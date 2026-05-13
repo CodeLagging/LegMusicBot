@@ -1,0 +1,13 @@
+{
+  "tokens": [
+    "Central Control Bot Token Here",
+    "Musicbot1 token Here",
+    "Musicbot2 token Here",
+    "add as many bots needed",
+  ],
+  "lavalink": {
+    "uri": "Lavalink URL",
+    "password": "Lavalink Server password"
+  },
+  "default_source": "yt"
+}
