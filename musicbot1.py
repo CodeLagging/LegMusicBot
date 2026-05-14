@@ -3,21 +3,18 @@ musicbot1.py — Music Worker Bot
 =================================
 Copy as musicbot1.py, musicbot2.py, musicbot3.py ...
 
-Silent worker — receives commands from main.py via command_queue.
-Sources: YouTube Music, SoundCloud, Spotify (via LavaSrc).
+SEARCH STRATEGY (most accurate first):
+  1. Default source is Spotify (sp):
+       spsearch: → Spotify finds the canonical track → LavaSrc resolves
+       via ISRC on YouTube Music → near-perfect accuracy
+  2. YouTube (yt): ytmsearch: (YouTube Music, not ytsearch)
+       Top 5 results scored + filtered, prefer "official audio/video"
+  3. SoundCloud (sc): direct search, no filtering needed
+  4. Any URL: passed straight through (Spotify/YT/SC all work)
 
-Clean-version filter applies to ALL sources on plain-text queries.
-Filter is skipped only when the user's query explicitly requests
-an altered version (sped up, slowed, reverb, etc.).
-
-3-minute idle timeout:
-  - Fires when queue is empty and nothing is playing
-  - Fires when all members leave the VC (even mid-song)
-  Both reset when a new track starts playing.
-
-Requirements:
-    pip install "discord.py[voice]" "wavelink>=3.4.0"
-    Lavalink: youtube-plugin + lavasrc-plugin (see application.yml)
+Filter is applied to ALL plain-text searches.
+Filter is SKIPPED only when the user's query explicitly contains
+one of the altered-version keywords (they want that specific version).
 """
 
 import asyncio
@@ -33,31 +30,138 @@ _cfg = Path(__file__).parent / "config.json"
 with open(_cfg) as _f:
     _CONFIG = json.load(_f)
 
-LAVALINK_URI  = _CONFIG["lavalink"]["uri"]
-LAVALINK_PASS = _CONFIG["lavalink"]["password"]
+LAVALINK_URI      = _CONFIG["lavalink"]["uri"]
+LAVALINK_PASS     = _CONFIG["lavalink"]["password"]
+STATUS_CHANNEL_ID = int(_CONFIG.get("status_channel_id", 0))
 
-VC_TIMEOUT    = 60.0   # seconds per connect attempt
-VC_RETRIES    = 3
-IDLE_TIMEOUT  = 180    # 3 minutes — disconnect if idle or empty
+VC_TIMEOUT   = 60.0
+VC_RETRIES   = 3
+IDLE_TIMEOUT = 180  # 3 minutes
 
-# ── Altered-version filter (applied to ALL sources) ────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# LARGE KEYWORD FILTER
+# Anything matching here is considered an "altered" or "non-original" version.
+# Grouped by category for maintainability.
+# ──────────────────────────────────────────────────────────────────────────────
+_ALTERED_KEYWORDS = [
+    # Speed alterations
+    "sped up", "spedup", "speed up", "sped-up", "speed-up",
+    "fast version", "faster version", "super fast",
+    "slowed", "slowed down", "slow version", "slowed version",
+    "slowed reverb", "slowed   reverb",
+
+    # Reverb / audio effects
+    "reverb", "reverbed", "with reverb", "heavy reverb",
+    "8d", "8d audio", "8-d audio", "8d music",
+    "bass boost", "bass boosted", "bassboost", "bassboosted",
+    "bass enhanced", "treble boost",
+    "underwater", "underwater version", "underwater effect",
+    "echo version", "echo effect",
+
+    # Pitch alterations
+    "pitched up", "pitched down", "pitch up", "pitch down",
+    "pitch shift", "pitch shifted", "higher pitch", "lower pitch",
+    "chipmunk", "chipmunk version",
+
+    # Nightcore / daycore variants
+    "nightcore", "nightcored", "night core",
+    "daycore", "day core",
+    "lullaby version", "lullaby",
+
+    # Lo-fi / chill edits
+    "lofi", "lo-fi", "lo fi", "lofied",
+    "chillhop", "chill hop",
+    "study version", "sleep version", "rain version",
+
+    # Acoustic / stripped versions (when labelled as such)
+    "acoustic", "acoustic version", "acoustic cover", "acoustic mix",
+    "unplugged", "stripped version", "stripped",
+    "piano version", "piano cover",
+    "guitar version", "guitar cover",
+    "violin version", "ukulele version",
+    "a cappella", "acapella",
+
+    # Remix / edit variants (generic non-official)
+    "extended mix", "extended version", "extended edit",
+    "club mix", "club edit", "radio edit",
+    "vip mix", "vip edit",
+    "chopped and screwed", "chopped & screwed", "chopped screwed",
+    "slowed chopped", "chopped slowed",
+    "flip", "bootleg", "mashup", "mash up", "mash-up",
+    "rework",
+
+    # Genre-specific production styles used as altered versions
+    "hardstyle", "hard style", "hardstyle remix", "hardstyle edit",
+    "hardcore", "hard core",
+    "gabber",
+    "rawstyle", "raw style",
+    "uptempo",
+    "frenchcore", "french core",
+    "terrorcore",
+    "industrial hardstyle",
+    "jumpstyle",
+    "trance remix", "trance version", "trance edit",
+    "psytrance", "psy trance",
+    "goa trance",
+    "drum and bass remix", "drum & bass remix", "dnb remix",
+    "dubstep remix", "dubstep version",
+    "trap remix", "trap version", "trap edit",
+    "phonk remix", "phonk version", "phonk edit",
+    "drift phonk",
+    "jersey club remix",
+    "amapiano remix",
+    "afrobeats remix",
+    "reggaeton remix",
+    "metal version", "metal cover", "metal remix",
+    "rock version", "rock cover", "rock remix",
+    "punk version", "punk cover",
+    "jazz version", "jazz cover",
+    "r&b remix", "rnb remix",
+    "country version", "country cover",
+    "classical version", "orchestral version",
+
+    # Cover / live / karaoke
+    "cover", "covered by", "cover by", "cover version",
+    "live version", "live performance", "live session", "live at",
+    "karaoke", "karaoke version", "instrumental karaoke",
+    "tribute", "tribute to",
+    "in the style of",
+
+    # Parody / joke versions
+    "parody", "parody version",
+    "comedy version",
+
+    # AI / generated
+    "ai version", "ai cover", "ai generated",
+    "ai vocals",
+
+    # Lyric video label (we prefer official audio over fan lyric videos)
+    # NOTE: "official lyric video" is fine, but fan-made lyric videos are not
+    # We don't filter "lyrics" alone since that's too broad
+
+    # Instrumental
+    "instrumental", "instrumental version", "no vocals",
+    "backing track",
+
+    # Sped reverb combos
+    "sped up reverb",
+    "sped reverb",
+]
+
+# Build a single compiled regex from the keyword list
+# Word-boundary aware, case-insensitive
 _ALTERED_RE = re.compile(
-    r"\b("
-    r"sped[\s\-]*up|speed[\s\-]*up|fast[\s\-]*version"
-    r"|slowed|slow[\s\-]*version"
-    r"|reverb|reverbed"
-    r"|nightcore|daycore|nightcored"
-    r"|lofi|lo[\s\-]*fi"
-    r"|pitched[\s\-]*up|pitched[\s\-]*down|pitch[\s\-]*shift"
-    r"|bass[\s\-]*boost(?:ed)?"
-    r"|8d|8[\s\-]*d[\s\-]*audio"
-    r"|chopped[\s&+]*screwed"
-    r"|underwater[\s\-]*version"
-    r")\b",
+    r"\b(" + "|".join(re.escape(k) for k in _ALTERED_KEYWORDS) + r")\b",
     re.IGNORECASE,
 )
 
-# Preferred lyric/repost channels — tried when YouTube plain search has no clean result
+# Official audio markers — boost score
+_OFFICIAL_RE = re.compile(
+    r"\b(official\s*(?:audio|video|music\s*video|lyric\s*video|visualizer)?)\b",
+    re.IGNORECASE,
+)
+
+# Preferred lyric/repost channels — tried when plain YT search has no clean result
 _PREFERRED_CHANNELS = [
     "Dan Music",
     "7clouds",
@@ -84,13 +188,23 @@ def _source_label(hint: str, query: str) -> str:
 
 
 def _user_wants_altered(query: str) -> bool:
-    """True if the user's own query asks for an altered version."""
+    """True if the user's own query explicitly asks for an altered version."""
     return bool(_ALTERED_RE.search(query))
 
 
 def _is_clean(track: wavelink.Playable) -> bool:
-    """True if the track title has no altered-version keywords."""
     return not bool(_ALTERED_RE.search(track.title or ""))
+
+
+def _track_score(track: wavelink.Playable) -> int:
+    """Higher = better match. Used to rank candidates."""
+    title = track.title or ""
+    score = 0
+    if _OFFICIAL_RE.search(title):
+        score += 10
+    if _ALTERED_RE.search(title):
+        score -= 100
+    return score
 
 
 def _is_local(track: wavelink.Playable) -> bool:
@@ -115,7 +229,10 @@ def _track_embed(
     if action == "playing":
         embed = discord.Embed(title="▶️  Now Playing", description=desc, colour=COLOUR)
     else:
-        embed = discord.Embed(title="➕  Added to Queue", description=desc, colour=discord.Colour.green())
+        embed = discord.Embed(
+            title="➕  Added to Queue", description=desc,
+            colour=discord.Colour.green(),
+        )
         embed.set_footer(text=f"Position in queue: #{queue_pos}")
 
     if track.artwork:
@@ -153,17 +270,6 @@ def _now_playing_embed(track: wavelink.Playable, source_label: str) -> discord.E
     return _track_embed(track, "playing", source_label)
 
 
-def _local_warning_embed(name: str) -> discord.Embed:
-    return discord.Embed(
-        title="⚠️  Local File — Skipped",
-        description=(
-            f"**{name}** is a local file and can't be streamed.\n"
-            "Only songs available on YouTube, SoundCloud, or Spotify's catalogue can be played."
-        ),
-        colour=discord.Colour.yellow(),
-    )
-
-
 # ── Worker ─────────────────────────────────────────────────────────────────────
 class Worker:
     def __init__(self, index: int, token: str, status_callback):
@@ -171,9 +277,10 @@ class Worker:
         self.token           = token
         self.status_callback = status_callback
 
-        self.busy:       bool      = False
-        self.guild_id:   int | None = None
-        self.channel_id: int | None = None
+        self.busy:        bool       = False
+        self.guild_id:    int | None = None
+        self.channel_id:  int | None = None
+        self.lavalink_ok: bool       = False
 
         self.command_queue: asyncio.Queue                       = asyncio.Queue()
         self._track_queue:  list[tuple[wavelink.Playable, str]] = []
@@ -181,7 +288,7 @@ class Worker:
         self._idle_task:    asyncio.Task | None                  = None
 
         intents = discord.Intents.default()
-        intents.voice_states = True   # needed to detect empty VC
+        intents.voice_states = True
         self.bot = discord.Client(intents=intents)
 
         self.bot.event(self.on_ready)
@@ -190,10 +297,29 @@ class Worker:
         self.bot.event(self.on_wavelink_track_exception)
         self.bot.event(self.on_voice_state_update)
 
+    # ── Lavalink connect with infinite retry ───────────────────────────────────
+
+    async def _connect_lavalink(self):
+        attempt  = 0
+        max_wait = 30
+        while True:
+            attempt += 1
+            try:
+                node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASS)
+                await wavelink.Pool.connect(client=self.bot, nodes=[node])
+                return
+            except Exception as exc:
+                wait = min(5 * attempt, max_wait)
+                print(
+                    f"[Worker {self.index}] Lavalink connect failed "
+                    f"(attempt {attempt}): {exc} — retrying in {wait}s",
+                    flush=True,
+                )
+                await asyncio.sleep(wait)
+
     # ── Idle timeout ───────────────────────────────────────────────────────────
 
     def _reset_idle_timer(self):
-        """Cancel any running idle timer and start a fresh 3-minute one."""
         if self._idle_task and not self._idle_task.done():
             self._idle_task.cancel()
         self._idle_task = asyncio.ensure_future(
@@ -206,16 +332,14 @@ class Worker:
         self._idle_task = None
 
     async def _idle_countdown(self):
-        """Wait IDLE_TIMEOUT seconds then disconnect if still idle/empty."""
         try:
             await asyncio.sleep(IDLE_TIMEOUT)
         except asyncio.CancelledError:
             return
-        # Timer fired — disconnect
         if self.guild_id:
             player = self._get_player(self.guild_id)
             if player:
-                print(f"[Worker {self.index}] Idle timeout — disconnecting")
+                print(f"[Worker {self.index}] Idle timeout — disconnecting", flush=True)
                 self._track_queue.clear()
                 try:
                     await player.stop()
@@ -227,20 +351,38 @@ class Worker:
     # ── Events ─────────────────────────────────────────────────────────────────
 
     async def on_ready(self):
-        node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASS)
-        await wavelink.Pool.connect(client=self.bot, nodes=[node])
-        asyncio.ensure_future(self._command_loop(), loop=self.bot.loop)
-        print(f"[Worker {self.index}] Ready — {self.bot.user}")
+        asyncio.ensure_future(self._connect_lavalink(), loop=self.bot.loop)
+        asyncio.ensure_future(self._command_loop(),     loop=self.bot.loop)
+        print(f"[Worker {self.index}] Discord ready — {self.bot.user}", flush=True)
 
     async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
-        print(f"[Worker {self.index}] Lavalink OK: {payload.node.uri}")
+        self.lavalink_ok = True
+        print(f"[Worker {self.index}] Lavalink OK: {payload.node.uri}", flush=True)
+        if STATUS_CHANNEL_ID:
+            try:
+                ch = self.bot.get_channel(STATUS_CHANNEL_ID) or \
+                     await self.bot.fetch_channel(STATUS_CHANNEL_ID)
+                await ch.send(
+                    embed=discord.Embed(
+                        title="✅  Worker Bot Connected",
+                        description=(
+                            f"**Worker {self.index}** (`{self.bot.user}`) is ready.\n"
+                            f"Lavalink: `{payload.node.uri}`"
+                        ),
+                        colour=discord.Colour.green(),
+                    ).set_footer(
+                        text=f"Connected at {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                    )
+                )
+            except Exception as exc:
+                print(f"[Worker {self.index}] Status post failed: {exc}", flush=True)
 
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
         player: wavelink.Player = payload.player
         if self._track_queue:
             next_track, next_label = self._track_queue.pop(0)
             await player.play(next_track)
-            self._reset_idle_timer()   # reset — new track started
+            self._reset_idle_timer()
             if self._text_channel:
                 try:
                     await self._text_channel.send(
@@ -249,12 +391,14 @@ class Worker:
                 except Exception:
                     pass
         else:
-            # Queue empty — start idle timer
             self._reset_idle_timer()
 
     async def on_wavelink_track_exception(self, payload: wavelink.TrackExceptionEventPayload):
-        print(f"[Worker {self.index}] Track exception — "
-              f"{payload.track.title if payload.track else '?'}: {payload.exception}")
+        print(
+            f"[Worker {self.index}] Track exception — "
+            f"{payload.track.title if payload.track else '?'}: {payload.exception}",
+            flush=True,
+        )
         player: wavelink.Player = payload.player
         if self._track_queue:
             next_track, next_label = self._track_queue.pop(0)
@@ -264,34 +408,20 @@ class Worker:
             self._reset_idle_timer()
 
     async def on_voice_state_update(
-        self,
-        member: discord.Member,
-        before: discord.VoiceState,
-        after: discord.VoiceState,
+        self, member: discord.Member,
+        before: discord.VoiceState, after: discord.VoiceState,
     ):
-        """Start idle timer if everyone leaves the VC (even mid-song)."""
-        if not self.guild_id or not self.channel_id:
+        if not self.guild_id or not self.channel_id or member.bot:
             return
-        if member.bot:
-            return   # ignore other bots
-
         guild = self.bot.get_guild(self.guild_id)
         if not guild:
             return
-
         vc = guild.get_channel(self.channel_id)
         if not isinstance(vc, discord.VoiceChannel):
             return
-
-        # Count non-bot members still in the channel
-        human_members = [m for m in vc.members if not m.bot]
-        if len(human_members) == 0:
-            print(f"[Worker {self.index}] VC empty — starting idle timer")
+        if not any(not m.bot for m in vc.members):
+            print(f"[Worker {self.index}] VC empty — starting idle timer", flush=True)
             self._reset_idle_timer()
-        else:
-            # Someone is still there — if timer was running due to empty VC, cancel it
-            # (don't cancel if timer is running due to empty queue — let that run)
-            pass
 
     # ── State ──────────────────────────────────────────────────────────────────
 
@@ -347,10 +477,13 @@ class Worker:
             for attempt in range(1, VC_RETRIES + 1):
                 try:
                     await asyncio.wait_for(player.move_to(vc), timeout=VC_TIMEOUT)
-                    print(f"[Worker {self.index}] Moved to {vc.name}")
+                    print(f"[Worker {self.index}] Moved to {vc.name}", flush=True)
                     return player
                 except asyncio.TimeoutError:
-                    print(f"[Worker {self.index}] move_to timeout ({attempt}/{VC_RETRIES})")
+                    print(
+                        f"[Worker {self.index}] move_to timeout ({attempt}/{VC_RETRIES})",
+                        flush=True,
+                    )
             raise RuntimeError(f"Could not move to {vc.name} after {VC_RETRIES} attempts.")
 
         for attempt in range(1, VC_RETRIES + 1):
@@ -361,7 +494,10 @@ class Worker:
                 )
                 return player
             except asyncio.TimeoutError:
-                print(f"[Worker {self.index}] connect timeout ({attempt}/{VC_RETRIES})")
+                print(
+                    f"[Worker {self.index}] connect timeout ({attempt}/{VC_RETRIES})",
+                    flush=True,
+                )
                 try:
                     if guild.voice_client:
                         await guild.voice_client.disconnect(force=True)
@@ -375,14 +511,23 @@ class Worker:
     # ── Search ─────────────────────────────────────────────────────────────────
 
     async def _raw_search(self, query: str, source: str) -> list[wavelink.Playable]:
+        """
+        Return up to 5 raw candidates.
+        Always uses ytmsearch (YouTube Music) for yt — far better accuracy than ytsearch.
+        Spotify uses spsearch — LavaSrc resolves via ISRC on YouTube Music automatically.
+        """
         try:
             if source == "sc":
                 results = await wavelink.Playable.search(
                     query, source=wavelink.TrackSource.SoundCloud
                 )
             elif source == "sp":
+                # spsearch: → Spotify metadata → ISRC lookup on YouTube Music
+                # This is the most accurate path for any song name search
                 results = await wavelink.Playable.search(f"spsearch:{query}")
             else:
+                # ytmsearch: — YouTube Music curated catalogue, much more accurate
+                # than ytsearch: which returns all video types
                 results = await wavelink.Playable.search(
                     query, source=wavelink.TrackSource.YouTubeMusic
                 )
@@ -390,19 +535,23 @@ class Worker:
                 return results.tracks[:5]
             return results[:5] if results else []
         except Exception as exc:
-            print(f"[Worker {self.index}] Raw search error: {exc}")
+            print(f"[Worker {self.index}] Raw search error ({source}): {exc}", flush=True)
             return []
 
     async def _search(self, query: str, source: str) -> tuple[wavelink.Playable | None, str]:
         """
-        Smart single-track search with clean-version filter on ALL sources.
-        Filter skipped only when user's query explicitly requests altered version.
-        Returns (track, source_label).
+        Smart search:
+          - URLs: passed straight through (Spotify/YT/SC)
+          - Spotify (sp): spsearch → ISRC resolution → near-perfect accuracy
+            Still filtered in case Spotify returns a remix/edit variant
+          - YouTube (yt): ytmsearch top 5 scored + filtered, preferred channels fallback
+          - SoundCloud (sc): direct, no extra filtering
+          - User explicitly wants altered version: skip filter, return best scored result
         """
         label  = _source_label(source, query)
         is_url = query.startswith(("http://", "https://"))
 
-        # URLs — straight to Lavalink / LavaSrc, no filter (user pasted exact link)
+        # URLs — straight to Lavalink / LavaSrc, no filter
         if is_url:
             try:
                 results = await wavelink.Playable.search(query)
@@ -410,42 +559,54 @@ class Worker:
                     tracks = [t for t in results.tracks if not _is_local(t)]
                     return (tracks[0] if tracks else None), label
                 if isinstance(results, list) and results:
-                    track = results[0]
-                    return (None if _is_local(track) else track), label
+                    t = results[0]
+                    return (None if _is_local(t) else t), label
             except Exception as exc:
-                print(f"[Worker {self.index}] URL search error: {exc}")
+                print(f"[Worker {self.index}] URL search error: {exc}", flush=True)
             return None, label
 
-        # Plain-text — apply clean filter to all sources
-        skip_filter = _user_wants_altered(query)
-
-        if skip_filter:
-            # User wants the altered version — just search normally
+        # User explicitly wants an altered version — respect that
+        if _user_wants_altered(query):
             candidates = await self._raw_search(query, source)
-            return (candidates[0] if candidates else None), label
+            if candidates:
+                return max(candidates, key=_track_score), label
+            return None, label
 
-        # ── Filtered path ──────────────────────────────────────────────────────
+        # ── Filtered + scored search ───────────────────────────────────────────
 
-        # Step 1: plain search top 5, pick first clean
+        # Step 1: plain search, score all, pick best clean result
         candidates = await self._raw_search(query, source)
-        for track in candidates:
-            if _is_clean(track):
-                print(f"[Worker {self.index}] Clean ({source}): {track.title}")
-                return track, label
+        clean = [t for t in candidates if _is_clean(t)]
+        if clean:
+            best = max(clean, key=_track_score)
+            print(
+                f"[Worker {self.index}] ✓ Clean ({source}): "
+                f"{best.title!r} score={_track_score(best)}",
+                flush=True,
+            )
+            return best, label
 
-        # Step 2: if YouTube, also try preferred channels
-        if source == "yt":
+        # Step 2: YouTube / Spotify — try preferred lyric channels as fallback
+        if source in ("yt", "sp"):
             for channel in _PREFERRED_CHANNELS:
-                ch_results = await self._raw_search(f"{query} {channel}", source)
-                for track in ch_results:
-                    if _is_clean(track):
-                        print(f"[Worker {self.index}] Clean via '{channel}': {track.title}")
-                        return track, label
+                ch_results = await self._raw_search(f"{query} {channel}", "yt")
+                ch_clean = [t for t in ch_results if _is_clean(t)]
+                if ch_clean:
+                    best = max(ch_clean, key=_track_score)
+                    print(
+                        f"[Worker {self.index}] ✓ Clean via '{channel}': {best.title!r}",
+                        flush=True,
+                    )
+                    return best, label
 
-        # Step 3: unfiltered fallback — take first result regardless
+        # Step 3: unfiltered fallback — best-scored result regardless
         if candidates:
-            print(f"[Worker {self.index}] No clean match, fallback: {candidates[0].title}")
-            return candidates[0], label
+            best = max(candidates, key=_track_score)
+            print(
+                f"[Worker {self.index}] ⚠ No clean match, best fallback: {best.title!r}",
+                flush=True,
+            )
+            return best, label
 
         return None, label
 
@@ -478,13 +639,13 @@ class Worker:
             elif isinstance(result, list) and result:
                 raw_tracks = result
         except Exception as exc:
-            print(f"[Worker {self.index}] Playlist search error: {exc}")
+            print(f"[Worker {self.index}] Playlist search error: {exc}", flush=True)
 
         good, skipped = [], 0
         for t in raw_tracks:
             if _is_local(t):
                 skipped += 1
-                print(f"[Worker {self.index}] Skipping local file: {t.title}")
+                print(f"[Worker {self.index}] Skipping local file: {t.title}", flush=True)
             else:
                 good.append(t)
 
@@ -498,7 +659,10 @@ class Worker:
             try:
                 await self._handle(cmd)
             except Exception as exc:
-                print(f"[Worker {self.index}] Error in op={cmd.get('op')}: {exc}")
+                print(
+                    f"[Worker {self.index}] Error in op={cmd.get('op')}: {exc}",
+                    flush=True,
+                )
                 itx: discord.Interaction | None = cmd.get("interaction")
                 if itx:
                     try:
@@ -524,49 +688,18 @@ class Worker:
             if resolved:
                 self._text_channel = resolved
 
-        # ── search_and_play ────────────────────────────────────────────────────
-        if op == "search_and_play":
+        async def _err(msg: str):
+            if itx:
+                await itx.followup.send(
+                    embed=discord.Embed(title=msg, colour=discord.Colour.red()),
+                    ephemeral=True,
+                )
+
+        # ── search_and_play / queue_track ──────────────────────────────────────
+        if op in ("search_and_play", "queue_track"):
             track, label = await self._search(cmd["query"], cmd["source"])
             if track is None:
-                if itx:
-                    # Check if it was a local file
-                    if _SPOTIFY_RE.search(cmd["query"]):
-                        await itx.followup.send(embed=_local_warning_embed(cmd["query"]), ephemeral=True)
-                    else:
-                        await itx.followup.send(
-                            embed=discord.Embed(title="❌ Nothing found.", colour=discord.Colour.red()),
-                            ephemeral=True,
-                        )
-                return
-
-            await self._set_busy(guild_id, channel_id)
-            player = await self._connect(guild_id, channel_id)
-
-            if player.playing:
-                self._track_queue.append((track, label))
-                if itx:
-                    await itx.followup.send(
-                        embed=_track_embed(track, "queued", label, len(self._track_queue)),
-                        ephemeral=True,
-                    )
-            else:
-                await player.play(track)
-                self._reset_idle_timer()
-                if itx:
-                    await itx.followup.send(
-                        embed=_track_embed(track, "playing", label),
-                        ephemeral=True,
-                    )
-
-        # ── queue_track ────────────────────────────────────────────────────────
-        elif op == "queue_track":
-            track, label = await self._search(cmd["query"], cmd["source"])
-            if track is None:
-                if itx:
-                    await itx.followup.send(
-                        embed=discord.Embed(title="❌ Nothing found.", colour=discord.Colour.red()),
-                        ephemeral=True,
-                    )
+                await _err("❌ Nothing found.")
                 return
 
             await self._set_busy(guild_id, channel_id)
@@ -596,12 +729,8 @@ class Worker:
             if not tracks:
                 msg = "❌ No playable tracks found."
                 if skipped:
-                    msg += f"\n({skipped} local file(s) were skipped.)"
-                if itx:
-                    await itx.followup.send(
-                        embed=discord.Embed(title="❌ Empty playlist", description=msg, colour=discord.Colour.red()),
-                        ephemeral=True,
-                    )
+                    msg += f"\n({skipped} local file(s) skipped.)"
+                await _err(msg)
                 return
 
             await self._set_busy(guild_id, channel_id)
@@ -644,55 +773,41 @@ class Worker:
                     ephemeral=True,
                 )
 
-        # ── control ops ───────────────────────────────────────────────────────
+        # ── pause_resume ───────────────────────────────────────────────────────
         elif op == "pause_resume":
             player = self._get_player(guild_id)
-            if not player or not player.playing and not player.paused:
-                if itx:
-                    await itx.followup.send(
-                        embed=discord.Embed(title="❌ Nothing playing", colour=discord.Colour.red()),
-                        ephemeral=True,
-                    )
+            if not player or (not player.playing and not player.paused):
+                await _err("❌ Nothing playing")
                 return
             if player.paused:
                 await player.pause(False)
-                label = "▶️  Resumed"
-                self._reset_idle_timer()
+                title = "▶️  Resumed"
             else:
                 await player.pause(True)
-                label = "⏸️  Paused"
-                # Start idle timer while paused (counts as idle)
-                self._reset_idle_timer()
+                title = "⏸️  Paused"
+            self._reset_idle_timer()
             if itx:
                 await itx.followup.send(
-                    embed=discord.Embed(title=label, colour=COLOUR),
-                    ephemeral=True,
+                    embed=discord.Embed(title=title, colour=COLOUR), ephemeral=True
                 )
 
+        # ── skip ──────────────────────────────────────────────────────────────
         elif op == "skip":
             player = self._get_player(guild_id)
             if not player or not player.playing:
-                if itx:
-                    await itx.followup.send(
-                        embed=discord.Embed(title="❌ Nothing playing", colour=discord.Colour.red()),
-                        ephemeral=True,
-                    )
+                await _err("❌ Nothing playing")
                 return
-            await player.stop()   # triggers on_wavelink_track_end → plays next
+            await player.stop()
             if itx:
                 await itx.followup.send(
-                    embed=discord.Embed(title="⏭️  Skipped", colour=COLOUR),
-                    ephemeral=True,
+                    embed=discord.Embed(title="⏭️  Skipped", colour=COLOUR), ephemeral=True
                 )
 
+        # ── backward ──────────────────────────────────────────────────────────
         elif op == "backward":
             player = self._get_player(guild_id)
             if not player or not player.playing:
-                if itx:
-                    await itx.followup.send(
-                        embed=discord.Embed(title="❌ Nothing playing", colour=discord.Colour.red()),
-                        ephemeral=True,
-                    )
+                await _err("❌ Nothing playing")
                 return
             await player.seek(0)
             if itx:
@@ -701,30 +816,38 @@ class Worker:
                     ephemeral=True,
                 )
 
+        # ── seek ──────────────────────────────────────────────────────────────
         elif op == "seek":
             player = self._get_player(guild_id)
             if not player or not player.playing:
-                if itx:
-                    await itx.followup.send(
-                        embed=discord.Embed(title="❌ Nothing playing", colour=discord.Colour.red()),
-                        ephemeral=True,
-                    )
+                await _err("❌ Nothing playing")
                 return
             delta_ms = cmd.get("delta_ms", 0)
             new_pos  = max(0, player.position + delta_ms)
             if player.current and new_pos > player.current.length:
                 new_pos = max(0, player.current.length - 1000)
             await player.seek(int(new_pos))
-            sign  = "+" if delta_ms > 0 else ""
-            secs  = delta_ms // 1000
+            sign = "+" if delta_ms > 0 else ""
+            secs = delta_ms // 1000
+            icon = "⏩" if delta_ms > 0 else "⏪"
             if itx:
                 await itx.followup.send(
-                    embed=discord.Embed(
-                        title=f"{'⏩' if delta_ms > 0 else '⏪'}  {sign}{secs}s",
-                        colour=COLOUR,
-                    ),
+                    embed=discord.Embed(title=f"{icon}  {sign}{secs}s", colour=COLOUR),
                     ephemeral=True,
                 )
+
+        # ── ping (health check) ────────────────────────────────────────────────
+        elif op == "ping":
+            result_queue: asyncio.Queue = cmd["result_queue"]
+            await result_queue.put({
+                "worker_index": self.index,
+                "discord_ok":   self.bot.is_ready(),
+                "discord_ms":   round(self.bot.latency * 1000),
+                "lavalink_ok":  self.lavalink_ok,
+                "lavalink_uri": LAVALINK_URI,
+                "busy":         self.busy,
+                "queue_len":    len(self._track_queue),
+            })
 
     async def start(self):
         await self.bot.start(self.token)
