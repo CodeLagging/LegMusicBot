@@ -10,4 +10,6 @@
     "password": "Lavalink Server password"
   },
   "default_source": "yt"
+  "guild_id": "your discord server id",
+  "status_channel_id": "channel id to send startup messages"
 }
