@@ -350,7 +350,6 @@ def _embed_from_response(resp: dict) -> discord.Embed | None:
         artwork = resp.get("artwork", "")
         dur_ms  = resp.get("duration", 0)
         lbl     = resp.get("source_label", "")
-        path    = resp.get("search_path", "")
         qpos    = resp.get("queue_pos", 0)
         desc    = f"**[{title}]({uri})**\n{author}" if uri else f"**{title}**\n{author}"
         embed   = discord.Embed(
@@ -367,8 +366,6 @@ def _embed_from_response(resp: dict) -> discord.Embed | None:
             embed.add_field(name="Duration", value=f"{m}:{s:02d}", inline=True)
         if lbl:
             embed.add_field(name="Source", value=lbl, inline=True)
-        if path:
-            embed.add_field(name="Found via", value=path, inline=True)
         return embed
 
     if et in ("playing_playlist", "queued_playlist"):

@@ -207,7 +207,7 @@ When you `/play` something, your history on that server is a real part of the ra
 ### Autoplay from /control (🎲 button)
 
 - When the queue runs out, the worker picks songs related to the **last few songs played in this session** (`autoplay_seed_count`), whether they came from `/play` or a playlist.
-- It queues 2 picks at a time, in the background while the last song is still playing, so there is no gap.
+- It queues **5** picks at a time (`AUTOPLAY_BATCH`), in the background while the last song is still playing, so there is no gap. Their source shows as **Autoplay (Algo)**.
 - Songs you queue yourself always go **ahead** of autoplay picks.
 - Turning autoplay off removes the queued autoplay picks.
 - It needs at least one song played in the session first.
@@ -220,9 +220,17 @@ When you `/play` something, your history on that server is a real part of the ra
 
 ### How picks are found
 
-1. **YouTube Mix:** for a seed song, the worker loads YouTube's own radio mix (`watch?v=ID&list=RDID`), which returns about 25 related songs. One random song from the top 8 usable ones is taken per seed.
-2. Picks are filtered: nothing already played in the session or already queued (by video id and by cleaned-up title, so a different upload of the same song is skipped), no altered versions (sped up, slowed, remix, cover, …), nothing shorter than 1 minute or longer than 10 minutes.
-3. **AI fallback:** if no Mix gives anything, the Groq model is asked for 5 similar songs ("Title - Artist"), and each is searched with the normal search pipeline.
+1. **YouTube Mix:** for each seed song, the worker loads YouTube's own radio mix (`watch?v=ID&list=RDID`, about 25 related songs). Mixes are cached for the session, so later refills don't reload them.
+2. All seeds' Mix songs go into **one pool**, filtered: nothing already played in the session or queued (by video id and cleaned-up title), no altered versions, nothing under 1 minute or over 10 minutes.
+3. Each candidate is scored (`_autoplay_score`):
+   - how related it is: earlier in a Mix and from a stronger/more recent seed scores higher; appearing in **several seeds' Mixes** is a strong bonus;
+   - **your reaction to autoplay before**: picks you listened to score higher, picks you skipped within 30 s are never played again (stored in search memory under `~autoplay`);
+   - your taste (`_personal`): artists you play, songs you know; artists you keep skipping are pushed down;
+   - a little randomness for variety.
+4. The best ones are queued, at most **2 per artist** per refill (`AUTOPLAY_PER_ARTIST`).
+5. **AI fallback** (only if the Mixes don't give enough): Groq is asked once for 10 similar songs; unused ones are kept for later refills. They're looked up without another AI call per song.
+
+For `/autoplay`, seeds are your saved songs, weighted by plays **and** how recently you listened.
 
 ---
 
@@ -295,7 +303,7 @@ Starts the Unix socket server on `.main.sock` that receives worker state events.
 ### Embeds and permission helpers
 
 **`def _embed_from_response(resp)`**
-Turns a worker reply into an embed using its `embed_type`: `playing`/`queued` (linked title, artist, thumbnail, duration, source, found-via, queue position) or `playing_playlist`/`queued_playlist` (name, track count, source, skipped local files, artwork). None when there is no `embed_type`.
+Turns a worker reply into an embed using its `embed_type`: `playing`/`queued` (linked title, artist, thumbnail, duration, source, queue position) or `playing_playlist`/`queued_playlist` (name, track count, source, skipped local files, artwork). None when there is no `embed_type`.
 
 **`def _simple_embed(title, colour)`**
 An embed with only a title and colour.
@@ -533,8 +541,14 @@ Asks whether the search text explicitly asks for an altered version, so a search
 
 Altered versions are only played when you ask for them: the main search checks every candidate with `_is_altered`; matching a Spotify/Apple Music song to YouTube skips uploads whose title looks altered (unless the original's does); autoplay skips them by title. Only if *every* candidate is altered does the search fall back to the best one.
 
+**`def _obvious_pick(ranked_top, asked, personal)`**
+Skips the AI when the answer is clear: the top result is the kind of version asked for (original vs altered, by title words) and either the user's history strongly points at it or it beats every rival of that kind by `AI_SKIP_MARGIN` (30). Most searches end here, using no Groq tokens.
+
+**`async def _ai_pick_cached(query, cands, notes)`**
+`_ai_pick` remembered for 6 hours per search text, stored by song id so it still applies when the result list shifts.
+
 **`async def _ai_pick(query, cands)`**
-One AI call per search (retried once if Groq rejects its own JSON). It gets the search text and the top `AI_PICK_CANDIDATES` (8) results (title, channel, length, views) and returns JSON: `wants_altered` (did the search explicitly ask for a sped up / slowed / remix / cover … version; genre, artist, language or mood words don't count), `altered` (which results are non-original versions, including mashups, montagems and medleys) and `pick` (the result that is the song the user means). Returns None when Groq fails or times out (8 s); the search then uses the title rules.
+One AI call when the answer isn't obvious (retried once if Groq rejects its own JSON). It gets the search text and the top `AI_PICK_CANDIDATES` (6) results (title, channel, length, views) and returns JSON: `wants_altered` (did the search explicitly ask for a sped up / slowed / remix / cover … version; genre, artist, language or mood words don't count), `altered` (which results are non-original versions, including mashups, montagems and medleys) and `pick` (the result that is the song the user means). Returns None when Groq fails or times out (8 s); the search then uses the title rules.
 
 The model is a reasoning model: its thinking counts toward `max_tokens`. All Groq calls use `_GROQ_ARGS` (400 tokens, low reasoning effort). Earlier versions allowed 3 tokens, so every answer came back empty and was read as "not altered", which is why altered versions used to slip through.
 
@@ -576,7 +590,7 @@ Popularity points from YouTube stats: `8 × log10(views + 1) + 4 × log10(likes 
 ### Embeds and messages
 
 **`def _track_embed(track, action, source_label, queue_pos=0, search_path="")`**
-Now Playing / Added to Queue embed.
+Now Playing / Added to Queue embed (title, artist, thumbnail, duration, source; `search_path` is kept for the logs but not shown). Autoplay songs show the source "Autoplay (Algo)".
 
 **`def _now_playing_embed(track, source_label, search_path="")`**
 Shortcut for the Now Playing embed sent on track changes.
@@ -671,13 +685,19 @@ The seed's YouTube id, looking it up on YouTube Music when unknown.
 Loads YouTube's radio mix for the seed and returns its tracks without the seed itself.
 
 **`def _weighted_pick(rows, k)`**
-Picks up to k distinct saved songs at random, weighted by score.
+Picks up to k distinct saved songs at random, weighted by score × recency.
 
 **`async def _autoplay_seeds(sess)`**
 Seeds for the next picks: weighted saved songs of `autoplay_user` in `algo` mode, else the most recent songs of the session (`autoplay_seed_count`).
 
+**`async def _mix_cached(sess, seed)`**
+A seed's Mix, loaded once per session.
+
+**`def _autoplay_score(t, position, seed_weight, appearances, taste)`**
+Score for one autoplay candidate, or None when the user skipped it in autoplay before (see "How picks are found").
+
 **`async def _recommend(sess, count)`**
-Finds up to `count` picks: in algo mode sometimes a saved song directly, then one Mix pick per seed, then the Groq fallback if nothing was found.
+Finds up to `count` picks: in algo mode sometimes a saved song directly, then the best-scored songs from the pooled Mixes (max 2 per artist), then AI suggestions (batched, kept in `sess.ai_reserve`) if still short.
 
 **`async def _autoplay_refill(sess)`**
 Queues the picks (credited to the autoplay user or controller) if the queue is still empty and the session still exists.
@@ -928,10 +948,13 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `SP_MIN_COVERAGE` | worker.py | 0.5 | Share of the query's words a Spotify match must contain to be used. |
 | `PLAY_COUNT_MS` | worker.py | 30 s | Listening time for a song to count as a listen. |
 | `HISTORY_LEN` | worker.py | 25 | Played tracks remembered per session. |
-| `AUTOPLAY_BATCH` | worker.py | 2 | Autoplay picks queued per refill. |
+| `AUTOPLAY_BATCH` | worker.py | 5 | Autoplay picks queued per refill. |
 | `ALGO_DIRECT_CHANCE` | worker.py | 0.3 | `/autoplay`: chance of replaying a saved song instead of a related one. |
 | `_STATUS_DELETE_DELAY` | worker.py | 10 s | Lifetime of the now-playing messages. |
-| `AI_PICK_CANDIDATES` | worker.py | 8 | Search results shown to the AI per search. |
+| `AI_PICK_CANDIDATES` | worker.py | 6 | Search results shown to the AI when it's needed. |
+| `AI_SKIP_MARGIN` | worker.py | 30 | Lead that makes a result a clear winner (no AI call). |
+| `AI_CACHE_TTL` | worker.py | 6 h | How long an AI decision is reused for the same search. |
+| `AUTOPLAY_PER_ARTIST` | worker.py | 2 | Max songs by one artist per autoplay refill. |
 | `PERSONAL_STRONG` | worker.py | 40 | Personal score at which your history overrides the AI pick. |
 | `PERSONAL_HALF_LIFE_DAYS` | worker.py | 30 | How fast personal boosts fade without listening. |
 | `NORMALIZE_SETTINGS` | worker.py | maxAmplitude 0.75, adaptive | Normalize filter settings. |

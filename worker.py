@@ -59,8 +59,10 @@ SP_MIN_COVERAGE = 0.5    # share of the query's words a Spotify match must conta
 
 PLAY_COUNT_MS   = 30_000   # a song counts as "listened" for the algo after this long
 HISTORY_LEN     = 25
-AUTOPLAY_BATCH  = 2
-AUTOPLAY_LABEL  = "Autoplay"
+AUTOPLAY_BATCH  = 5      # autoplay songs queued per refill
+AUTOPLAY_QUERY  = "~autoplay"   # search-memory key for how the user reacts to autoplay picks
+AUTOPLAY_PER_ARTIST = 2  # variety: at most this many songs by one artist per refill
+AUTOPLAY_LABEL  = "Autoplay (Algo)"   # source shown for autoplay picks; also marks them in the queue
 ALGO_DIRECT_CHANCE = 0.3   # /autoplay: chance to replay a saved song instead of a recommendation
 
 _groq         = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
@@ -69,7 +71,9 @@ _GROQ_TIMEOUT = 6.0
 # gpt-oss is a reasoning model: it thinks before answering, and the thinking counts toward
 # max_tokens. With a tiny limit the answer comes back empty, so leave room and keep thinking short.
 _GROQ_ARGS = {"max_tokens": 400, "temperature": 0, "extra_body": {"reasoning_effort": "low"}}
-AI_PICK_CANDIDATES = 8   # candidates shown to the AI per search
+AI_PICK_CANDIDATES = 6   # candidates shown to the AI per search
+AI_SKIP_MARGIN     = 30  # a top result this far ahead of every rival is picked without the AI
+AI_CACHE_TTL       = 6 * 3600
 
 
 _OFFICIAL_RE = re.compile(
@@ -163,26 +167,67 @@ async def _user_wants_altered(query: str) -> bool:
         print(f"[Worker {BOT_INDEX}] Groq query-check error: {exc} — using title rules", flush=True)
         return bool(_ALTERED_ASK.search(query or ""))
 
-_PICK_SYSTEM = """You pick which search result to play for a music bot.
+_PICK_SYSTEM = """Pick which search result a music bot should play. Reply with JSON only:
+{"wants_altered": bool, "altered": [numbers], "pick": number}
+wants_altered: true only if the search explicitly asks for a non-original version (sped up, slowed,
+reverb, nightcore, 8D, bass boosted, lofi, remix, cover, karaoke, instrumental, acoustic, live,
+mashup, montagem/edit of the song). Genre, artist, language or mood words don't count.
+altered: results that are non-original versions (the above, AI covers, fan edits, compilations,
+medleys). Official remixes by the original artist, remasters, radio edits and official audio/lyric
+videos are NOT altered.
+pick: the result that IS the searched song (same title; never a different song sharing a word).
+If not wants_altered, never pick an altered result; prefer the original artist's studio recording,
+then more views. If wants_altered, pick that version. Among equal matches prefer ones noted as the
+user's. -1 if none fits."""
 
-You get the user's search and numbered YouTube Music results (title, channel, length, views if known).
-Answer with JSON only: {"wants_altered": true/false, "altered": [numbers], "pick": number}
+def _short_views(v: int | None) -> str:
+    if v is None:
+        return ""
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if v >= div:
+            return f", {v / div:.1f}{suf} views"
+    return f", {v} views"
 
-- wants_altered: true ONLY if the search explicitly asks for a non-original version: sped up, slowed,
-  reverb, nightcore, daycore, 8D, bass boosted, lofi, remix, cover, karaoke, instrumental, acoustic,
-  live, mashup, edit/montagem of the song, etc. Genre words (phonk, funk, trap, pop, rock), artist
-  names, language or mood words are NOT a request for an altered version.
-- altered: every result that is a non-original version (any of the above, also "ultra speed",
-  "super slowed", AI covers, fan edits, montagem/mashups of the song, compilations, medleys).
-  Official remixes by the original artist, remasters, radio edits and official lyric/audio videos
-  are NOT altered.
-- pick: the result that is the song the user most likely means. It MUST be the same song as searched
-  (same song title) — never a different song that merely shares a word like "slowed" or "remix".
-  If wants_altered is false, never pick an altered result; prefer the original studio recording by the original artist, and among equal
-  matches the official upload with more views. If wants_altered is true, pick the version they asked for.
-  When results match the search equally well, prefer ones noted as played by the user / by an artist
-  they often play — but never let that override what the search clearly asks for.
-  Use -1 only if no result is the requested song."""
+_ai_cache: dict[str, tuple[float, dict]] = {}
+
+def _obvious_pick(ranked_top: list[tuple[wavelink.Playable, float]], asked: bool,
+                  personal: dict[str, tuple[float, str]]) -> int | None:
+    """0 when the top result is clearly right and the AI call can be skipped, else None.
+    Clear = it's the kind of version asked for (original vs altered by title words), and either
+    the user's history strongly points at it or it beats every rival of that kind by AI_SKIP_MARGIN."""
+    if not ranked_top:
+        return None
+    t0, s0 = ranked_top[0]
+    if bool(_ALTERED_QUICK.search(t0.title or "")) != asked:
+        return None
+    if personal.get(_track_key(t0), (0.0, ""))[0] >= PERSONAL_STRONG:
+        return 0
+    rivals = [sc for t, sc in ranked_top[1:] if bool(_ALTERED_QUICK.search(t.title or "")) == asked]
+    if not rivals:
+        return 0
+    return 0 if s0 - max(rivals) >= AI_SKIP_MARGIN else None
+
+async def _ai_pick_cached(query: str, cands: list[wavelink.Playable],
+                          notes: dict[int, str] | None) -> dict | None:
+    """_ai_pick, remembered for AI_CACHE_TTL per search text. Stored by song id, not position, so
+    it still applies when the result list shifts a little (Spotify/YouTube answers vary)."""
+    key  = (_query_norm(query) or query).lower()
+    ids  = [t.identifier or t.uri or t.title for t in cands]
+    hit  = _ai_cache.get(key)
+    if hit and time.time() - hit[0] < AI_CACHE_TTL and hit[1]["pick_id"] in ids:
+        d = hit[1]
+        print(f"[Worker {BOT_INDEX}] AI decision from cache", flush=True)
+        return {"wants_altered": d["wants_altered"], "pick": ids.index(d["pick_id"]),
+                "altered": {i for i, x in enumerate(ids) if x in d["altered_ids"]}}
+    decision = await _ai_pick(query, cands, notes)
+    if decision is not None and 0 <= decision["pick"] < len(ids):
+        _ai_cache[key] = (time.time(), {"wants_altered": decision["wants_altered"],
+                                        "pick_id": ids[decision["pick"]],
+                                        "altered_ids": {ids[i] for i in decision["altered"] if 0 <= i < len(ids)}})
+        if len(_ai_cache) > 500:
+            for k, _ in sorted(_ai_cache.items(), key=lambda kv: kv[1][0])[:100]:
+                _ai_cache.pop(k, None)
+    return decision
 
 async def _ai_pick(query: str, cands: list[wavelink.Playable],
                    notes: dict[int, str] | None = None) -> dict | None:
@@ -192,8 +237,8 @@ async def _ai_pick(query: str, cands: list[wavelink.Playable],
     for i, t in enumerate(cands):
         views = (_meta_cache.get(t.uri or "", (0, None))[1] or {}).get("view_count")
         length = f"{(t.length or 0) // 60000}:{(t.length or 0) // 1000 % 60:02d}"
-        lines.append(f"{i}. {t.title} — {t.author} ({length}"
-                     + (f", {views:,} views" if views is not None else "")
+        lines.append(f"{i}. {(t.title or '')[:70]} — {(t.author or '')[:40]} ({length}"
+                     + _short_views(views)
                      + (f"; {notes[i]}" if notes and i in notes else "") + ")")
     for attempt in (1, 2):
         decision = await _ai_pick_once(query, lines, len(cands), last=(attempt == 2))
@@ -211,7 +256,7 @@ async def _ai_pick_once(query: str, lines: list[str], n: int, last: bool):
                 messages=[{"role": "system", "content": _PICK_SYSTEM},
                           {"role": "user", "content": f'Search: "{query}"\nResults:\n' + "\n".join(lines)}],
                 response_format={"type": "json_object"},
-                **{**_GROQ_ARGS, "max_tokens": 1200},
+                **{**_GROQ_ARGS, "max_tokens": 700},
             ),
             timeout=8.0,
         )
@@ -240,7 +285,7 @@ async def _groq_similar(seeds: list[dict], count: int = 5) -> list[str]:
                         "Answer with one song per line, formatted exactly as: Title - Artist. No other text."},
                     {"role": "user", "content": listing},
                 ],
-                max_tokens=800, temperature=0.8,
+                max_tokens=500, temperature=0.8,
                 extra_body={"reasoning_effort": "low"},
             ),
             timeout=10.0,
@@ -354,7 +399,7 @@ async def _taste(guild_id: int, user_id: int) -> dict | None:
         return None
     taste = None
     if rows or queries:
-        ids, songs, titles, artists = {}, {}, {}, {}
+        ids, songs, titles, artists, artist_skips = {}, {}, {}, {}, {}
         for r in rows:
             score = r["plays"] - r["skips"]   # for search, one quick skip cancels one listen
             if r["yt_id"]:
@@ -364,10 +409,11 @@ async def _taste(guild_id: int, user_id: int) -> dict | None:
             songs[sid] = (old[0] + score, max(old[1], r["last_played"]))
             titles.setdefault(sid[0], set()).add(sid[1])
             artists[sid[1]] = artists.get(sid[1], 0) + max(r["plays"], 0)
+            artist_skips[sid[1]] = artist_skips.get(sid[1], 0) + r["skips"]
         by_query: dict[str, list[dict]] = {}
         for q in queries:
             by_query.setdefault(q["query"], []).append(q)
-        taste = {"ids": ids, "songs": songs, "titles": titles, "artists": artists,
+        taste = {"ids": ids, "songs": songs, "titles": titles, "artists": artists, "artist_skips": artist_skips,
                  "total": max(1, sum(artists.values())), "queries": by_query, "rows": rows}
     _taste_cache[key] = (time.monotonic(), taste)
     return taste
@@ -478,8 +524,6 @@ def _track_embed(track, action, source_label, queue_pos=0, search_path=""):
         m, s = divmod(track.length // 1000, 60)
         embed.add_field(name="Duration", value=f"{m}:{s:02d}", inline=True)
     embed.add_field(name="Source", value=source_label, inline=True)
-    if search_path:
-        embed.add_field(name="Found via", value=search_path, inline=True)
     return embed
 
 def _now_playing_embed(track, source_label, search_path=""):
@@ -560,6 +604,8 @@ class Session:
         self.closing      = False
         self.drain_state: str | None = None   # None, "finishing" (current song) or "message" (shutdown.mp3)
         self.created      = time.monotonic()
+        self.mix_cache: dict[str, list] = {}   # seed YouTube id -> its Mix, reused across refills
+        self.ai_reserve: list[str] = []        # unused AI suggestions, used before asking Groq again
         self.history: deque[dict] = deque(maxlen=HISTORY_LEN)
 
     def snapshot(self) -> dict:
@@ -834,6 +880,8 @@ def _query_norm(query: str | None) -> str | None:
     """Search text as stored in search memory: no prefix, accents or punctuation. URLs aren't stored."""
     if not query or query.strip().startswith(("http://", "https://")):
         return None
+    if query.startswith("~"):
+        return query   # internal keys like "~autoplay"
     return " ".join(_words(_SEARCH_PREFIX_RE.sub("", query))) or None
 
 def _set_current(sess: Session, origin: wavelink.Playable,
@@ -1064,9 +1112,10 @@ async def _mix_for(seed: dict) -> list[wavelink.Playable]:
     return [t for t in tracks if t.identifier != yt_id]
 
 def _weighted_pick(rows: list[dict], k: int) -> list[dict]:
+    """Saved songs as autoplay seeds: favours ones played more and more recently."""
     pool, out = list(rows), []
     while pool and len(out) < k:
-        weights = [max(r["score"], 0.5) for r in pool]
+        weights = [max(r["score"], 0.5) * _recency(r.get("last_played", 0)) for r in pool]
         r = random.choices(pool, weights=weights, k=1)[0]
         out.append(r)
         pool.remove(r)
@@ -1081,17 +1130,53 @@ async def _autoplay_seeds(sess: Session) -> list[dict]:
     recent.reverse()   # most recent first
     return recent
 
+async def _mix_cached(sess: Session, seed: dict) -> list[wavelink.Playable]:
+    yt_id = await _yt_id_for(seed)
+    if not yt_id:
+        return []
+    if yt_id not in sess.mix_cache:
+        seed = dict(seed, yt_id=yt_id)
+        sess.mix_cache[yt_id] = await _mix_for(seed)
+    return sess.mix_cache[yt_id]
+
+def _autoplay_score(t: wavelink.Playable, position: int, seed_weight: float, appearances: int,
+                    taste: dict | None) -> float | None:
+    """How good an autoplay pick is for this user. None = don't play it."""
+    score = max(0.0, 25 - position) * seed_weight      # earlier in a Mix = more closely related
+    score += 12 * (appearances - 1)                     # related to several seeds = strong signal
+    if taste:
+        for q in taste["queries"].get(AUTOPLAY_QUERY, []):
+            if q["yt_id"] and q["yt_id"] == t.identifier:
+                net = q["listens"] - 1.5 * q["skips"]
+                if net < 0:
+                    return None                         # skipped when autoplay played it before
+                score += 15 * min(net, 3)
+        bonus, _ = _personal(t, taste, None)            # artist share, known songs, same-title rules
+        score += 0.6 * bonus
+        artist = _artist_key(t.author)
+        skips, plays = taste["artist_skips"].get(artist, 0), taste["artists"].get(artist, 0)
+        if skips >= 2 and skips > plays:
+            score -= 25                                 # an artist this user keeps skipping
+    return score + random.uniform(0, 8)                 # a little variety between refills
+
 async def _recommend(sess: Session, count: int) -> list[tuple[wavelink.Playable, str, str]]:
     seeds = await _autoplay_seeds(sess)
     if not seeds:
         return []
     ids, titles = _excluded_sets(sess)
+    taste = await _taste(sess.guild_id, sess.autoplay_user or sess.controller_id)
     out: list[tuple[wavelink.Playable, str, str]] = []
+    per_artist: dict[str, int] = {}
 
-    def take(t: wavelink.Playable, path: str) -> None:
+    def take(t: wavelink.Playable, path: str) -> bool:
+        artist = _artist_key(t.author)
+        if per_artist.get(artist, 0) >= AUTOPLAY_PER_ARTIST:
+            return False
+        per_artist[artist] = per_artist.get(artist, 0) + 1
         ids.add(t.identifier or "")
         titles.add(_norm_title(t.title or ""))
         out.append((t, AUTOPLAY_LABEL, path))
+        return True
 
     if sess.autoplay_source == "algo" and random.random() < ALGO_DIRECT_CHANCE:
         for seed in seeds:
@@ -1105,21 +1190,38 @@ async def _recommend(sess: Session, count: int) -> list[tuple[wavelink.Playable,
                     take(tracks[0], "Your saved songs")
                 break
 
-    for seed in seeds:
+    # One pool from every seed's Mix (cached per session), ranked for this user.
+    mixes = await asyncio.gather(*[_mix_cached(sess, seed) for seed in seeds])
+    pool: dict[str, dict] = {}
+    for rank, (seed, mix) in enumerate(zip(seeds, mixes)):
+        weight = 1.0 - 0.1 * rank                        # most recent / strongest seed counts most
+        for pos, t in enumerate(mix[:20]):
+            if not _usable_rec(t, ids, titles):
+                continue
+            entry = pool.setdefault(t.identifier or t.uri, {"t": t, "pos": pos, "w": weight, "n": 0,
+                                                            "seed": seed.get("title", "")})
+            entry["n"] += 1
+            entry["pos"], entry["w"] = min(entry["pos"], pos), max(entry["w"], weight)
+    scored = []
+    for e in pool.values():
+        sc = _autoplay_score(e["t"], e["pos"], e["w"], e["n"], taste)
+        if sc is not None:
+            scored.append((sc, e))
+    for sc, e in sorted(scored, key=lambda x: -x[0]):
         if len(out) >= count:
             break
-        mix = [t for t in await _mix_for(seed) if _usable_rec(t, ids, titles)]
-        if mix:
-            take(random.choice(mix[:8]), f"Mix · {seed.get('title', '')[:40]}")
+        take(e["t"], f"Mix · {e['seed'][:40]}")
 
-    if not out:
-        print(f"[Worker {BOT_INDEX}] No mix results — asking Groq for recommendations", flush=True)
-        for line in await _groq_similar(seeds):
-            if len(out) >= count:
-                break
-            t, _, _ = await _search(line, "sp", None)
+    if len(out) < count:
+        # Fallback: AI suggestions. Ask for a batch once and keep the rest for later refills.
+        if not sess.ai_reserve:
+            print(f"[Worker {BOT_INDEX}] Not enough Mix results — asking Groq for a batch of suggestions", flush=True)
+            sess.ai_reserve = await _groq_similar(seeds, count=10)
+        while sess.ai_reserve and len(out) < count:
+            line = sess.ai_reserve.pop(0)
+            t, _, _ = await _search(line, "sp", None, use_ai=False)   # no extra Groq call per song
             if t and _usable_rec(t, ids, titles):
-                take(t, "Autoplay · AI pick")
+                take(t, "AI pick")
     return out
 
 async def _autoplay_refill(sess: Session) -> None:
@@ -1134,7 +1236,7 @@ async def _autoplay_refill(sess: Session) -> None:
         return
     requester = sess.autoplay_user or sess.controller_id
     for t, lbl, path in recs:
-        sess.queue.append(QueueItem(t, lbl, path, requester))
+        sess.queue.append(QueueItem(t, lbl, path, requester, AUTOPLAY_QUERY))
     if recs:
         print(f"[Worker {BOT_INDEX}] Autoplay queued: {', '.join(repr(t.title) for t, _, _ in recs)}", flush=True)
         _prefetch_next(sess)
@@ -1593,7 +1695,7 @@ async def _first_clean(candidates: list) -> wavelink.Playable | None:
     return None
 
 async def _search(query: str, source: str, sess: Session | None,
-                  user_id: int | None = None) -> tuple[wavelink.Playable | None, str, str]:
+                  user_id: int | None = None, use_ai: bool = True) -> tuple[wavelink.Playable | None, str, str]:
     query = _SEARCH_PREFIX_RE.sub("", query).strip()
     label  = _source_label(source, query)
     is_url = query.startswith(("http://", "https://"))
@@ -1678,7 +1780,18 @@ async def _search(query: str, source: str, sess: Session | None,
     top    = [t for t, _ in ranked[:AI_PICK_CANDIDATES]]
 
     notes    = {i: personal[_track_key(t)][1] for i, t in enumerate(top) if personal[_track_key(t)][1]}
-    decision = await _ai_pick(query, top, notes) if top else None
+    obvious  = _obvious_pick(ranked[:AI_PICK_CANDIDATES], asked, personal)
+    if obvious is None and not use_ai:
+        obvious = 0 if top and not _ALTERED_QUICK.search(top[0].title or "") else None
+    if obvious is not None:
+        # Clear winner: no AI call needed (saves Groq tokens).
+        print(f"[Worker {BOT_INDEX}] Clear winner — AI skipped", flush=True)
+        decision = {"wants_altered": asked, "pick": obvious,
+                    "altered": set() if asked else {i for i, t in enumerate(top) if _ALTERED_QUICK.search(t.title or "")}}
+    elif use_ai:
+        decision = await _ai_pick_cached(query, top, notes) if top else None
+    else:
+        decision = None
     if decision:
         wants_altered = decision["wants_altered"] or asked
         altered = set(decision["altered"])
@@ -2177,7 +2290,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
         sess.fail_streak = 0
         played = await _play(sess, player, nxt, req)
         await reply(True, "playing", session=sess.snapshot(),
-                    **_track_reply(played, "playing", "Autoplay", path or "Your saved songs"))
+                    **_track_reply(played, "playing", AUTOPLAY_LABEL, path or "Your saved songs"))
         return
 
 
