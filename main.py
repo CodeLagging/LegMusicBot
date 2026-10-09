@@ -96,10 +96,8 @@ PENDING_TTL = 90.0   # how long a reservation made by /play survives without the
 SHUTDOWN_MP3     = SCRIPT_DIR / "shutdown.mp3"
 DRAIN_TIMEOUT    = 300.0   # after this, songs are cut and the message plays right away
 DRAIN_MESSAGE_MAX = 130.0  # extra time allowed for the message itself to play out
-# `systemctl reload` (SIGHUP) = graceful restart that returns immediately. After draining, the
-# process exits with this code and the unit's RestartForceExitStatus makes systemd start it again.
-RESTART_EXIT_CODE = 75
-_restart_after = False
+PID_FILE = SCRIPT_DIR / ".bot.pid"   # lets launcher.py wait for a previous bot that's still finishing
+_stop_event: asyncio.Event | None = None
 _draining = False
 _force_drain: asyncio.Event | None = None
 
@@ -293,11 +291,30 @@ async def _resync_all() -> None:
 
 # ── worker → main state events ──────────────────────────────────────────────
 
+def _request_stop() -> None:
+    """Start the graceful shutdown (finish songs, play shutdown.mp3, exit).
+    A second request skips the wait: songs are cut and the message plays now."""
+    if _stop_event is None:
+        return
+    if _stop_event.is_set():
+        print("[Main] Second stop request — cutting songs now", flush=True)
+        if _force_drain:
+            _force_drain.set()
+        return
+    _stop_event.set()
+
 async def _handle_event(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
         data = await asyncio.wait_for(reader.readline(), timeout=5.0)
         msg  = json.loads(data.decode())
-        if msg.get("op") == "state":
+        if msg.get("op") == "shutdown":
+            # From launcher.py on `systemctl restart/stop`: acknowledge, then shut down gracefully
+            # in the background so the launcher (and systemctl) can return immediately.
+            print("[Main] Shutdown requested by the launcher — finishing current songs in the background", flush=True)
+            writer.write((json.dumps({"status": "ok", "pid": os.getpid()}) + "\n").encode())
+            await writer.drain()
+            _request_stop()
+        elif msg.get("op") == "state":
             w = _workers.get(int(msg["index"]))
             if w:
                 w.apply(int(msg["guild_id"]), msg.get("session"))
@@ -545,9 +562,7 @@ async def _dev_power(message: discord.Message, cmd: str, arg: str) -> None:
     restart = cmd == "restart"
 
     if arg == "full":
-        # restart -> "reload": the service finishes songs, then exits with RESTART_EXIT_CODE and
-        # systemd starts it again (see ExecReload/RestartForceExitStatus in the unit file).
-        action = "reload" if restart else "stop"
+        action = "restart" if restart else "stop"
         embed = discord.Embed(
             title="🔄  Restarting entire service…" if restart else "🔴  Shutting down entire service…",
             description=(f"Running `systemctl {action} {SERVICE_NAME}`.\n"
@@ -1681,6 +1696,7 @@ async def _run(stop_event: asyncio.Event | None = None):
     global _shutting_down, _force_drain
 
     _force_drain = asyncio.Event()
+    PID_FILE.write_text(str(os.getpid()))
     _migrate_legacy_settings()
     asyncio.create_task(_event_server(), name="event_server")
 
@@ -1723,6 +1739,7 @@ async def _run(stop_event: asyncio.Event | None = None):
     await main_bot.close()
     await asyncio.gather(*[w.terminate() for w in _workers.values()], return_exceptions=True)
     MAIN_SOCKET.unlink(missing_ok=True)
+    PID_FILE.unlink(missing_ok=True)
     print("[Main] All workers stopped.", flush=True)
 
 
@@ -1732,22 +1749,14 @@ if __name__ == "__main__":
         asyncio.set_event_loop(loop)
         stop_evt = asyncio.Event()
 
-        def _sig(reload: bool = False):
-            global _restart_after
-            if stop_evt.is_set():
-                # A second signal skips the wait: songs are cut and the message plays now.
-                print("[Main] Second signal — forcing restart now", flush=True)
-                if _force_drain:
-                    loop.call_soon_threadsafe(_force_drain.set)
-                return
-            _restart_after = reload
-            print("[Main] " + ("Reload — finishing current songs, then restarting ..." if reload
-                               else "Signal — finishing current songs before stopping ..."), flush=True)
-            loop.call_soon_threadsafe(stop_evt.set)
+        _stop_event = stop_evt
+
+        def _sig():
+            print("[Main] Signal — finishing current songs before stopping ...", flush=True)
+            _request_stop()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _sig)
-        loop.add_signal_handler(signal.SIGHUP, _sig, True)
 
         try:
             loop.run_until_complete(_run(stop_event=stop_evt))
@@ -1757,8 +1766,7 @@ if __name__ == "__main__":
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
-        if _restart_after:
-            sys.exit(RESTART_EXIT_CODE)
+
     else:
         try:
             asyncio.run(_run())

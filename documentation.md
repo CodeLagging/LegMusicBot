@@ -27,7 +27,7 @@ The system has four parts that run together on the server:
 
 | Part | File / service | Job |
 |---|---|---|
-| Controller | `main.py` (systemd unit `SERVER_musicbots`) | Logs in as the main bot, registers the slash commands for every server, enforces the whitelist, reads the dev ``prefix`` commands, starts and watches the workers, decides which worker serves which request, and relays commands to them. |
+| Controller | `main.py`, started by `launcher.py` (systemd unit `SERVER_musicbots`) | Logs in as the main bot, registers the slash commands for every server, enforces the whitelist, reads the dev ``prefix`` commands, starts and watches the workers, decides which worker serves which request, and relays commands to them. |
 | Workers | `worker.py`, started once per worker token with `--index N` | Each copy is a separate Discord bot in its own process. Worker N uses `tokens[N]`. A worker keeps **one session per server**, so it can play in one voice channel in every server at the same time. It searches, resolves streams, plays, records listens and runs autoplay. |
 | Storage | `db.py` → `database/` | SQLite files. `database/server/servers.db` holds per-server settings; `database/algo/<server id>.db` holds every user's saved songs for that server. |
 | Lavalink | `localhost:2333` (unit `SERVER_lavalink`) | The audio server, with the youtube-plugin and lavasrc-plugin. Workers connect to it with wavelink. YouTube streams are resolved by yt-dlp first and given to Lavalink as plain URLs. |
@@ -899,7 +899,6 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 |---|---|---|---|
 | `SERVICE_NAME` | main.py | `SERVER_musicbots` | systemd unit used by ``restart full`` / ``shutdown full``. |
 | `DRAIN_TIMEOUT` | main.py | 300 s | Graceful restart: longest wait for current songs before they are cut. |
-| `RESTART_EXIT_CODE` | main.py | 75 | Exit code after a `reload`; the unit restarts the bot on it. |
 | `DRAIN_MESSAGE_MAX` | main.py | 130 s | Graceful restart: extra wait for the shutdown messages after the timeout. |
 | `SHUTDOWN_MESSAGE_MAX` | worker.py | 120 s | A worker leaves this long after starting the message, even if it never reports finishing. |
 | `PENDING_TTL` | main.py | 90 s | How long a `/play` reservation holds a worker without confirmation. |
@@ -936,6 +935,8 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `.worker<N>.sock` | worker | Socket the controller uses to talk to worker N. |
 | `.main.sock` | controller | Socket the workers send state events to. |
 | `shutdown.mp3` | you | Message played before a restart (optional). |
+| `launcher.py` | repo | systemd entry point that makes restart/stop return immediately (section 11). |
+| `.bot.pid` | controller | PID of the running bot, so a new launcher can wait for an old one still finishing. |
 | `settings.json.migrated` | controller | The old single-server settings after their one-time import. |
 
 To reset a server's settings, delete its row from `servers.db` (or the whole file to reset every server). To forget everyone's saved songs on a server, delete `database/algo/<server id>.db`.
@@ -944,46 +945,51 @@ To reset a server's settings, delete its row from `servers.db` (or the whole fil
 
 ## 11. Graceful restart
 
-Use **`sudo systemctl reload SERVER_musicbots`** to restart. It returns immediately; the bot finishes songs in the background and then restarts itself. ``restart full`` does the same.
+`sudo systemctl restart SERVER_musicbots` and `sudo systemctl stop SERVER_musicbots` (and ``restart full`` / ``shutdown full``) **return immediately** and don't cut the music. The waiting happens in the background:
 
-| Command | Returns | What happens |
-|---|---|---|
-| `systemctl reload SERVER_musicbots` | immediately | graceful restart (steps below), then the bot starts again |
-| `systemctl --no-block restart SERVER_musicbots` | immediately | same, through a normal restart |
-| `systemctl --no-block stop SERVER_musicbots` / ``shutdown full`` | immediately | graceful, then stays stopped |
-| `systemctl restart` / `stop` without `--no-block` | when done (up to ~7 min) | same, but systemd makes the command wait — that's how systemd works and can't be changed by the bot |
-
-Steps:
-
-1. `reload` sends SIGHUP; `restart`/`stop` send SIGTERM to the **main bot only** (`KillMode=mixed`).
-2. The main bot blocks new commands ("restarting — try again in a few minutes") and sends `drain` to every worker. A worker that is draining refuses new playback ("hard block"), even after its own song finished.
-3. Each worker, per server:
+1. systemd runs **`launcher.py`**, which starts `main.py --server` as its child. On restart/stop systemd signals **only the launcher** (`KillMode=process`).
+2. The launcher sends `{"op": "shutdown"}` to the bot over `.main.sock`, waits for its **ACK**, and exits. systemd sees the stop as done, so `systemctl` returns. (No ACK within 10 s → the launcher sends the bot SIGTERM, which it handles the same way.)
+3. The bot blocks new commands ("restarting — try again in a few minutes") and sends `drain` to every worker. A draining worker refuses new playback ("hard block"), even after its own song finished.
+4. Each worker, per server:
    - a song is playing → it finishes **that song**; the rest of the queue/playlist and autoplay are dropped;
    - paused or between songs → the message plays right away;
    - nobody in the voice channel → it leaves without a message.
-4. After the song, the worker plays **`shutdown.mp3`** (next to `main.py`) and leaves when it ends (at most 2 minutes). Without the file, it just leaves.
-5. The main bot waits until **every** worker is done, or `DRAIN_TIMEOUT` (5 minutes). At the timeout, songs still playing are cut and the message plays immediately (`drain_force`); then it waits for those messages.
-6. Everything exits. After a reload the bot exits with code 75 and systemd starts it again (`RestartForceExitStatus=75`); after a restart systemd starts it; after a stop it stays stopped.
+5. After the song, the worker plays **`shutdown.mp3`** (next to `main.py`) and leaves when it ends (at most 2 minutes). Without the file, it just leaves.
+6. The bot waits until **every** worker is done, or `DRAIN_TIMEOUT` (5 minutes). At the timeout, songs still playing are cut and the message plays immediately (`drain_force`); then it waits for those messages and exits.
+7. On a restart, systemd has already started a **new launcher**. It sees the old bot still running (its PID is in `.bot.pid`), logs "Previous bot … is still finishing songs — waiting", and starts the new bot once the old one exits (after at most 9 minutes it kills the old one).
 
-A second signal while it waits (another `reload`, or `systemctl kill SERVER_musicbots`) skips the wait and goes straight to step 5. If nothing is playing, it restarts immediately.
+A second stop request while the bot waits (another `systemctl restart`/`stop`) skips the wait and goes straight to step 6. If nothing is playing, it restarts in a few seconds. If the bot crashes, the launcher exits with the same code, so `Restart=on-failure` restarts it as before.
 
-The message is served to Lavalink over a private `http://127.0.0.1:<random port>/shutdown.mp3` by the main bot, so Lavalink must run on the same machine (its `http` source is enabled; its `local` file source is not needed).
+The message is served to Lavalink over a private `http://127.0.0.1:<random port>/shutdown.mp3` by the bot, so Lavalink must run on the same machine (its `http` source is enabled; its `local` file source is not needed).
 
-Required service settings (in `/etc/systemd/system/SERVER_musicbots.service`):
+Service settings (in `/etc/systemd/system/SERVER_musicbots.service`):
 
 ```ini
-ExecReload=/bin/kill -HUP $MAINPID
-KillMode=mixed
-TimeoutStopSec=480
-SuccessExitStatus=75
-RestartForceExitStatus=75
+ExecStart=/home/jared/servers/musicbot_updated/venv/bin/python launcher.py
+KillMode=process
+TimeoutStopSec=30
+Restart=on-failure
 ```
 
-`TimeoutStopSec` must be longer than the 5-minute wait plus the message, otherwise systemd kills everything before it's done.
+`KillMode=process` is what lets the bot outlive the launcher during its graceful shutdown; the bot stops its workers itself.
+
+### launcher.py reference
+
+**`def main()`**
+Waits for a previous bot that's still finishing (from `.bot.pid`, up to `OLD_BOT_WAIT`, 540 s), starts `main.py --server`, and waits for it. Exits with the bot's code if it stops by itself.
+
+**`def _previous_bot()`**
+PID of a still-running bot from `.bot.pid` (checked against `/proc/<pid>/cmdline`), or None.
+
+**`def _ask_bot_to_stop(pid)`**
+Sends the shutdown request and waits for the ACK (`ACK_TIMEOUT`, 10 s); falls back to SIGTERM.
+
+**`main.py`: `def _request_stop()`**
+Starts the graceful shutdown; a second call cuts songs right away. Used by the launcher's shutdown request and by SIGTERM/SIGINT.
 
 ## 12. Deployment and service
 
-The service file is `/etc/systemd/system/SERVER_musicbots.service`. It runs `venv/bin/python main.py --server` from `/home/jared/servers/musicbot_updated`, after `SERVER_lavalink`. A backup of the version that pointed at the old folder is at `~/servers/SERVER_musicbots.service.bak`.
+The service file is `/etc/systemd/system/SERVER_musicbots.service`. It runs `venv/bin/python launcher.py` (which starts `main.py --server`) from `/home/jared/servers/musicbot_updated`, after `SERVER_lavalink`. A backup of the version that pointed at the old folder is at `~/servers/SERVER_musicbots.service.bak`.
 
 Fresh install:
 
