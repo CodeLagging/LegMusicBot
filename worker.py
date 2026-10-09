@@ -1280,6 +1280,12 @@ async def _session_watchdog():
             print(f"[Worker {BOT_INDEX}] Watchdog error: {exc}", flush=True)
 
 async def _watchdog_pass() -> None:
+        # Ghost voice connections: Discord can keep a worker in a channel after the process that
+        # joined it restarted. A worker in voice without a session leaves.
+        for guild in list(bot.guilds):
+            if guild.me and guild.me.voice and guild.me.voice.channel and guild.id not in sessions:
+                print(f"[Worker {BOT_INDEX}] Watchdog: in voice in guild {guild.id} without a session — leaving", flush=True)
+                await _leave_voice(guild.id)
         for gid, sess in list(sessions.items()):
             if sess.connecting or sess.closing or sess.drain_state:
                 continue
@@ -1308,6 +1314,7 @@ async def on_ready():
     asyncio.ensure_future(_connect_lavalink())
     asyncio.ensure_future(_ipc_server())
     asyncio.ensure_future(_session_watchdog())
+    asyncio.get_event_loop().call_later(10, lambda: asyncio.ensure_future(_watchdog_pass()))   # clean ghosts soon after start
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):

@@ -709,7 +709,7 @@ Really leaves the voice channel: stop, disconnect, and if Discord still shows th
 Connects for a play command. A new session never reuses a player left over from an earlier one (a dead leftover holding an old paused track used to make new songs queue behind it and never start).
 
 **`async def _session_watchdog()`** / **`async def _watchdog_pass()`**
-Every 30 s: ends sessions whose voice connection is gone and starts the idle timer for sessions with nothing to play, so a worker can't stay "busy" forever.
+Every 30 s (and 10 s after start): leaves any voice channel the worker is in without a session (a "ghost" connection Discord kept after a restart), ends sessions whose voice connection is gone, and starts the idle timer for sessions with nothing to play, so a worker can't stay "busy" or sit in a channel forever.
 
 **`def _claim(guild_id, channel_id, user_id)`**
 Returns the server's session (creating it with `user_id` as controller when there is none). Raises when the worker already plays in a different channel of that server.
