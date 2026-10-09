@@ -6,6 +6,7 @@ database/algo/<guild_id>.db     per-user listening history ("algo") for that ser
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 DB_ROOT   = Path(__file__).parent / "database"
@@ -28,6 +29,17 @@ def _connect(path: Path) -> sqlite3.Connection:
     return con
 
 
+@contextmanager
+def _tx(con: sqlite3.Connection):
+    """Commit (or roll back) and always close. sqlite3's own `with con:` only commits; the
+    connection stays open until garbage-collected."""
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
+
+
 # ── server config ────────────────────────────────────────────────────────────
 
 def _server_con() -> sqlite3.Connection:
@@ -46,7 +58,7 @@ def _server_con() -> sqlite3.Connection:
 
 
 def get_guild(guild_id: int) -> dict:
-    with _server_con() as con:
+    with _tx(_server_con()) as con:
         row = con.execute("SELECT cc_id, vcw, eph, src FROM guild_settings WHERE guild_id = ?",
                           (guild_id,)).fetchone()
     if not row:
@@ -56,7 +68,7 @@ def get_guild(guild_id: int) -> dict:
 
 
 def save_guild(guild_id: int, cfg: dict) -> None:
-    with _server_con() as con:
+    with _tx(_server_con()) as con:
         con.execute(
             """INSERT INTO guild_settings (guild_id, cc_id, vcw, eph, src, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)
@@ -69,7 +81,7 @@ def save_guild(guild_id: int, cfg: dict) -> None:
 
 
 def guild_exists(guild_id: int) -> bool:
-    with _server_con() as con:
+    with _tx(_server_con()) as con:
         return con.execute("SELECT 1 FROM guild_settings WHERE guild_id = ?",
                            (guild_id,)).fetchone() is not None
 
@@ -112,7 +124,7 @@ def record_play(guild_id: int, user_id: int, meta: dict, max_kb: int) -> None:
     if not key:
         return
     now = time.time()
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         con.execute(
             """INSERT INTO user_tracks (user_id, track_key, title, author, uri, yt_id,
                                         plays, skips, last_played, added_at)
@@ -151,7 +163,7 @@ def record_query(guild_id: int, user_id: int, query: str, meta: dict,
     key = meta.get("key")
     if not key or not query:
         return
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         con.execute(
             """INSERT INTO user_queries (user_id, query, track_key, title, author, yt_id,
                                          listens, skips, last_used)
@@ -175,7 +187,7 @@ def record_query(guild_id: int, user_id: int, query: str, meta: dict,
 def user_queries(guild_id: int, user_id: int) -> list[dict]:
     if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
         return []
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         rows = con.execute("SELECT query, track_key, title, author, yt_id, listens, skips, last_used "
                            "FROM user_queries WHERE user_id = ?", (user_id,)).fetchall()
     return [dict(r) for r in rows]
@@ -184,7 +196,7 @@ def record_skip(guild_id: int, user_id: int, key: str) -> None:
     """A quick skip lowers a saved song's score. Unsaved songs are not added."""
     if not key:
         return
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         con.execute("UPDATE user_tracks SET skips = skips + 1 WHERE user_id = ? AND track_key = ?",
                     (user_id, key))
 
@@ -193,7 +205,7 @@ def user_tracks(guild_id: int, user_id: int, limit: int = 100_000) -> list[dict]
     """The user's saved songs, best first."""
     if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
         return []
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         rows = con.execute(
             f"""SELECT track_key, title, author, uri, yt_id, plays, skips, last_played,
                        {_SCORE_SQL} AS score
@@ -209,7 +221,7 @@ def reset_user(guild_id: int, user_id: int) -> tuple[int, int]:
     Returns (songs deleted, search-memory entries deleted). Never touches other users."""
     if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
         return 0, 0
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         songs   = con.execute("DELETE FROM user_tracks WHERE user_id = ?", (user_id,)).rowcount
         queries = con.execute("DELETE FROM user_queries WHERE user_id = ?", (user_id,)).rowcount
     return songs, queries
@@ -218,7 +230,7 @@ def remove_user_tracks(guild_id: int, user_id: int, keys: list[str]) -> int:
     """Remove chosen songs from one user's algo (and their search memory for those songs)."""
     if not keys or not (ALGO_DIR / f"{int(guild_id)}.db").exists():
         return 0
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         removed = 0
         for k in keys:
             removed += con.execute("DELETE FROM user_tracks WHERE user_id = ? AND track_key = ?",
@@ -230,14 +242,14 @@ def remove_user_tracks(guild_id: int, user_id: int, keys: list[str]) -> int:
 def user_query_count(guild_id: int, user_id: int) -> int:
     if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
         return 0
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         return con.execute("SELECT COUNT(*) FROM user_queries WHERE user_id = ?", (user_id,)).fetchone()[0]
 
 def user_stats(guild_id: int, user_id: int) -> tuple[int, int]:
     """(song count, approx bytes) for one user."""
     if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
         return 0, 0
-    with _algo_con(guild_id) as con:
+    with _tx(_algo_con(guild_id)) as con:
         row = con.execute(f"SELECT COUNT(*), {_SIZE_SQL} FROM user_tracks WHERE user_id = ?",
                           (user_id,)).fetchone()
     return row[0], row[1]

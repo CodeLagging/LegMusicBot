@@ -191,8 +191,12 @@ def _short_views(v: int | None) -> str:
 
 _ai_cache: dict[str, tuple[float, dict]] = {}
 
+def _altered_kinds(text: str) -> set[str]:
+    """Which altered-version words appear ('slowed', 'sped up', ...), normalised for comparison."""
+    return {re.sub(r"[\s_-]+", " ", m.group(1).lower()) for m in _ALTERED_ASK.finditer(text or "")}
+
 def _obvious_pick(ranked_top: list[tuple[wavelink.Playable, float]], asked: bool,
-                  personal: dict[str, tuple[float, str]]) -> int | None:
+                  personal: dict[str, tuple[float, str]], query_kinds: set[str] | None = None) -> int | None:
     """0 when the top result is clearly right and the AI call can be skipped, else None.
     Clear = it's the kind of version asked for (original vs altered by title words), and either
     the user's history strongly points at it or it beats every rival of that kind by AI_SKIP_MARGIN."""
@@ -201,6 +205,8 @@ def _obvious_pick(ranked_top: list[tuple[wavelink.Playable, float]], asked: bool
     t0, s0 = ranked_top[0]
     if bool(_ALTERED_QUICK.search(t0.title or "")) != asked:
         return None
+    if asked and query_kinds and not query_kinds <= _altered_kinds(t0.title or ""):
+        return None   # asked for "slowed" but the top result is e.g. "sped up": let the AI decide
     if personal.get(_track_key(t0), (0.0, ""))[0] >= PERSONAL_STRONG:
         return 0
     rivals = [sc for t, sc in ranked_top[1:] if bool(_ALTERED_QUICK.search(t.title or "")) == asked]
@@ -511,7 +517,7 @@ def _track_embed(track, action, source_label, queue_pos=0, search_path=""):
     title  = track.title  or "Unknown Title"
     author = track.author or "Unknown Artist"
     uri    = track.uri    or ""
-    desc   = f"**[{title}]({uri})**\n{author}" if uri else f"**{title}**\n{author}"
+    desc   = f"**[{_link_text(title)}]({uri})**\n{author}" if uri else f"**{title}**\n{author}"
     embed  = discord.Embed(
         title="▶️  Now Playing" if action == "playing" else "➕  Added to Queue",
         description=desc,
@@ -526,6 +532,10 @@ def _track_embed(track, action, source_label, queue_pos=0, search_path=""):
         embed.add_field(name="Duration", value=f"{m}:{s:02d}", inline=True)
     embed.add_field(name="Source", value=source_label, inline=True)
     return embed
+
+def _link_text(text: str) -> str:
+    """Square brackets in a title (e.g. "[Official Video]") would end the Markdown link early."""
+    return (text or "").replace("[", "\\[").replace("]", "\\]")
 
 def _now_playing_embed(track, source_label, search_path=""):
     return _track_embed(track, "playing", source_label, search_path=search_path)
@@ -688,6 +698,17 @@ def _bg(fn, *args) -> None:
 _url_cache: dict[str, tuple[float, str]] = {}
 _inflight: dict[str, asyncio.Future] = {}
 
+async def _kill_proc(proc) -> None:
+    """Kill a timed-out subprocess and reap it (a killed but never-awaited process lingers)."""
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except Exception:
+        pass
+
 async def _ytdlp_run(video_url: str) -> str | None:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -704,10 +725,7 @@ async def _ytdlp_run(video_url: str) -> str | None:
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=YTDLP_TIMEOUT)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        await _kill_proc(proc)
         print(f"[Worker {BOT_INDEX}] yt-dlp timed out for {video_url}", flush=True)
         return None
     if proc.returncode != 0:
@@ -755,10 +773,7 @@ async def _ytdlp_meta_run(video_url: str) -> dict | None:
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=YTDLP_TIMEOUT)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        await _kill_proc(proc)
         return None
     except Exception as exc:
         print(f"[Worker {BOT_INDEX}] yt-dlp metadata failed: {exc}", flush=True)
@@ -930,6 +945,11 @@ async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable
             print(f"[Worker {BOT_INDEX}] Could not resolve {cand.title!r} — trying next candidate", flush=True)
             continue
         playable, origin, yt_src = resolved
+        try:
+            await player.play(playable)
+        except Exception as exc:
+            print(f"[Worker {BOT_INDEX}] Lavalink refused to play {cand.title!r}: {exc} — trying next candidate", flush=True)
+            continue
         sess.origin[_track_key(playable)] = origin
         _set_current(sess, origin, yt_src, requester, query)
         if i > 0:
@@ -937,7 +957,6 @@ async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable
             rest = sess.fallbacks.get(_track_key(track), [])[i:]
             if rest:
                 sess.fallbacks[_track_key(origin)] = rest
-        await player.play(playable)
         _after_start(sess)
         if i > 0:
             print(f"[Worker {BOT_INDEX}] Playing alternate {origin.title!r} by {origin.author!r} "
@@ -946,9 +965,9 @@ async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable
 
 
     print(f"[Worker {BOT_INDEX}] Resolve failed for {track.title!r} — passing to Lavalink as-is", flush=True)
+    await player.play(track)   # raises if this fails too; callers move on to the next song
     sess.origin[_track_key(track)] = track
     _set_current(sess, track, None, requester, query)
-    await player.play(track)
     _after_start(sess)
     return track
 
@@ -991,16 +1010,42 @@ async def _advance(sess: Session, player: wavelink.Player, announce: bool = True
         await _autoplay_fill(sess)
     if sessions.get(sess.guild_id) is not sess:
         return
-    if sess.queue:
+    while sess.queue and sessions.get(sess.guild_id) is sess:
         item = sess.queue.pop(0)
         nxt, nxt_label, nxt_path, req = item
-        played = await _play(sess, player, nxt, req, item.query)
+        try:
+            played = await _play(sess, player, nxt, req, item.query)
+        except Exception as exc:
+            # This song can't be played at all: skip it instead of leaving the session stuck.
+            print(f"[Worker {BOT_INDEX}] Skipping {nxt.title!r}: {exc}", flush=True)
+            sess.fail_streak += 1
+            if sess.fail_streak >= MAX_FAIL_STREAK:
+                print(f"[Worker {BOT_INDEX}] {sess.fail_streak} songs in a row failed — stopping", flush=True)
+                sess.queue.clear()
+                sess.autoplay = False
+                break
+            if not sess.queue and sess.autoplay:
+                await _autoplay_fill(sess)
+            continue
         if announce and _can_post(sess):
             await _send_status(sess.text_channel, _now_playing_embed(played, nxt_label, nxt_path))
-    else:
-        sess.current_info = None
-        asyncio.ensure_future(_set_vc_status(sess.guild_id, sess.channel_id, None))
-        _start_idle_timer(sess)
+        return
+    if sessions.get(sess.guild_id) is not sess:
+        return
+    sess.current_info = None
+    asyncio.ensure_future(_set_vc_status(sess.guild_id, sess.channel_id, None))
+    _start_idle_timer(sess)
+
+
+async def _advance_safely(sess: Session, player: wavelink.Player, announce: bool = True) -> None:
+    """_advance for event handlers: an error is logged and the session goes idle (it will leave
+    after the idle timeout) instead of the handler dying and the session hanging."""
+    try:
+        await _advance(sess, player, announce)
+    except Exception as exc:
+        print(f"[Worker {BOT_INDEX}] Could not continue playback in guild {sess.guild_id}: {exc}", flush=True)
+        if sessions.get(sess.guild_id) is sess:
+            _start_idle_timer(sess)
 
 
 # ── normalization ────────────────────────────────────────────────────────────
@@ -1249,10 +1294,9 @@ def _kick_autoplay(sess: Session) -> None:
 
 async def _autoplay_fill(sess: Session) -> None:
     _kick_autoplay(sess)
-    try:
-        await sess.autoplay_task
-    except Exception:
-        pass
+    # asyncio.wait never raises: if the refill is cancelled (stop / restart), awaiting it directly
+    # would raise CancelledError into the song change or command that is waiting for it.
+    await asyncio.wait([sess.autoplay_task])
 
 
 # ── idle / lifecycle ─────────────────────────────────────────────────────────
@@ -1384,24 +1428,24 @@ async def _session_watchdog():
             print(f"[Worker {BOT_INDEX}] Watchdog error: {exc}", flush=True)
 
 async def _watchdog_pass() -> None:
-        # Ghost voice connections: Discord can keep a worker in a channel after the process that
-        # joined it restarted. A worker in voice without a session leaves.
-        for guild in list(bot.guilds):
-            if guild.me and guild.me.voice and guild.me.voice.channel and guild.id not in sessions:
-                print(f"[Worker {BOT_INDEX}] Watchdog: in voice in guild {guild.id} without a session — leaving", flush=True)
-                await _leave_voice(guild.id)
-        for gid, sess in list(sessions.items()):
-            if sess.connecting or sess.closing or sess.drain_state:
-                continue
-            if time.monotonic() - sess.created < 90:
-                continue   # still searching / connecting
-            player = _get_player(gid)
-            if player is None or not getattr(player, "connected", True):
-                print(f"[Worker {BOT_INDEX}] Watchdog: session in guild {gid} has no voice connection — ending", flush=True)
-                await _end_session(gid, disconnect=False)
-            elif player.current is None and not sess.queue and not (sess.idle_task and not sess.idle_task.done()):
-                print(f"[Worker {BOT_INDEX}] Watchdog: nothing playing in guild {gid} — starting idle timer", flush=True)
-                _start_idle_timer(sess)
+    # Ghost voice connections: Discord can keep a worker in a channel after the process that
+    # joined it restarted. A worker in voice without a session leaves.
+    for guild in list(bot.guilds):
+        if guild.me and guild.me.voice and guild.me.voice.channel and guild.id not in sessions:
+            print(f"[Worker {BOT_INDEX}] Watchdog: in voice in guild {guild.id} without a session — leaving", flush=True)
+            await _leave_voice(guild.id)
+    for gid, sess in list(sessions.items()):
+        if sess.connecting or sess.closing or sess.drain_state:
+            continue
+        if time.monotonic() - sess.created < 90:
+            continue   # still searching / connecting
+        player = _get_player(gid)
+        if player is None or not getattr(player, "connected", True):
+            print(f"[Worker {BOT_INDEX}] Watchdog: session in guild {gid} has no voice connection — ending", flush=True)
+            await _end_session(gid, disconnect=False)
+        elif player.current is None and not sess.queue and not (sess.idle_task and not sess.idle_task.done()):
+            print(f"[Worker {BOT_INDEX}] Watchdog: nothing playing in guild {gid} — starting idle timer", flush=True)
+            _start_idle_timer(sess)
 
 @bot.event
 async def on_ready():
@@ -1471,7 +1515,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     if sess.loop and orig:
         sess.queue.insert(0, QueueItem(orig, "Looping", "", sess.current_requester))
 
-    await _advance(sess, player)
+    await _advance_safely(sess, player)
 
 @bot.event
 async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPayload):
@@ -1524,9 +1568,12 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
         if alternatives:
             sess.fallbacks[_track_key(nxt)] = alternatives
         print(f"[Worker {BOT_INDEX}] Trying alternate track: {nxt.title!r}", flush=True)
-        await _play(sess, player, nxt, sess.current_requester, sess.current_query)
-        return
-    await _advance(sess, player, announce=False)
+        try:
+            await _play(sess, player, nxt, sess.current_requester, sess.current_query)
+            return
+        except Exception as exc:
+            print(f"[Worker {BOT_INDEX}] Alternate failed too: {exc}", flush=True)
+    await _advance_safely(sess, player, announce=False)
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
@@ -1596,6 +1643,9 @@ async def _connect_vc(sess: Session) -> wavelink.Player:
     if not isinstance(vc, discord.VoiceChannel):
         raise RuntimeError(f"Channel {sess.channel_id} not found or not a voice channel")
     player: wavelink.Player = guild.voice_client
+    if player and getattr(player, "channel", None) is None:
+        await _leave_voice(sess.guild_id)   # half-disconnected leftover: start clean
+        player = None
     if player and player.channel.id == vc.id:
         return player
     sess.connecting = True
@@ -1782,7 +1832,7 @@ async def _search(query: str, source: str, sess: Session | None,
     top    = [t for t, _ in ranked[:AI_PICK_CANDIDATES]]
 
     notes    = {i: personal[_track_key(t)][1] for i, t in enumerate(top) if personal[_track_key(t)][1]}
-    obvious  = _obvious_pick(ranked[:AI_PICK_CANDIDATES], asked, personal)
+    obvious  = _obvious_pick(ranked[:AI_PICK_CANDIDATES], asked, personal, _altered_kinds(query))
     if obvious is None and not use_ai:
         obvious = 0 if top and not _ALTERED_QUICK.search(top[0].title or "") else None
     if obvious is not None:
@@ -1919,9 +1969,14 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
         op  = cmd.get("op")
 
         async def reply(ok: bool, msg: str = "", **extra):
+            # If the controller already gave up waiting (timeout), the connection is gone. That
+            # must not count as a failure: before, it ended the session that had just started.
             resp = json.dumps({"status": "ok" if ok else "error", "message": msg, **extra})
-            writer.write((resp + "\n").encode())
-            await writer.drain()
+            try:
+                writer.write((resp + "\n").encode())
+                await writer.drain()
+            except (ConnectionError, OSError) as exc:
+                print(f"[Worker {BOT_INDEX}] Reply to controller lost ({op}): {exc}", flush=True)
 
         gid  = int(cmd["guild_id"]) if cmd.get("guild_id") else None
         cid  = int(cmd["channel_id"]) if cmd.get("channel_id") else None
@@ -2094,10 +2149,11 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             if not player or not player.playing:
                 await reply(False, "Nothing playing.")
                 return
-            delta = cmd.get("delta_ms", 0)
+            delta = int(cmd.get("delta_ms", 0))
             pos   = max(0, player.position + delta)
-            if player.current and pos > player.current.length:
-                pos = max(0, player.current.length - 1000)
+            length = (player.current.length or 0) if player.current else 0
+            if length and pos > length:   # streams have no length: don't clamp them to 0
+                pos = max(0, length - 1000)
             await player.seek(int(pos))
             await reply(True, "seeked", delta_ms=delta)
             return
@@ -2182,9 +2238,15 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             try:
                 await player.stop()
                 sess.fail_streak = 0
-                target_track = await _play(sess, player, target_track, target_req, target_item.query)
-                if _can_post(sess):
-                    await _send_status(sess.text_channel, _now_playing_embed(target_track, target_lbl, target_path))
+                try:
+                    target_track = await _play(sess, player, target_track, target_req, target_item.query)
+                    if _can_post(sess):
+                        await _send_status(sess.text_channel, _now_playing_embed(target_track, target_lbl, target_path))
+                except Exception as exc:
+                    print(f"[Worker {BOT_INDEX}] Jump target failed: {exc} — continuing with the queue", flush=True)
+                    await _advance_safely(sess, player)
+                    await reply(False, f"Couldn't play {target_track.title or 'that song'} — moved on to the next one.")
+                    return
             finally:
                 sess.skipping = False
             await reply(True, "jumped",
@@ -2221,6 +2283,17 @@ async def _fresh_vc(sess: Session, new: bool) -> wavelink.Player:
             sess.connecting = False
     return await _connect_vc(sess)
 
+async def _abandoned(sess: Session, reply) -> bool:
+    """True if the session was stopped (/stop, or a restart began) while we were searching or
+    connecting. Playing anyway would leave music running with no session to control or stop it."""
+    if sessions.get(sess.guild_id) is sess:
+        return False
+    print(f"[Worker {BOT_INDEX}] Session in guild {sess.guild_id} ended before playback started — not playing", flush=True)
+    if sess.guild_id not in sessions:
+        await _leave_voice(sess.guild_id)
+    await reply(False, "Playback was stopped before it started.")
+    return True
+
 async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, new: bool = False) -> None:
     """Ops that can start playback: /play, /playlist, /autoplay."""
     gid = sess.guild_id
@@ -2231,6 +2304,8 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
             await reply(False, "Nothing found.")
             return
         player = await _fresh_vc(sess, new)
+        if await _abandoned(sess, reply):
+            return
         if player.playing:
             pos = _enqueue(sess, QueueItem(track, lbl, path, uid, cmd["query"]))
             await reply(True, "queued", session=sess.snapshot(),
@@ -2248,6 +2323,8 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
             await reply(False, f"No playable tracks found.{' (' + str(skipped) + ' local skipped)' if skipped else ''}")
             return
         player = await _fresh_vc(sess, new)
+        if await _abandoned(sess, reply):
+            return
         first = tracks[0]
         if player.playing:
             for t in tracks: _enqueue(sess, QueueItem(t, lbl, "Playlist", uid))
@@ -2278,6 +2355,8 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
         sess.autoplay_user   = uid
         _notify(gid)
         player = await _fresh_vc(sess, new)
+        if await _abandoned(sess, reply):
+            return
         if player.playing:
             sess.queue = [q for q in sess.queue if q[1] != AUTOPLAY_LABEL]
             if not sess.queue:
@@ -2285,12 +2364,15 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
             await reply(True, "autoplay_on", autoplay=True, session=sess.snapshot())
             return
         await _autoplay_fill(sess)
+        if await _abandoned(sess, reply):
+            return
         if not sess.queue:
             await reply(False, "Couldn't find anything to autoplay right now — try again in a bit.")
             return
-        nxt, lbl, path, req = sess.queue.pop(0)
+        item = sess.queue.pop(0)
+        nxt, lbl, path, req = item
         sess.fail_streak = 0
-        played = await _play(sess, player, nxt, req)
+        played = await _play(sess, player, nxt, req, item.query)
         await reply(True, "playing", session=sess.snapshot(),
                     **_track_reply(played, "playing", AUTOPLAY_LABEL, path or "Your saved songs"))
         return
@@ -2299,7 +2381,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
 async def _ipc_server():
     if SOCKET_PATH.exists():
         SOCKET_PATH.unlink()
-    server = await asyncio.start_unix_server(_handle_connection, path=str(SOCKET_PATH))
+    server = await asyncio.start_unix_server(_handle_connection, path=str(SOCKET_PATH), limit=1 << 20)
     print(f"[Worker {BOT_INDEX}] IPC listening on {SOCKET_PATH}", flush=True)
     async with server:
         await server.serve_forever()

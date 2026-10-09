@@ -97,6 +97,8 @@ def _migrate_legacy_settings() -> None:
 # ── worker processes ────────────────────────────────────────────────────────
 
 PENDING_TTL = 90.0   # how long a reservation made by /play survives without the worker confirming it
+IPC_LINE_LIMIT = 8 << 20   # longest reply line accepted from a worker (bytes)
+HUNG_AFTER     = 4         # failed 30-second health checks in a row before a running worker is restarted
 
 # Graceful restart (systemctl restart/stop): finish current songs, play shutdown.mp3, then exit.
 SHUTDOWN_MP3     = SCRIPT_DIR / "shutdown.mp3"
@@ -123,6 +125,14 @@ class WorkerProcess:
         self.guild_ids: set[int] = set()
         self.user_id: int | None = None
         self.lavalink_ok = False
+        # Serialises start/restart: the watchdog and a dev ``restart`` must never both start a
+        # process (that left two copies of one worker logged in, one of them untracked).
+        self.lock = asyncio.Lock()
+        self.watch_task: asyncio.Task | None = None
+
+    def ensure_watched(self) -> None:
+        if self.watch_task is None or self.watch_task.done():
+            self.watch_task = asyncio.create_task(_watch_worker(self))
 
     def session(self, guild_id: int) -> dict | None:
         s = self.sessions.get(guild_id)
@@ -174,13 +184,21 @@ class WorkerProcess:
         asyncio.ensure_future(self._reap())
 
     async def _stream_output(self):
+        """Copy the worker's output into our log. This must never stop reading: if the pipe fills
+        up, the worker blocks on its next print and freezes. Very long lines are split, not fatal."""
         if not self.proc or not self.proc.stdout:
             return
         loop = asyncio.get_event_loop()
-        reader = asyncio.StreamReader()
+        reader = asyncio.StreamReader(limit=1 << 20)
         protocol = asyncio.StreamReaderProtocol(reader)
         await loop.connect_read_pipe(lambda: protocol, self.proc.stdout)
-        async for line in reader:
+        while True:
+            try:
+                line = await reader.readline()
+            except (ValueError, asyncio.LimitOverrunError):
+                line = await reader.read(1 << 16)   # over-long line: take a chunk and keep going
+            if not line:
+                return
             print(f"[Worker {self.index}] {line.decode(errors='replace').rstrip()}", flush=True)
 
     async def _reap(self):
@@ -195,7 +213,17 @@ class WorkerProcess:
         return self.proc is not None and self.proc.poll() is None
 
     async def terminate(self, timeout: float = 8.0):
-        if not self.proc or not self.is_alive():
+        if self.proc is None:
+            # Adopted from a previous controller (no process handle): ask it to exit over IPC
+            # and wait for its socket to go away, so restarting it can't create a second copy.
+            if self.socket_path.exists():
+                await self.send({"op": "shutdown_graceful"}, timeout=5.0)
+                for _ in range(int(timeout * 2)):
+                    if not self.socket_path.exists():
+                        break
+                    await asyncio.sleep(0.5)
+            return
+        if not self.is_alive():
             return
 
         try:
@@ -231,18 +259,22 @@ class WorkerProcess:
                 pass
 
     async def restart(self):
-        print(f"[Main] Restarting Worker {self.index} ...", flush=True)
-        self.clear_state()
-        self._shutdown_requested = False
-        await self.terminate()
-        await asyncio.sleep(1)
-        self.start()
+        async with self.lock:
+            print(f"[Main] Restarting Worker {self.index} ...", flush=True)
+            self.clear_state()
+            self._shutdown_requested = False
+            await self.terminate()
+            await asyncio.sleep(1)
+            self.start()
+        self.ensure_watched()   # a worker shut down earlier lost its watcher
 
     async def send(self, cmd: dict, timeout: float = 15.0) -> dict:
         for attempt in range(3):
             try:
+                # Large limit: a get_queue reply for a few-hundred-song playlist is bigger than the
+                # default 64 KB line limit, which made /control fail on long queues.
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_unix_connection(str(self.socket_path)),
+                    asyncio.open_unix_connection(str(self.socket_path), limit=IPC_LINE_LIMIT),
                     timeout=5.0,
                 )
                 writer.write((json.dumps(cmd) + "\n").encode())
@@ -351,7 +383,8 @@ def _embed_from_response(resp: dict) -> discord.Embed | None:
         dur_ms  = resp.get("duration", 0)
         lbl     = resp.get("source_label", "")
         qpos    = resp.get("queue_pos", 0)
-        desc    = f"**[{title}]({uri})**\n{author}" if uri else f"**{title}**\n{author}"
+        link    = (title or "").replace("[", "\\[").replace("]", "\\]")   # "[Official Video]" would end the link
+        desc    = f"**[{link}]({uri})**\n{author}" if uri else f"**{title}**\n{author}"
         embed   = discord.Embed(
             title="▶️  Now Playing" if et == "playing" else "➕  Added to Queue",
             description=desc,
@@ -848,6 +881,9 @@ async def _start_playback(interaction: discord.Interaction, op: str, eph_key: st
         w.apply(guild_id, resp["session"])
 
 _source_choices = [app_commands.Choice(name=label, value=key) for key, label in SOURCES.items()]
+# Search (Spotify + YouTube Music + AI) plus joining voice and fetching the stream can exceed 30 s
+# on a slow moment; the interaction itself stays valid for 15 minutes.
+PLAY_TIMEOUT = 90.0
 
 
 @main_bot.tree.command(name="play", description="Play a song — name or URL (YouTube / SoundCloud / Spotify)")
@@ -857,7 +893,7 @@ _source_choices = [app_commands.Choice(name=label, value=key) for key, label in 
 async def slash_play(interaction: discord.Interaction, query: str,
                      source: app_commands.Choice[str] | None = None, worker: int = 0):
     if not await _guard(interaction): return
-    await _start_playback(interaction, "search_and_play", "P_EPH", worker,
+    await _start_playback(interaction, "search_and_play", "P_EPH", worker, timeout=PLAY_TIMEOUT,
                           query=query, source=source.value if source else _cfg_src(interaction.guild_id))
 
 
@@ -868,7 +904,7 @@ async def slash_play(interaction: discord.Interaction, query: str,
 async def slash_playlist(interaction: discord.Interaction, query: str,
                          source: app_commands.Choice[str] | None = None, worker: int = 0):
     if not await _guard(interaction): return
-    await _start_playback(interaction, "search_and_playlist", "PL_EPH", worker,
+    await _start_playback(interaction, "search_and_playlist", "PL_EPH", worker, timeout=PLAY_TIMEOUT,
                           query=query, source=source.value if source else _cfg_src(interaction.guild_id))
 
 
@@ -876,7 +912,7 @@ async def slash_playlist(interaction: discord.Interaction, query: str,
 @app_commands.describe(worker="Force a specific worker bot (0 = automatic)")
 async def slash_autoplay(interaction: discord.Interaction, worker: int = 0):
     if not await _guard(interaction): return
-    await _start_playback(interaction, "autoplay_start", "AP_EPH", worker, timeout=60.0)
+    await _start_playback(interaction, "autoplay_start", "AP_EPH", worker, timeout=PLAY_TIMEOUT)
 
 
 @main_bot.tree.command(name="stop", description="Stop music and disconnect")
@@ -950,10 +986,10 @@ class QueueSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=self._ctrl.eph)
-        if not self.values or self.values[0] == "__empty__":
+        if self.values and self.values[0] == "__empty__":
             return
-
-        self._ctrl._selected_qid = int(self.values[0])
+        # Nothing chosen = the user cleared the selection: Jump To / Remove must not act on the old one.
+        self._ctrl._selected_qid = int(self.values[0]) if self.values else None
         await _refresh_control_panel(interaction, self._ctrl,
                                      page=self._ctrl._queue_page,
                                      selected_qid=self._ctrl._selected_qid)
@@ -1646,10 +1682,12 @@ class AlgoMenuView(discord.ui.View):
         if page_rows:
             pick = discord.ui.Select(
                 placeholder="Select songs to remove…", min_values=0, max_values=len(page_rows), row=0,
+                # Values are positions in this menu's own list (Discord caps values at 100 chars;
+                # song keys can be long URLs). The list never changes while this menu is open.
                 options=[discord.SelectOption(
                     label=_truncate(f"#{self.page * ALGO_PAGE + i + 1}  {r['title'] or '?'}", 100),
                     description=_truncate(f"{r['author'] or '?'} · {r['plays']} play(s)", 100),
-                    value=r["track_key"], default=r["track_key"] in self.selected)
+                    value=str(self.page * ALGO_PAGE + i), default=r["track_key"] in self.selected)
                     for i, r in enumerate(page_rows)])
             pick.callback = self._on_pick
             self.pick = pick
@@ -1696,9 +1734,9 @@ class AlgoMenuView(discord.ui.View):
         on_page = {r["track_key"]: r for r in self.rows[self.page * ALGO_PAGE:(self.page + 1) * ALGO_PAGE]}
         for k in on_page:
             self.selected.pop(k, None)
-        for k in self.pick.values:
-            r = on_page[k]
-            self.selected[k] = f"{r['title'] or '?'} — {r['author'] or '?'}"
+        for v in self.pick.values:
+            r = self.rows[int(v)]
+            self.selected[r["track_key"]] = f"{r['title'] or '?'} — {r['author'] or '?'}"
         await self._goto(interaction, self.page)
 
     async def _on_reset(self, interaction: discord.Interaction):
@@ -1824,6 +1862,7 @@ async def slash_purge(interaction: discord.Interaction, limit: int = 20):
 
 async def _watch_worker(w: WorkerProcess):
     ticks = 0
+    failed_checks = 0
     while True:
         await asyncio.sleep(5)
         if _shutting_down:
@@ -1839,13 +1878,32 @@ async def _watch_worker(w: WorkerProcess):
             if w._shutdown_requested:
                 print(f"[Main] Worker {w.index} is shut down (requested) — not restarting", flush=True)
                 return
-            print(f"[Main] Worker {w.index} unresponsive — restarting in 3s", flush=True)
-            w.clear_state()
-            await asyncio.sleep(3)
-            if not _shutting_down:
-                w.start()
+            if w.lock.locked():
+                continue   # a dev ``restart`` is already bringing it back
+            async with w.lock:
+                if w.proc is not None and w.is_alive():
+                    continue   # restarted by someone else meanwhile
+                print(f"[Main] Worker {w.index} unresponsive — restarting in 3s", flush=True)
+                w.clear_state()
+                await asyncio.sleep(3)
+                if not _shutting_down and not w._shutdown_requested:
+                    if w.proc is None:
+                        await w.terminate()   # adopted worker that stopped answering
+                    w.start()
         elif ticks % 6 == 0:
-            await _resync_worker(w)   # backstop in case a state event was lost
+            # Backstop in case a state event was lost, and a health check: a worker whose process
+            # is alive but that stops answering (frozen event loop) is killed and restarted.
+            if await _resync_worker(w):
+                failed_checks = 0
+            elif w.proc is not None and not w.lock.locked():
+                failed_checks += 1
+                if failed_checks >= HUNG_AFTER:
+                    print(f"[Main] Worker {w.index} hasn't answered for {failed_checks * 30}s — killing it", flush=True)
+                    failed_checks = 0
+                    try:
+                        os.killpg(w._pgid, signal.SIGKILL) if w._pgid else w.proc.kill()
+                    except ProcessLookupError:
+                        pass
 
 
 async def _serve_shutdown_message():
@@ -1881,7 +1939,11 @@ async def _drain_workers() -> None:
         print(f"[Main] Restart scheduled — waiting up to {int(DRAIN_TIMEOUT)}s for current songs to finish", flush=True)
 
         async def still_busy() -> list[WorkerProcess]:
-            await _resync_all()
+            results = await asyncio.gather(*[_resync_worker(w, timeout=3.0) for w in live],
+                                           return_exceptions=True)
+            for w, ok in zip(live, results):
+                if ok is not True:
+                    w.sessions.clear()   # not answering (crashed/exited): nothing left to wait for
             return [w for w in live if w.sessions]
 
         deadline = time.monotonic() + DRAIN_TIMEOUT
@@ -1923,21 +1985,31 @@ async def _run(stop_event: asyncio.Event | None = None):
             alive = await _resync_worker(w)
             if alive:
                 print(f"[Main] Worker {w.index} already running ({len(w.sessions)} session(s)) — skipping spawn", flush=True)
-                asyncio.create_task(_watch_worker(w))
+                w.ensure_watched()
                 continue
             print(f"[Main] Worker {w.index} socket stale — spawning fresh", flush=True)
         w.start()
-        asyncio.create_task(_watch_worker(w))
+        w.ensure_watched()
         await asyncio.sleep(1)
 
     print(f"[Main] All {len(_workers)} worker(s) ready", flush=True)
 
+    exit_code = 0
     if stop_event:
-        await stop_event.wait()
-        try:
-            await _drain_workers()
-        except Exception as exc:
-            print(f"[Main] Graceful restart failed: {exc} — stopping now", flush=True)
+        stop_wait = asyncio.create_task(stop_event.wait())
+        await asyncio.wait({stop_wait, main_task}, return_when=asyncio.FIRST_COMPLETED)
+        if main_task.done() and not stop_event.is_set():
+            # discord.py reconnects by itself; ending means a fatal error (bad token, intents…).
+            # Exit with an error so the launcher / systemd restart us instead of idling offline.
+            exc = main_task.exception() if not main_task.cancelled() else None
+            print(f"[Main] Discord connection ended ({exc!r}) — exiting so the service restarts", flush=True)
+            exit_code = 1
+            stop_wait.cancel()
+        else:
+            try:
+                await _drain_workers()
+            except Exception as exc:
+                print(f"[Main] Graceful restart failed: {exc} — stopping now", flush=True)
     else:
         try:
             await main_task
@@ -1951,6 +2023,7 @@ async def _run(stop_event: asyncio.Event | None = None):
     MAIN_SOCKET.unlink(missing_ok=True)
     PID_FILE.unlink(missing_ok=True)
     print("[Main] All workers stopped.", flush=True)
+    return exit_code
 
 
 if __name__ == "__main__":
@@ -1968,14 +2041,16 @@ if __name__ == "__main__":
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _sig)
 
+        code = 1
         try:
-            loop.run_until_complete(_run(stop_event=stop_evt))
+            code = loop.run_until_complete(_run(stop_event=stop_evt)) or 0
         finally:
             pending = asyncio.all_tasks(loop)
             for t in pending: t.cancel()
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
+        sys.exit(code)
 
     else:
         try:
