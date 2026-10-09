@@ -15,6 +15,16 @@ from discord import app_commands
 import appsettings
 import db
 
+# Fire-and-forget tasks are kept here until they finish: asyncio only holds weak references to
+# tasks, so an unreferenced task can be garbage-collected mid-run (Python docs, create_task).
+_BG_TASKS: set = set()
+
+def _spawn(coro):
+    task = asyncio.ensure_future(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -181,7 +191,7 @@ class WorkerProcess:
             self._output_task.cancel()
         self._output_task = asyncio.ensure_future(self._stream_output())
 
-        asyncio.ensure_future(self._reap())
+        _spawn(self._reap())
 
     async def _stream_output(self):
         """Copy the worker's output into our log. This must never stop reading: if the pipe fills
@@ -619,7 +629,7 @@ async def _dev_power(message: discord.Message, cmd: str, arg: str) -> None:
         )
         embed.set_footer(text="This message will not update.")
         await message.reply(embed=embed, mention_author=False)
-        asyncio.ensure_future(_delayed_systemctl(action, delay=2.0))
+        _spawn(_delayed_systemctl(action, delay=2.0))
         return
 
     if arg in ("", "all", "0"):
@@ -1401,7 +1411,7 @@ async def slash_control(interaction: discord.Interaction, worker: int = 0):
     embed, view = await _build_control_view(w, interaction.guild_id, page=0, state=state)
     state.message = await interaction.followup.send(embed=embed, view=view, ephemeral=eph, wait=True)
     state.show(view)
-    asyncio.create_task(_panel_autorefresh(state))
+    _spawn(_panel_autorefresh(state))
 
 
 @main_bot.tree.command(name="hctest", description="Health check — tests all systems")
@@ -1506,23 +1516,24 @@ class SettingsView(discord.ui.View):
         self.cc_select = cc_select
         self.add_item(cc_select)
 
-        worker_select = discord.ui.Select(
-            row=1, min_values=1, max_values=1,
-            options=[discord.SelectOption(label=f"Worker {w.index}", value=str(w.index),
-                                          description="Choose which worker's fixed channel to edit",
-                                          default=(w.index == worker_idx))
-                     for w in _ordered_workers()])
-        worker_select.callback = self._on_worker
-        self.worker_select = worker_select
-        self.add_item(worker_select)
+        if _workers:   # empty for a few seconds right after a restart; Discord rejects empty dropdowns
+            worker_select = discord.ui.Select(
+                row=1, min_values=1, max_values=1,
+                options=[discord.SelectOption(label=f"Worker {w.index}", value=str(w.index),
+                                              description="Choose which worker's fixed channel to edit",
+                                              default=(w.index == worker_idx))
+                         for w in _ordered_workers()])
+            worker_select.callback = self._on_worker
+            self.worker_select = worker_select
+            self.add_item(worker_select)
 
-        vc_select = discord.ui.ChannelSelect(
-            channel_types=[discord.ChannelType.voice], min_values=0, max_values=1, row=2,
-            placeholder=f"Worker {worker_idx} fixed voice channel (empty = follow the user)",
-            default_values=_channel_default(_cfg_vcw(gid, worker_idx)))
-        vc_select.callback = self._on_vc
-        self.vc_select = vc_select
-        self.add_item(vc_select)
+            vc_select = discord.ui.ChannelSelect(
+                channel_types=[discord.ChannelType.voice], min_values=0, max_values=1, row=2,
+                placeholder=f"Worker {worker_idx} fixed voice channel (empty = follow the user)",
+                default_values=_channel_default(_cfg_vcw(gid, worker_idx)))
+            vc_select.callback = self._on_vc
+            self.vc_select = vc_select
+            self.add_item(vc_select)
 
         eph_select = discord.ui.Select(
             row=3, min_values=0, max_values=len(EPH_KEYS),
@@ -1970,7 +1981,7 @@ async def _run(stop_event: asyncio.Event | None = None):
     _force_drain = asyncio.Event()
     PID_FILE.write_text(str(os.getpid()))
     _migrate_legacy_settings()
-    asyncio.create_task(_event_server(), name="event_server")
+    _spawn(_event_server())
 
     main_task = asyncio.create_task(main_bot.start(TOKENS[0]), name="main_bot")
     await asyncio.sleep(5)

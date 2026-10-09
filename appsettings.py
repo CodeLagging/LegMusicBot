@@ -55,12 +55,28 @@ def require_startup() -> dict:
     return s
 
 
+def _id_set(values) -> set[int]:
+    """IDs from a settings list; a typo in one entry is skipped (and logged) instead of raising on
+    every message the bot sees."""
+    out = set()
+    for v in values or []:
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            if repr(v) not in _warned:
+                _warned.add(repr(v))
+                print(f"[Settings] Ignoring invalid id {v!r} in {PATH.name}", flush=True)
+    return out
+
+_warned: set[str] = set()
+
+
 def is_dev(user_id: int) -> bool:
-    return int(user_id) in {int(i) for i in get()["dev_ids"]}
+    return int(user_id) in _id_set(get()["dev_ids"])
 
 
 def is_whitelisted(guild_id: int) -> bool:
     s = get()
     if not s["whitelist_enabled"]:
         return True
-    return int(guild_id) in {int(i) for i in s["whitelist"]}
+    return int(guild_id) in _id_set(s["whitelist"])

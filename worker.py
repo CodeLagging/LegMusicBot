@@ -37,6 +37,16 @@ from groq import AsyncGroq
 import appsettings
 import db
 
+# Fire-and-forget tasks are kept here until they finish: asyncio only holds weak references to
+# tasks, so an unreferenced task can be garbage-collected mid-run (Python docs, create_task).
+_BG_TASKS: set = set()
+
+def _spawn(coro):
+    task = asyncio.ensure_future(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
 _SETTINGS     = appsettings.require_startup()
 TOKEN         = _SETTINGS["tokens"][BOT_INDEX]
 LAVALINK_URI  = _SETTINGS["lavalink"]["uri"]
@@ -546,7 +556,7 @@ _STATUS_DELETE_DELAY = 10
 async def _send_status(channel: discord.TextChannel, embed: discord.Embed):
     try:
         msg = await channel.send(embed=embed)
-        asyncio.ensure_future(_delete_after(msg, _STATUS_DELETE_DELAY))
+        _spawn(_delete_after(msg, _STATUS_DELETE_DELAY))
     except Exception:
         pass
 
@@ -692,7 +702,7 @@ def _bg(fn, *args) -> None:
             await asyncio.to_thread(fn, *args)
         except Exception as exc:
             print(f"[Worker {BOT_INDEX}] DB error in {fn.__name__}: {exc}", flush=True)
-    asyncio.ensure_future(run())
+    _spawn(run())
 
 
 _url_cache: dict[str, tuple[float, str]] = {}
@@ -891,7 +901,7 @@ def _prefetch_next(sess: Session) -> None:
         return
     uri = sess.queue[0][0].uri or ""
     if _YT_RE.search(uri):
-        asyncio.ensure_future(_ytdlp_url(uri))
+        _spawn(_ytdlp_url(uri))
 
 def _query_norm(query: str | None) -> str | None:
     """Search text as stored in search memory: no prefix, accents or punctuation. URLs aren't stored."""
@@ -926,7 +936,7 @@ async def _set_vc_status(guild_id: int, channel_id: int, title: str | None) -> N
 
 def _after_start(sess: Session) -> None:
     if sess.current_info:
-        asyncio.ensure_future(_set_vc_status(sess.guild_id, sess.channel_id, sess.current_info["title"]))
+        _spawn(_set_vc_status(sess.guild_id, sess.channel_id, sess.current_info["title"]))
     _cancel_idle_timer(sess)
     _prefetch_next(sess)
     if sess.autoplay and not sess.queue:
@@ -1033,7 +1043,7 @@ async def _advance(sess: Session, player: wavelink.Player, announce: bool = True
     if sessions.get(sess.guild_id) is not sess:
         return
     sess.current_info = None
-    asyncio.ensure_future(_set_vc_status(sess.guild_id, sess.channel_id, None))
+    _spawn(_set_vc_status(sess.guild_id, sess.channel_id, None))
     _start_idle_timer(sess)
 
 
@@ -1094,9 +1104,9 @@ async def _play_shutdown_message(sess: Session, player: wavelink.Player | None) 
             await player.pause(False)
         await player.play(track)
         sess.current_info = {"title": "Restarting", "author": ""}
-        asyncio.ensure_future(_set_vc_status(sess.guild_id, sess.channel_id, None))
+        _spawn(_set_vc_status(sess.guild_id, sess.channel_id, None))
         print(f"[Worker {BOT_INDEX}] Playing shutdown message in guild {sess.guild_id}", flush=True)
-        asyncio.ensure_future(_end_later(sess, SHUTDOWN_MESSAGE_MAX))
+        _spawn(_end_later(sess, SHUTDOWN_MESSAGE_MAX))
     except Exception as exc:
         print(f"[Worker {BOT_INDEX}] Shutdown message failed: {exc}", flush=True)
         await _end_session(sess.guild_id)
@@ -1458,11 +1468,11 @@ async def on_ready():
         return
     _started = True
     _events = asyncio.Queue()
-    asyncio.ensure_future(_event_sender())
-    asyncio.ensure_future(_connect_lavalink())
-    asyncio.ensure_future(_ipc_server())
-    asyncio.ensure_future(_session_watchdog())
-    asyncio.get_event_loop().call_later(10, lambda: asyncio.ensure_future(_watchdog_pass()))   # clean ghosts soon after start
+    _spawn(_event_sender())
+    _spawn(_connect_lavalink())
+    _spawn(_ipc_server())
+    _spawn(_session_watchdog())
+    asyncio.get_event_loop().call_later(10, lambda: _spawn(_watchdog_pass()))   # clean ghosts soon after start
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -2007,7 +2017,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                 await _end_session(g)
             await reply(True, "shutdown_graceful")
 
-            asyncio.ensure_future(_do_shutdown())
+            _spawn(_do_shutdown())
             return
 
         if op == "forget_user":
@@ -2283,6 +2293,14 @@ async def _fresh_vc(sess: Session, new: bool) -> wavelink.Player:
             sess.connecting = False
     return await _connect_vc(sess)
 
+def _not_found_msg(query: str, default: str) -> str:
+    """Spotify links fail when Spotify refuses Lavalink's lookups (its API now requires the app
+    owner to have Premium); "Nothing found" made it look like the song doesn't exist."""
+    if _SPOTIFY_RE.search(query or ""):
+        return ("Couldn't load that Spotify link — Spotify is refusing lookups right now "
+                "(its API requires the Spotify app owner to have Premium). Try searching by name instead.")
+    return default
+
 async def _abandoned(sess: Session, reply) -> bool:
     """True if the session was stopped (/stop, or a restart began) while we were searching or
     connecting. Playing anyway would leave music running with no session to control or stop it."""
@@ -2301,7 +2319,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
     if op in ("search_and_play", "queue_track"):
         track, lbl, path = await _search(cmd["query"], cmd["source"], sess, uid)
         if not track:
-            await reply(False, "Nothing found.")
+            await reply(False, _not_found_msg(cmd["query"], "Nothing found."))
             return
         player = await _fresh_vc(sess, new)
         if await _abandoned(sess, reply):
@@ -2320,7 +2338,8 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
     if op == "search_and_playlist":
         tracks, pl_name, lbl, skipped = await _search_playlist(cmd["query"], cmd["source"])
         if not tracks:
-            await reply(False, f"No playable tracks found.{' (' + str(skipped) + ' local skipped)' if skipped else ''}")
+            await reply(False, _not_found_msg(
+                cmd["query"], f"No playable tracks found.{' (' + str(skipped) + ' local skipped)' if skipped else ''}"))
             return
         player = await _fresh_vc(sess, new)
         if await _abandoned(sess, reply):
