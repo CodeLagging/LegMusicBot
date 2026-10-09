@@ -195,6 +195,15 @@ async def _ai_pick(query: str, cands: list[wavelink.Playable],
         lines.append(f"{i}. {t.title} — {t.author} ({length}"
                      + (f", {views:,} views" if views is not None else "")
                      + (f"; {notes[i]}" if notes and i in notes else "") + ")")
+    for attempt in (1, 2):
+        decision = await _ai_pick_once(query, lines, len(cands), last=(attempt == 2))
+        if decision is not _RETRY:
+            return decision
+    return None
+
+_RETRY = object()
+
+async def _ai_pick_once(query: str, lines: list[str], n: int, last: bool):
     try:
         r = await asyncio.wait_for(
             _groq.chat.completions.create(
@@ -208,10 +217,12 @@ async def _ai_pick(query: str, cands: list[wavelink.Playable],
         )
         data = json.loads(r.choices[0].message.content or "")
         pick = int(data.get("pick", -1))
-        altered = {int(i) for i in data.get("altered", []) if 0 <= int(i) < len(cands)}
+        altered = {int(i) for i in data.get("altered", []) if 0 <= int(i) < n}
         return {"wants_altered": bool(data.get("wants_altered")), "altered": altered,
-                "pick": pick if 0 <= pick < len(cands) else -1}
+                "pick": pick if 0 <= pick < n else -1}
     except Exception as exc:
+        if not last and ("json" in str(exc).lower() or isinstance(exc, json.JSONDecodeError)):
+            return _RETRY   # Groq occasionally rejects its own JSON; one retry usually works
         print(f"[Worker {BOT_INDEX}] AI pick failed: {str(exc)[:120]} — using title rules", flush=True)
         return None
 
@@ -548,6 +559,7 @@ class Session:
         self.connecting   = False
         self.closing      = False
         self.drain_state: str | None = None   # None, "finishing" (current song) or "message" (shutdown.mp3)
+        self.created      = time.monotonic()
         self.history: deque[dict] = deque(maxlen=HISTORY_LEN)
 
     def snapshot(self) -> dict:
@@ -1182,14 +1194,39 @@ async def _end_session(guild_id: int, disconnect: bool = True) -> None:
     player = _get_player(guild_id)
     if player:
         _account(sess, player.position if player.current else 0)
-        if disconnect:
+    if disconnect:
+        if player:
             await _set_vc_status(guild_id, sess.channel_id, None)   # clear it while still in the channel
-            try:
-                await player.stop()
-                await player.disconnect()
-            except Exception:
-                pass
+        await _leave_voice(guild_id)
     _notify(guild_id)
+
+async def _leave_voice(guild_id: int) -> None:
+    """Really leave the voice channel. Each step is separate: wavelink's disconnect() removes the
+    Lavalink player before telling Discord to leave, so if that first part failed the bot used to
+    stay in the channel with a dead player that the next session then reused."""
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    player = guild.voice_client
+    if player:
+        try:
+            await player.stop()
+        except Exception as exc:
+            print(f"[Worker {BOT_INDEX}] stop() failed while leaving guild {guild_id}: {exc}", flush=True)
+        try:
+            await player.disconnect()
+        except Exception as exc:
+            print(f"[Worker {BOT_INDEX}] disconnect() failed in guild {guild_id}: {exc} — forcing", flush=True)
+    if guild.me and guild.me.voice and guild.me.voice.channel:
+        try:
+            await guild.change_voice_state(channel=None)
+        except Exception as exc:
+            print(f"[Worker {BOT_INDEX}] Could not leave voice in guild {guild_id}: {exc}", flush=True)
+    if guild.voice_client:
+        try:
+            guild.voice_client.cleanup()
+        except Exception:
+            pass
 
 def _claim(guild_id: int, channel_id: int, user_id: int) -> tuple[Session, bool]:
     sess = sessions.get(guild_id)
@@ -1232,6 +1269,30 @@ async def _enforce_whitelist(guild: discord.Guild) -> None:
 
 _started = False
 
+async def _session_watchdog():
+    """Every 30 s: end sessions whose voice connection is gone, and start the idle timer for
+    sessions with nothing to play, so a worker can't stay 'busy' forever."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _watchdog_pass()
+        except Exception as exc:
+            print(f"[Worker {BOT_INDEX}] Watchdog error: {exc}", flush=True)
+
+async def _watchdog_pass() -> None:
+        for gid, sess in list(sessions.items()):
+            if sess.connecting or sess.closing or sess.drain_state:
+                continue
+            if time.monotonic() - sess.created < 90:
+                continue   # still searching / connecting
+            player = _get_player(gid)
+            if player is None or not getattr(player, "connected", True):
+                print(f"[Worker {BOT_INDEX}] Watchdog: session in guild {gid} has no voice connection — ending", flush=True)
+                await _end_session(gid, disconnect=False)
+            elif player.current is None and not sess.queue and not (sess.idle_task and not sess.idle_task.done()):
+                print(f"[Worker {BOT_INDEX}] Watchdog: nothing playing in guild {gid} — starting idle timer", flush=True)
+                _start_idle_timer(sess)
+
 @bot.event
 async def on_ready():
     global _started, _events
@@ -1246,6 +1307,7 @@ async def on_ready():
     asyncio.ensure_future(_event_sender())
     asyncio.ensure_future(_connect_lavalink())
     asyncio.ensure_future(_ipc_server())
+    asyncio.ensure_future(_session_watchdog())
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -1830,7 +1892,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                     sess.text_channel = ch
             sess.announce = bool(cmd.get("announce", True))   # follows the latest play command
             try:
-                await _start_op(sess, op, cmd, uid, reply)
+                await _start_op(sess, op, cmd, uid, reply, new)
             except Exception:
                 if new and sessions.get(gid) is sess:
                     await _end_session(gid)
@@ -2022,7 +2084,22 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
         writer.close()
 
 
-async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -> None:
+async def _fresh_vc(sess: Session, new: bool) -> wavelink.Player:
+    """Connect for a play command. A new session never reuses a player left over from an earlier
+    one: a dead leftover (still holding an old paused track) made new songs queue up behind it and
+    never start."""
+    guild = bot.get_guild(sess.guild_id)
+    if new and guild and guild.voice_client:
+        print(f"[Worker {BOT_INDEX}] Leftover voice connection in guild {sess.guild_id} — reconnecting fresh", flush=True)
+        sess.connecting = True
+        try:
+            await _leave_voice(sess.guild_id)
+            await asyncio.sleep(1)
+        finally:
+            sess.connecting = False
+    return await _connect_vc(sess)
+
+async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, new: bool = False) -> None:
     """Ops that can start playback: /play, /playlist, /autoplay."""
     gid = sess.guild_id
 
@@ -2031,7 +2108,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
         if not track:
             await reply(False, "Nothing found.")
             return
-        player = await _connect_vc(sess)
+        player = await _fresh_vc(sess, new)
         if player.playing:
             pos = _enqueue(sess, QueueItem(track, lbl, path, uid, cmd["query"]))
             await reply(True, "queued", session=sess.snapshot(),
@@ -2048,7 +2125,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
         if not tracks:
             await reply(False, f"No playable tracks found.{' (' + str(skipped) + ' local skipped)' if skipped else ''}")
             return
-        player = await _connect_vc(sess)
+        player = await _fresh_vc(sess, new)
         first = tracks[0]
         if player.playing:
             for t in tracks: _enqueue(sess, QueueItem(t, lbl, "Playlist", uid))
@@ -2078,7 +2155,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
         sess.autoplay_source = "algo"
         sess.autoplay_user   = uid
         _notify(gid)
-        player = await _connect_vc(sess)
+        player = await _fresh_vc(sess, new)
         if player.playing:
             sess.queue = [q for q in sess.queue if q[1] != AUTOPLAY_LABEL]
             if not sess.queue:

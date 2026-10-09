@@ -65,10 +65,16 @@ def _cfg_src(guild_id: int) -> str:
     src = _gcfg(guild_id).get("src")
     return src if src in SOURCES else DEFAULT_SOURCE
 
+# Keys added later default to an older key's value, so turning on private /play also covers /autoplay.
+_EPH_FALLBACK = {"AP_EPH": "P_EPH"}
+
 def _eph(guild_id: int | None, key: str) -> bool:
     if not guild_id:
         return False
-    return bool(_gcfg(guild_id)["eph"].get(key, False))
+    eph = _gcfg(guild_id)["eph"]
+    if key not in eph and key in _EPH_FALLBACK:
+        return bool(eph.get(_EPH_FALLBACK[key], False))
+    return bool(eph.get(key, False))
 
 def _migrate_legacy_settings() -> None:
     """One-time import of the old single-server settings.json into the server DB."""
@@ -1420,7 +1426,7 @@ class SettingsView(discord.ui.View):
             row=3, min_values=0, max_values=len(EPH_KEYS),
             placeholder="Private replies (only the person who ran it sees them)",
             options=[discord.SelectOption(label=f"{label} replies private", value=k,
-                                          default=bool(cfg["eph"].get(k)))
+                                          default=_eph(gid, k))
                      for k, label in EPH_KEYS.items()])
         eph_select.callback = self._on_eph
         self.eph_select = eph_select

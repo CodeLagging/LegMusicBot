@@ -82,7 +82,7 @@ Stored in `database/server/servers.db`, one row per server. Change them with the
 | `SRC` | `sp` | Default search source for `/play` and `/playlist`: `sp` Spotify, `yt` YouTube Music, `sc` SoundCloud. The command's `source` option overrides it. |
 | `P_EPH` | false | `/play` replies private (only the person who ran it sees them). |
 | `PL_EPH` | false | `/playlist` replies private. |
-| `AP_EPH` | false | `/autoplay` replies private. |
+| `AP_EPH` | same as `P_EPH` | `/autoplay` replies private. Until set on its own in `/settings`, it follows `/play`. |
 | `HC_EPH` | false | `/hctest` replies private. |
 | `CC_EPH` | false | `/control` panel and its button feedback private. |
 | `S_EPH` | false | `/stop` replies private. |
@@ -534,7 +534,7 @@ Asks whether the search text explicitly asks for an altered version, so a search
 Altered versions are only played when you ask for them: the main search checks every candidate with `_is_altered`; matching a Spotify/Apple Music song to YouTube skips uploads whose title looks altered (unless the original's does); autoplay skips them by title. Only if *every* candidate is altered does the search fall back to the best one.
 
 **`async def _ai_pick(query, cands)`**
-One AI call per search. It gets the search text and the top `AI_PICK_CANDIDATES` (8) results (title, channel, length, views) and returns JSON: `wants_altered` (did the search explicitly ask for a sped up / slowed / remix / cover … version; genre, artist, language or mood words don't count), `altered` (which results are non-original versions, including mashups, montagems and medleys) and `pick` (the result that is the song the user means). Returns None when Groq fails or times out (8 s); the search then uses the title rules.
+One AI call per search (retried once if Groq rejects its own JSON). It gets the search text and the top `AI_PICK_CANDIDATES` (8) results (title, channel, length, views) and returns JSON: `wants_altered` (did the search explicitly ask for a sped up / slowed / remix / cover … version; genre, artist, language or mood words don't count), `altered` (which results are non-original versions, including mashups, montagems and medleys) and `pick` (the result that is the song the user means). Returns None when Groq fails or times out (8 s); the search then uses the title rules.
 
 The model is a reasoning model: its thinking counts toward `max_tokens`. All Groq calls use `_GROQ_ARGS` (400 tokens, low reasoning effort). Earlier versions allowed 3 tokens, so every answer came back empty and was read as "not altered", which is why altered versions used to slip through.
 
@@ -701,6 +701,15 @@ After `IDLE_TIMEOUT` (180 s) ends the session, unless music is actively playing 
 
 **`async def _end_session(guild_id, disconnect=True)`**
 Removes the session, cancels its timers and autoplay, records the current track's listen, clears the voice channel status and leaves the channel (when `disconnect`), and notifies the controller.
+
+**`async def _leave_voice(guild_id)`**
+Really leaves the voice channel: stop, disconnect, and if Discord still shows the bot in a channel, leave it directly and drop the voice client. Each step is separate, so a failing Lavalink call can't leave the bot sitting in the channel.
+
+**`async def _fresh_vc(sess, new)`**
+Connects for a play command. A new session never reuses a player left over from an earlier one (a dead leftover holding an old paused track used to make new songs queue behind it and never start).
+
+**`async def _session_watchdog()`** / **`async def _watchdog_pass()`**
+Every 30 s: ends sessions whose voice connection is gone and starts the idle timer for sessions with nothing to play, so a worker can't stay "busy" forever.
 
 **`def _claim(guild_id, channel_id, user_id)`**
 Returns the server's session (creating it with `user_id` as controller when there is none). Raises when the worker already plays in a different channel of that server.
