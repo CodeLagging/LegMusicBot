@@ -96,6 +96,10 @@ PENDING_TTL = 90.0   # how long a reservation made by /play survives without the
 SHUTDOWN_MP3     = SCRIPT_DIR / "shutdown.mp3"
 DRAIN_TIMEOUT    = 300.0   # after this, songs are cut and the message plays right away
 DRAIN_MESSAGE_MAX = 130.0  # extra time allowed for the message itself to play out
+# `systemctl reload` (SIGHUP) = graceful restart that returns immediately. After draining, the
+# process exits with this code and the unit's RestartForceExitStatus makes systemd start it again.
+RESTART_EXIT_CODE = 75
+_restart_after = False
 _draining = False
 _force_drain: asyncio.Event | None = None
 
@@ -523,8 +527,10 @@ async def on_message(message: discord.Message):
 SERVICE_NAME = "SERVER_musicbots"
 
 async def _systemctl(action: str):
+    # --no-block: queue the job and return. A blocking call would wait for this very process
+    # to finish its graceful shutdown.
     proc = await asyncio.create_subprocess_exec(
-        "systemctl", action, SERVICE_NAME,
+        "systemctl", "--no-block", action, SERVICE_NAME,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -539,7 +545,9 @@ async def _dev_power(message: discord.Message, cmd: str, arg: str) -> None:
     restart = cmd == "restart"
 
     if arg == "full":
-        action = "restart" if restart else "stop"
+        # restart -> "reload": the service finishes songs, then exits with RESTART_EXIT_CODE and
+        # systemd starts it again (see ExecReload/RestartForceExitStatus in the unit file).
+        action = "reload" if restart else "stop"
         embed = discord.Embed(
             title="🔄  Restarting entire service…" if restart else "🔴  Shutting down entire service…",
             description=(f"Running `systemctl {action} {SERVICE_NAME}`.\n"
@@ -761,6 +769,8 @@ _MESSAGE_EMBEDS = {
     "autoplay_off": ("🎲  Autoplay OFF", COLOUR),
     "mode_all":     ("🔓  Control: everyone in the voice channel", COLOUR),
     "mode_me":      ("🔒  Control: only the person who started playback", COLOUR),
+    "normalize_on":  ("🎚️  Normalize ON — loud and quiet songs are evened out", COLOUR),
+    "normalize_off": ("🎚️  Normalize OFF", COLOUR),
 }
 
 def _message_embed(resp: dict) -> discord.Embed | None:
@@ -1014,6 +1024,17 @@ class ModeButton(discord.ui.Button):
         await self._ctrl._dispatch(interaction, "set_mode", mode=new_mode)
 
 
+class NormalizeButton(discord.ui.Button):
+    def __init__(self, view: "ControlView"):
+        self._ctrl = view
+        on = view._normalize
+        super().__init__(label="🎚️ Normalize ON" if on else "🎚️ Normalize",
+                         style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        await self._ctrl._dispatch(interaction, "toggle_normalize")
+
+
 class PrevPageButton(discord.ui.Button):
     def __init__(self, view: "ControlView"):
         self._ctrl = view
@@ -1052,7 +1073,7 @@ class ControlView(discord.ui.View):
     def __init__(self, worker: WorkerProcess, guild_id: int,
                  queue: list[dict], current_title: str, page: int = 0,
                  muted: bool = False, loop: bool = False, autoplay: bool = False,
-                 mode: str = "me", selected_qid: int | None = None):
+                 mode: str = "me", selected_qid: int | None = None, normalize: bool = False):
         super().__init__(timeout=900)
         self.worker          = worker
         self.guild_id        = guild_id
@@ -1066,6 +1087,7 @@ class ControlView(discord.ui.View):
         self._autoplay       = autoplay
         self._mode           = mode
         self._selected_qid   = selected_qid
+        self._normalize      = normalize
 
         total_pages = max(1, -(-len(queue) // PAGE_SIZE))
 
@@ -1080,6 +1102,7 @@ class ControlView(discord.ui.View):
         self.add_item(ModeButton(self))
 
 
+        self.add_item(NormalizeButton(self))
         if total_pages > 1:
             self.add_item(PrevPageButton(self))
             self.add_item(PageLabelButton(page, total_pages))
@@ -1121,7 +1144,8 @@ class ControlView(discord.ui.View):
         if embed:
             await interaction.followup.send(embed=embed, ephemeral=self.eph)
         if resp.get("message") in ("skipped", "restarted", "muted", "unmuted", "loop_on", "loop_off",
-                                   "autoplay_on", "autoplay_off", "mode_all", "mode_me"):
+                                   "autoplay_on", "autoplay_off", "mode_all", "mode_me",
+                                   "normalize_on", "normalize_off"):
             await _refresh_control_panel(interaction, self, page=self._queue_page, selected_qid=None)
         return resp
 
@@ -1173,6 +1197,7 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
     muted: bool    = resp.get("muted", False) if ok else False
     loop:  bool    = resp.get("loop",  False) if ok else False
     autoplay: bool = resp.get("autoplay", False) if ok else False
+    normalize: bool = resp.get("normalize", False) if ok else False
     session        = (resp.get("session") if ok else None) or worker.session(guild_id) or {}
     if ok:
         worker.apply(guild_id, resp.get("session"))
@@ -1189,7 +1214,7 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
         selected_qid = None
 
     view  = ControlView(worker, guild_id, queue, current_title,
-                        page, muted, loop, autoplay, mode, selected_qid)
+                        page, muted, loop, autoplay, mode, selected_qid, normalize)
 
 
     for child in view.children:
@@ -1205,7 +1230,8 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
     start     = page * PAGE_SIZE
     end       = min(start + PAGE_SIZE, len(queue))
     page_info = f"  (page {page + 1}/{total_pages})" if total_pages > 1 else ""
-    flags     = ("  🔇 muted" if muted else "") + ("  🔁 loop" if loop else "") + ("  🎲 autoplay" if autoplay else "")
+    flags     = (("  🔇 muted" if muted else "") + ("  🔁 loop" if loop else "") + ("  🎲 autoplay" if autoplay else "")
+                 + ("  🎚️ normalized" if normalize else ""))
     sel_info  = (f"\n✅ **Selected:** #{sel_item['index'] + 1} {_truncate(sel_item['title'], 50)}"
                  if sel_item else "")
     who       = (f"🔒 Controlled by <@{controller}>" if mode == "me" else
@@ -1479,6 +1505,64 @@ async def slash_settings(interaction: discord.Interaction):
         ephemeral=True)
 
 
+class ResetAlgoView(discord.ui.View):
+    """Confirm step for /reset-algo. Only the person who ran it can press the buttons,
+    and it only ever deletes that person's own data on this server."""
+    def __init__(self, user_id: int, guild_id: int):
+        super().__init__(timeout=120)
+        self.user_id  = user_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(embed=_err_embed("This isn't your reset"), ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Delete my algo", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _):
+        songs, queries = await asyncio.to_thread(db.reset_user, self.guild_id, self.user_id)
+        await asyncio.gather(*[w.send({"op": "forget_user", "guild_id": self.guild_id, "user_id": self.user_id},
+                                      timeout=5.0) for w in _workers.values()], return_exceptions=True)
+        self.stop()
+        await interaction.response.edit_message(embed=discord.Embed(
+            title="🗑️  Your algo was reset",
+            description=f"Deleted {songs} saved song(s) and {queries} search memor{'y' if queries == 1 else 'ies'} "
+                        "on this server. Searches and autoplay start fresh from your next listens.",
+            colour=discord.Colour.orange()), view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=_simple_embed("Nothing was deleted", COLOUR), view=None)
+
+
+@main_bot.tree.command(name="reset-algo", description="Delete your own saved songs and search memory on this server")
+async def slash_reset_algo(interaction: discord.Interaction):
+    # Personal and private: works in any channel, and there is deliberately no option to target someone else.
+    if not interaction.guild_id:
+        await interaction.response.send_message(embed=_err_embed("Server only"), ephemeral=True)
+        return
+    if not appsettings.is_whitelisted(interaction.guild_id):
+        await interaction.response.send_message(embed=_err_embed("This server is not whitelisted"), ephemeral=True)
+        return
+    gid, uid = interaction.guild_id, interaction.user.id
+    songs, size = await asyncio.to_thread(db.user_stats, gid, uid)
+    queries = await asyncio.to_thread(db.user_query_count, gid, uid)
+    if not songs and not queries:
+        await interaction.response.send_message(
+            embed=_simple_embed("You have no saved algo on this server", COLOUR), ephemeral=True)
+        return
+    await interaction.response.send_message(embed=discord.Embed(
+        title="Reset your algo?",
+        description=(f"This deletes **your** {songs} saved song(s) and {queries} search memor{'y' if queries == 1 else 'ies'} "
+                     f"(about {max(1, size // 1024)} KB) on this server. Other people's data isn't affected.\n"
+                     "Your searches and autoplay will stop being personalised until you listen again. "
+                     "This can't be undone."),
+        colour=discord.Colour.orange()), view=ResetAlgoView(uid, gid), ephemeral=True)
+
+
 @main_bot.tree.command(name="purge", description="Delete the last N bot messages in this channel (default: 20)")
 @app_commands.describe(limit="Number of messages to scan (1–100, default 20)")
 async def slash_purge(interaction: discord.Interaction, limit: int = 20):
@@ -1648,18 +1732,22 @@ if __name__ == "__main__":
         asyncio.set_event_loop(loop)
         stop_evt = asyncio.Event()
 
-        def _sig():
+        def _sig(reload: bool = False):
+            global _restart_after
             if stop_evt.is_set():
-                # A second stop signal skips the wait: songs are cut and the message plays now.
+                # A second signal skips the wait: songs are cut and the message plays now.
                 print("[Main] Second signal — forcing restart now", flush=True)
                 if _force_drain:
                     loop.call_soon_threadsafe(_force_drain.set)
                 return
-            print("[Main] Signal — finishing current songs before stopping ...", flush=True)
+            _restart_after = reload
+            print("[Main] " + ("Reload — finishing current songs, then restarting ..." if reload
+                               else "Signal — finishing current songs before stopping ..."), flush=True)
             loop.call_soon_threadsafe(stop_evt.set)
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _sig)
+        loop.add_signal_handler(signal.SIGHUP, _sig, True)
 
         try:
             loop.run_until_complete(_run(stop_event=stop_evt))
@@ -1669,6 +1757,8 @@ if __name__ == "__main__":
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
+        if _restart_after:
+            sys.exit(RESTART_EXIT_CODE)
     else:
         try:
             asyncio.run(_run())

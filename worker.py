@@ -309,53 +309,135 @@ def _track_score(track: wavelink.Playable, query: str = "",
 
 _taste_cache: dict[tuple[int, int], tuple[float, dict]] = {}
 
+PERSONAL_HALF_LIFE_DAYS = 30   # personal boosts fade with time since the last listen
+PERSONAL_STRONG = 40           # personal score that overrides the AI's generic pick
+
+_CHANNEL_SUFFIX_RE = re.compile(r"(\s*-\s*topic|\s*vevo|\s+official|\s+music|\s+oficial)$")
+
+def _artist_key(author: str) -> str:
+    """'Sxilwix - Topic', 'SxilwixVEVO' and 'Sxilwix' are the same artist."""
+    a = _fold(author or "").strip()
+    for _ in range(2):
+        a = _CHANNEL_SUFFIX_RE.sub("", a).strip()
+    return a
+
+def _song_id(title: str, author: str) -> tuple[str, str]:
+    return _norm_title(_fold(title or "")), _artist_key(author)
+
+def _recency(ts: float) -> float:
+    days = max(0.0, (time.time() - (ts or 0)) / 86400)
+    return 0.5 + 0.5 * math.exp(-days / PERSONAL_HALF_LIFE_DAYS)
+
 async def _taste(guild_id: int, user_id: int) -> dict | None:
-    """The requester's saved songs, summarised for search ranking: plays per YouTube id and per artist."""
+    """The requester's listening summarised for search: saved uploads, songs, titles, artists
+    and search memory. Cached for 60 s and dropped whenever they finish or skip a song."""
     key = (guild_id, user_id)
     hit = _taste_cache.get(key)
     if hit and time.monotonic() - hit[0] < 60:
         return hit[1]
     try:
-        rows = await asyncio.to_thread(db.user_tracks, guild_id, user_id)
+        rows    = await asyncio.to_thread(db.user_tracks, guild_id, user_id)
+        queries = await asyncio.to_thread(db.user_queries, guild_id, user_id)
     except Exception as exc:
         print(f"[Worker {BOT_INDEX}] Could not read saved songs: {exc}", flush=True)
         return None
-    ids: dict[str, int] = {}
-    artists: dict[str, int] = {}
-    for r in rows:
-        if r["yt_id"]:
-            ids[r["yt_id"]] = r["plays"]
-        a = _fold(r["author"]).strip()
-        if a:
-            artists[a] = artists.get(a, 0) + r["plays"]
-    taste = {"ids": ids, "artists": artists} if rows else None
+    taste = None
+    if rows or queries:
+        ids, songs, titles, artists = {}, {}, {}, {}
+        for r in rows:
+            score = r["plays"] - r["skips"]   # for search, one quick skip cancels one listen
+            if r["yt_id"]:
+                ids[r["yt_id"]] = (score, r["last_played"])
+            sid = _song_id(r["title"], r["author"])
+            old = songs.get(sid, (0.0, 0.0))
+            songs[sid] = (old[0] + score, max(old[1], r["last_played"]))
+            titles.setdefault(sid[0], set()).add(sid[1])
+            artists[sid[1]] = artists.get(sid[1], 0) + max(r["plays"], 0)
+        by_query: dict[str, list[dict]] = {}
+        for q in queries:
+            by_query.setdefault(q["query"], []).append(q)
+        taste = {"ids": ids, "songs": songs, "titles": titles, "artists": artists,
+                 "total": max(1, sum(artists.values())), "queries": by_query, "rows": rows}
     _taste_cache[key] = (time.monotonic(), taste)
     return taste
 
-def _taste_bonus(track: wavelink.Playable, taste: dict | None) -> float:
-    """Personal boost: an upload the user already listened to, or an artist they play a lot.
-    Kept below one query word (40) so taste breaks ties instead of overriding the search."""
-    if not taste:
-        return 0.0
-    bonus = 0.0
-    plays = taste["ids"].get(track.identifier or "")
-    if plays:
-        bonus += 25 + min(10, 2 * plays)
-    artist_plays = taste["artists"].get(_fold(track.author or "").strip(), 0)
-    if artist_plays:
-        bonus += min(20, 6 * math.log2(1 + artist_plays))
-    return bonus
+def _personal(track: wavelink.Playable, taste: dict | None, query_norm: str | None) -> tuple[float, str]:
+    """How much this user's own history favours a search result, plus a note for the AI.
 
-def _taste_note(track: wavelink.Playable, taste: dict | None) -> str:
+    Signals, strongest first:
+      - search memory: what they listened to (or skipped) the last times they searched this text
+      - the exact upload they've listened to before
+      - the same song (title + artist) from another upload
+      - they know a song with this title by a different artist -> this one is probably not it
+      - how big a share of their listening this artist is
+    Listens raise it, quick skips lower it, and it fades over about a month without listening."""
     if not taste:
-        return ""
-    plays = taste["ids"].get(track.identifier or "")
-    if plays:
-        return f"the user has played this exact upload {plays}x"
-    artist_plays = taste["artists"].get(_fold(track.author or "").strip(), 0)
-    if artist_plays >= 2:
-        return f"the user often plays this artist ({artist_plays} plays)"
-    return ""
+        return 0.0, ""
+    sid = _song_id(track.title, track.author)
+    yt  = track.identifier or ""
+    bonus, notes = 0.0, []
+
+    for q in taste["queries"].get(query_norm or "", []):
+        same = (yt and q["yt_id"] == yt) or _song_id(q["title"], q["author"]) == sid
+        if not same:
+            continue
+        net = q["listens"] - 1.5 * q["skips"]
+        if net > 0:
+            bonus += (60 + 15 * math.log2(1 + net)) * _recency(q["last_used"])
+            notes.append(f"the user picked this for the same search before ({q['listens']} listens)")
+        elif q["skips"]:
+            bonus -= 40
+            notes.append("the user skipped this for the same search before")
+
+    saved = taste["ids"].get(yt)
+    song  = taste["songs"].get(sid)
+    if saved:
+        score, last = saved
+        bonus += (35 + 10 * math.log2(1 + score)) * _recency(last) if score > 0 else -20
+        notes.append("the user has listened to this exact upload" if score > 0 else "the user often skips this upload")
+    elif song and song[0] > 0:
+        bonus += (30 + 8 * math.log2(1 + song[0])) * _recency(song[1])
+        notes.append("the user listens to this song (another upload)")
+    elif sid[0] in taste["titles"] and sid[1] not in taste["titles"][sid[0]]:
+        bonus -= 15   # they know a same-titled song by someone else; this is probably a different one
+
+    artist_plays = taste["artists"].get(sid[1], 0)
+    if artist_plays:
+        share = artist_plays / taste["total"]
+        bonus += min(25.0, 60 * share + 4 * math.log2(1 + artist_plays))
+        if artist_plays >= 2:
+            notes.append(f"an artist the user plays a lot ({artist_plays} plays)")
+    return min(bonus, 140.0), "; ".join(notes)
+
+async def _remembered_candidates(taste: dict, query_norm: str | None,
+                                 existing: list[wavelink.Playable]) -> list[wavelink.Playable]:
+    """Uploads from the user's history that fit this search but aren't among the results:
+    what they listened to for this exact search, and saved songs whose title has every query word."""
+    have = {t.identifier for t in existing}
+    want: dict[str, float] = {}
+    for q in taste["queries"].get(query_norm or "", []):
+        if q["yt_id"] and q["listens"] - 1.5 * q["skips"] > 0:
+            want[q["yt_id"]] = want.get(q["yt_id"], 0) + 100 + q["listens"]
+    q_words = (query_norm or "").split()
+    if q_words:
+        for r in taste["rows"]:
+            title = _fold(r["title"])
+            if r["yt_id"] and r["plays"] - 0.5 * r["skips"] > 0 and all(w in title for w in q_words):
+                want[r["yt_id"]] = want.get(r["yt_id"], 0) + r["plays"]
+    picks = [yt for yt, _ in sorted(want.items(), key=lambda kv: -kv[1]) if yt not in have][:3]
+    if not picks:
+        return []
+    async def load(yt: str):
+        try:
+            res = await wavelink.Pool.fetch_tracks(f"https://www.youtube.com/watch?v={yt}")
+            tracks = res.tracks if isinstance(res, wavelink.Playlist) else list(res or [])
+            return tracks[0] if tracks else None
+        except Exception:
+            return None
+    found = [t for t in await asyncio.gather(*[load(yt) for yt in picks]) if t]
+    for t in found:
+        print(f"[Worker {BOT_INDEX}]   + from your history: {t.title!r} by {t.author!r}", flush=True)
+    return found
 
 def _popularity(meta: dict | None) -> float:
     if not meta:
@@ -425,10 +507,11 @@ class QueueItem(tuple):
     ends or autoplay adds picks, which made Jump To / Remove hit the song after the one chosen."""
     _next_qid = 0
 
-    def __new__(cls, track, label, path, requester):
+    def __new__(cls, track, label, path, requester, query: str | None = None):
         item = super().__new__(cls, (track, label, path, requester))
         QueueItem._next_qid += 1
         item.qid = QueueItem._next_qid
+        item.query = query   # the search that found it, for the requester's search memory
         return item
 
 def _queue_pos(sess: "Session", qid: int) -> int | None:
@@ -446,6 +529,7 @@ class Session:
         self.origin: dict[str, wavelink.Playable] = {}
         self.skipping     = False
         self.muted        = False
+        self.normalize    = False   # LavaDSPX normalization filter (also applies to shutdown.mp3)
         # False when playback was started with a private (ephemeral) command: track-change
         # messages are normal channel posts and can't be private, so they're not posted at all.
         self.announce     = True
@@ -458,6 +542,7 @@ class Session:
         self.current_info: dict | None = None
         self.current_meta: dict | None = None
         self.current_requester: int | None = None
+        self.current_query: str | None = None   # normalised search that led to the playing track
         self.idle_task: asyncio.Task | None = None
         self.auto_paused  = False
         self.connecting   = False
@@ -667,7 +752,7 @@ async def _rank_by_popularity(scored: list[tuple[wavelink.Playable, int]],
         final[_track_key(t)] = rel + pop
         views = (meta or {}).get("view_count")
         likes = (meta or {}).get("like_count")
-        print(f"[Worker {BOT_INDEX}]   {rel:>4} + pop {pop:5.1f} = {rel + pop:6.1f}: "
+        print(f"[Worker {BOT_INDEX}]   {rel:6.1f} + pop {pop:5.1f} = {rel + pop:6.1f}: "
               f"{t.title!r} by {t.author!r} ({views or 0:,} views, {likes or 0:,} likes)", flush=True)
     ranked = [(t, final.get(_track_key(t), float(rel))) for t, rel in scored]
     ranked.sort(key=lambda x: x[1], reverse=True)
@@ -733,12 +818,20 @@ def _prefetch_next(sess: Session) -> None:
     if _YT_RE.search(uri):
         asyncio.ensure_future(_ytdlp_url(uri))
 
+def _query_norm(query: str | None) -> str | None:
+    """Search text as stored in search memory: no prefix, accents or punctuation. URLs aren't stored."""
+    if not query or query.strip().startswith(("http://", "https://")):
+        return None
+    return " ".join(_words(_SEARCH_PREFIX_RE.sub("", query))) or None
+
 def _set_current(sess: Session, origin: wavelink.Playable,
-                 yt_src: wavelink.Playable | None, requester: int | None) -> None:
+                 yt_src: wavelink.Playable | None, requester: int | None,
+                 query: str | None = None) -> None:
     meta = _track_meta(origin, yt_src)
     sess.current_info      = {"title": origin.title or "Unknown", "author": origin.author or ""}
     sess.current_meta      = meta
     sess.current_requester = requester
+    sess.current_query     = _query_norm(query)
     sess.history.append(meta)
 
 async def _set_vc_status(guild_id: int, channel_id: int, title: str | None) -> None:
@@ -763,7 +856,7 @@ def _after_start(sess: Session) -> None:
         _kick_autoplay(sess)
 
 async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable,
-                requester: int | None) -> wavelink.Playable:
+                requester: int | None, query: str | None = None) -> wavelink.Playable:
     """Plays a track (or, if it can't be loaded, one of its same-song alternates).
     Returns the track that is actually playing, so messages never show a different song."""
     alternates = [t for t, _, _ in sess.fallbacks.get(_track_key(track), [])]
@@ -776,7 +869,7 @@ async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable
             continue
         playable, origin, yt_src = resolved
         sess.origin[_track_key(playable)] = origin
-        _set_current(sess, origin, yt_src, requester)
+        _set_current(sess, origin, yt_src, requester, query)
         if i > 0:
 
             rest = sess.fallbacks.get(_track_key(track), [])[i:]
@@ -792,7 +885,7 @@ async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable
 
     print(f"[Worker {BOT_INDEX}] Resolve failed for {track.title!r} — passing to Lavalink as-is", flush=True)
     sess.origin[_track_key(track)] = track
-    _set_current(sess, track, None, requester)
+    _set_current(sess, track, None, requester, query)
     await player.play(track)
     _after_start(sess)
     return track
@@ -800,15 +893,20 @@ async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable
 def _account(sess: Session, played_ms: int | None = None,
              finished: bool = False, skipped: bool = False) -> None:
     """Feed the outgoing track into the requester's algo: a listen, a quick skip, or nothing."""
-    meta, uid = sess.current_meta, sess.current_requester
-    sess.current_meta = None
+    meta, uid, query = sess.current_meta, sess.current_requester, sess.current_query
+    sess.current_meta = sess.current_query = None
     if not meta or not uid:
         return
+    max_kb = int(appsettings.get()["algo_max_kb"])
     if finished or (played_ms or 0) >= PLAY_COUNT_MS:
-        s = appsettings.get()
-        _bg(db.record_play, sess.guild_id, uid, meta, int(s["algo_max_kb"]))
+        _bg(db.record_play, sess.guild_id, uid, meta, max_kb)
+        if query:
+            _bg(db.record_query, sess.guild_id, uid, query, meta, True, max_kb)
     elif skipped:
         _bg(db.record_skip, sess.guild_id, uid, meta["key"])
+        if query:   # this search picked something the user didn't want
+            _bg(db.record_query, sess.guild_id, uid, query, meta, False, max_kb)
+    _taste_cache.pop((sess.guild_id, uid), None)
 
 def _can_post(sess: Session) -> bool:
     return bool(sess.text_channel) and sess.announce and not sess.muted
@@ -832,14 +930,30 @@ async def _advance(sess: Session, player: wavelink.Player, announce: bool = True
     if sessions.get(sess.guild_id) is not sess:
         return
     if sess.queue:
-        nxt, nxt_label, nxt_path, req = sess.queue.pop(0)
-        played = await _play(sess, player, nxt, req)
+        item = sess.queue.pop(0)
+        nxt, nxt_label, nxt_path, req = item
+        played = await _play(sess, player, nxt, req, item.query)
         if announce and _can_post(sess):
             await _send_status(sess.text_channel, _now_playing_embed(played, nxt_label, nxt_path))
     else:
         sess.current_info = None
         asyncio.ensure_future(_set_vc_status(sess.guild_id, sess.channel_id, None))
         _start_idle_timer(sess)
+
+
+# ── normalization ────────────────────────────────────────────────────────────
+
+# LavaDSPX "normalization": tames peaks above maxAmplitude and adapts quickly to each song,
+# so loud and quiet songs end up at a similar level. Needs the LavaDSPX plugin in Lavalink.
+NORMALIZE_SETTINGS = {"maxAmplitude": 0.75, "adaptive": True}
+
+async def _apply_normalize(player: wavelink.Player, on: bool) -> None:
+    filters: wavelink.Filters = player.filters
+    if on:
+        filters.plugin_filters.set(normalization=dict(NORMALIZE_SETTINGS))
+    else:
+        filters.plugin_filters.reset()
+    await player.set_filters(filters)
 
 
 # ── graceful restart ─────────────────────────────────────────────────────────
@@ -892,7 +1006,7 @@ def _same_song(a: wavelink.Playable, b: wavelink.Playable) -> bool:
     ta, tb = _norm_title(_fold(a.title or "")), _norm_title(_fold(b.title or ""))
     if not ta or not tb or (ta not in tb and tb not in ta):
         return False
-    same_artist = _fold(a.author or "").strip() == _fold(b.author or "").strip()
+    same_artist = _artist_key(a.author) == _artist_key(b.author)
     return same_artist or abs((a.length or 0) - (b.length or 0)) <= 8000
 
 def _norm_title(title: str) -> str:
@@ -1237,7 +1351,7 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
         if alternatives:
             sess.fallbacks[_track_key(nxt)] = alternatives
         print(f"[Worker {BOT_INDEX}] Trying alternate track: {nxt.title!r}", flush=True)
-        await _play(sess, player, nxt, sess.current_requester)
+        await _play(sess, player, nxt, sess.current_requester, sess.current_query)
         return
     await _advance(sess, player, announce=False)
 
@@ -1335,7 +1449,7 @@ async def _connect_vc(sess: Session) -> wavelink.Player:
         sess.connecting = False
 
 
-async def _sp_lookup(query: str) -> wavelink.Playable | None:
+async def _sp_lookup(query: str, taste: dict | None = None) -> wavelink.Playable | None:
     """Clean title/artist/length from Spotify, but only if a top result actually matches the query.
     Spotify's first hit can be unrelated (e.g. 'noite quente' -> 'Spa Noturno Hindu')."""
     try:
@@ -1348,13 +1462,22 @@ async def _sp_lookup(query: str) -> wavelink.Playable | None:
     if not items or not q_words:
         return None
     asked = bool(_ALTERED_ASK.search(query))
-    best, best_key = None, (-1.0, False)
+    best, best_key = None, (-1.0, False, 0)
     for t in items[:5]:
         t_text = _fold(f"{t.title} {t.author}")
         cov = sum(1 for w in q_words if w in t_text) / len(q_words)
         # e.g. "noite quente phonk" should not lock onto "Noite Quente (Slowed)" by "Adiel phonk"
         clean = asked or not _ALTERED_QUICK.search(t.title or "")
-        key = (cov if cov >= SP_MIN_COVERAGE else 0.0, clean)
+        # Many songs share a title ("Noite Quente" by M22, Flame Runner, ...). Among matching
+        # results, prefer the song / artist this user actually listens to.
+        known = 0
+        if taste:
+            sid = _song_id(t.title, t.author)
+            if taste["songs"].get(sid, (0, 0))[0] > 0:
+                known = 2
+            elif taste["artists"].get(sid[1], 0) > 0:
+                known = 1
+        key = (cov if cov >= SP_MIN_COVERAGE else 0.0, clean, known)
         if key > best_key:
             best, best_key = t, key
     best_cov = best_key[0]
@@ -1446,7 +1569,8 @@ async def _search(query: str, source: str, sess: Session | None,
         return selected, label, "SoundCloud"
 
     # Spotify and the plain YouTube Music search run at the same time.
-    sp_task = _sp_lookup(query) if source != "yt" else asyncio.sleep(0, result=None)
+    taste = await _taste(sess.guild_id, user_id) if sess and user_id else None
+    sp_task = _sp_lookup(query, taste) if source != "yt" else asyncio.sleep(0, result=None)
     asked = bool(_ALTERED_ASK.search(query))
     sp, raw = await asyncio.gather(sp_task, _ytm(query))
     if sp:
@@ -1462,12 +1586,29 @@ async def _search(query: str, source: str, sess: Session | None,
     else:
         yt_q, path, candidates = query, "YouTube Music", raw
 
-    taste  = await _taste(sess.guild_id, user_id) if sess and user_id else None
-    scored = [(t, _track_score(t, query, sp) + _taste_bonus(t, taste)) for t in candidates]
+    qnorm = _query_norm(query)
+    if taste:
+        # The upload they listened to may not be in this search's results at all: add it.
+        candidates += await _remembered_candidates(taste, qnorm, candidates)
+
+    # If the search names an artist, personal history must not pull results by other artists.
+    q_words = [w for w in _words(query) if len(w) >= 3]
+    named = {_artist_key(t.author) for t in candidates
+             if any(w in _fold(t.author or "") and w not in _fold(t.title or "") for w in q_words)}
+    personal: dict[str, tuple[float, str]] = {}
+    for t in candidates:
+        bonus, note = _personal(t, taste, qnorm)
+        if named and _artist_key(t.author) not in named:
+            bonus = min(bonus, 0.0)
+        personal[_track_key(t)] = (bonus, note)
+        if bonus:
+            print(f"[Worker {BOT_INDEX}]   personal {bonus:+6.1f}: {t.title!r} by {t.author!r}", flush=True)
+
+    scored = [(t, _track_score(t, query, sp) + personal[_track_key(t)][0]) for t in candidates]
     ranked = await _rank_by_popularity(scored, skip_altered=not asked) if scored else []
     top    = [t for t, _ in ranked[:AI_PICK_CANDIDATES]]
 
-    notes    = {i: n for i, t in enumerate(top) if (n := _taste_note(t, taste))}
+    notes    = {i: personal[_track_key(t)][1] for i, t in enumerate(top) if personal[_track_key(t)][1]}
     decision = await _ai_pick(query, top, notes) if top else None
     if decision:
         wants_altered = decision["wants_altered"] or asked
@@ -1484,8 +1625,10 @@ async def _search(query: str, source: str, sess: Session | None,
     allowed = [i for i in range(len(top)) if wants_altered or i not in altered]
     if allowed:
         # Relevance guard: the pick must match the search about as well as the best allowed result,
-        # so "noite quente slowed" can't land on a slowed version of a different song.
-        rel = {_track_key(t): r for t, r in scored}
+        # so "noite quente slowed" can't land on a slowed version of a different song. Measured on
+        # the user's own words plus their history, NOT on Spotify's guess: Spotify picks one of many
+        # same-titled songs (e.g. M22's "Noite Quente"), which must not veto a better pick.
+        rel = {_track_key(t): _track_score(t, query) + personal[_track_key(t)][0] for t, _ in scored}
         best_rel = max(rel[_track_key(top[i])] for i in allowed)
         relevant = [i for i in allowed if rel[_track_key(top[i])] >= best_rel - 40]
         if wants_altered:
@@ -1497,13 +1640,14 @@ async def _search(query: str, source: str, sess: Session | None,
             if decision and decision["pick"] >= 0:
                 print(f"[Worker {BOT_INDEX}] AI pick {decision['pick']} doesn't match the search well enough — overriding", flush=True)
             choice = relevant[0]
-        # If the user has a saved upload of this same song, play the one they already know.
-        if taste:
-            saved = [i for i in relevant if (top[i].identifier or "") in taste["ids"]
-                     and _same_song(top[i], top[choice])]
-            if saved and choice not in saved:
-                choice = max(saved, key=lambda i: taste["ids"][top[i].identifier])
-                print(f"[Worker {BOT_INDEX}] Using the upload from your saved songs", flush=True)
+        # The AI judges generically ("most popular official upload"). Strong personal evidence
+        # for a result that matches the search wins over that.
+        pers = {i: personal[_track_key(top[i])][0] for i in relevant}
+        fav  = max(relevant, key=lambda i: pers[i])
+        if pers[fav] >= PERSONAL_STRONG and pers[fav] > pers[choice] + 20:
+            print(f"[Worker {BOT_INDEX}] Personal history prefers {top[fav].title!r} by {top[fav].author!r} "
+                  f"({pers[fav]:+.0f}) over the AI pick", flush=True)
+            choice = fav
         t = top[choice]
         print(f"[Worker {BOT_INDEX}] ✓ {t.title!r} by {t.author!r}", flush=True)
         # Fallbacks (if this upload can't be played) must be another upload of the SAME song:
@@ -1627,6 +1771,16 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             asyncio.ensure_future(_do_shutdown())
             return
 
+        if op == "forget_user":
+            # /reset-algo: drop cached history and don't re-save the song playing right now.
+            uid_f = int(cmd.get("user_id") or 0)
+            _taste_cache.pop((gid, uid_f), None)
+            for g, sess in sessions.items():
+                if g == gid and sess.current_requester == uid_f:
+                    sess.current_meta = sess.current_query = None
+            await reply(True, "forgotten")
+            return
+
         if op == "drain":
             # Restart scheduled: finish the current song (dropping the rest of the queue/playlist),
             # then play the shutdown message and leave. Nothing new can start from now on.
@@ -1708,6 +1862,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             await reply(True, "queue", current=current, queue=queue_list,
                         muted=sess.muted if sess else False, loop=sess.loop if sess else False,
                         autoplay=sess.autoplay if sess else False,
+                        normalize=sess.normalize if sess else False,
                         session=sess.snapshot() if sess else None)
             return
 
@@ -1802,6 +1957,20 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                         autoplay=sess.autoplay, session=sess.snapshot())
             return
 
+        if op == "toggle_normalize":
+            if not player:
+                await reply(False, "Nothing playing.")
+                return
+            want = not sess.normalize
+            try:
+                await _apply_normalize(player, want)
+            except Exception as exc:
+                await reply(False, f"Couldn't change normalization (is the LavaDSPX plugin installed in Lavalink?): {exc}")
+                return
+            sess.normalize = want
+            await reply(True, "normalize_on" if want else "normalize_off", normalize=want)
+            return
+
         if op == "set_mode":
             mode = cmd.get("mode")
             if mode not in ("me", "all"):
@@ -1821,14 +1990,15 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                 await reply(False, "That song is no longer in the queue (it already played or was removed).")
                 return
 
-            target_track, target_lbl, target_path, target_req = sess.queue[idx]
+            target_item = sess.queue[idx]
+            target_track, target_lbl, target_path, target_req = target_item
             del sess.queue[:idx + 1]
             _account(sess, player.position, skipped=True)
             sess.skipping = True
             try:
                 await player.stop()
                 sess.fail_streak = 0
-                target_track = await _play(sess, player, target_track, target_req)
+                target_track = await _play(sess, player, target_track, target_req, target_item.query)
                 if _can_post(sess):
                     await _send_status(sess.text_channel, _now_playing_embed(target_track, target_lbl, target_path))
             finally:
@@ -1863,12 +2033,12 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
             return
         player = await _connect_vc(sess)
         if player.playing:
-            pos = _enqueue(sess, QueueItem(track, lbl, path, uid))
+            pos = _enqueue(sess, QueueItem(track, lbl, path, uid, cmd["query"]))
             await reply(True, "queued", session=sess.snapshot(),
                         **_track_reply(track, "queued", lbl, path, queue_pos=pos))
         else:
             sess.fail_streak = 0
-            played = await _play(sess, player, track, uid)
+            played = await _play(sess, player, track, uid, cmd["query"])
             await reply(True, "playing", session=sess.snapshot(),
                         **_track_reply(played, "playing", lbl, path))
         return

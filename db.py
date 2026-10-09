@@ -90,6 +90,18 @@ def _algo_con(guild_id: int) -> sqlite3.Connection:
         last_played REAL    NOT NULL,
         added_at    REAL    NOT NULL,
         PRIMARY KEY (user_id, track_key))""")
+    # Search memory: what the user ended up listening to (or skipped) for a given search text.
+    con.execute("""CREATE TABLE IF NOT EXISTS user_queries (
+        user_id     INTEGER NOT NULL,
+        query       TEXT    NOT NULL,
+        track_key   TEXT    NOT NULL,
+        title       TEXT    NOT NULL DEFAULT '',
+        author      TEXT    NOT NULL DEFAULT '',
+        yt_id       TEXT    NOT NULL DEFAULT '',
+        listens     INTEGER NOT NULL DEFAULT 0,
+        skips       INTEGER NOT NULL DEFAULT 0,
+        last_used   REAL    NOT NULL,
+        PRIMARY KEY (user_id, query, track_key))""")
     return con
 
 
@@ -129,6 +141,45 @@ def _evict(con: sqlite3.Connection, user_id: int, keep_key: str, max_kb: int) ->
         con.execute("DELETE FROM user_tracks WHERE user_id = ? AND track_key = ?", (user_id, victim[0]))
 
 
+_QUERY_SIZE_SQL = ("COALESCE(SUM(LENGTH(query) + LENGTH(track_key) + LENGTH(title) + LENGTH(author) + "
+                   f"LENGTH(yt_id) + {_ROW_OVERHEAD}), 0)")
+
+def record_query(guild_id: int, user_id: int, query: str, meta: dict,
+                 listened: bool, max_kb: int) -> None:
+    """Remember what a search led to: a listen (>= 30 s) or a quick skip.
+    Search memory gets a quarter of the user's storage cap; the least recently used entries go first."""
+    key = meta.get("key")
+    if not key or not query:
+        return
+    with _algo_con(guild_id) as con:
+        con.execute(
+            """INSERT INTO user_queries (user_id, query, track_key, title, author, yt_id,
+                                         listens, skips, last_used)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, query, track_key) DO UPDATE SET
+                 listens = listens + excluded.listens, skips = skips + excluded.skips,
+                 last_used = excluded.last_used""",
+            (user_id, query, key, meta.get("title") or "", meta.get("author") or "",
+             meta.get("yt_id") or "", 1 if listened else 0, 0 if listened else 1, time.time()),
+        )
+        limit = max_kb * 1024 // 4
+        while con.execute(f"SELECT {_QUERY_SIZE_SQL} FROM user_queries WHERE user_id = ?",
+                          (user_id,)).fetchone()[0] > limit:
+            oldest = con.execute("SELECT query, track_key FROM user_queries WHERE user_id = ? "
+                                 "ORDER BY last_used ASC LIMIT 1", (user_id,)).fetchone()
+            if not oldest:
+                break
+            con.execute("DELETE FROM user_queries WHERE user_id = ? AND query = ? AND track_key = ?",
+                        (user_id, oldest[0], oldest[1]))
+
+def user_queries(guild_id: int, user_id: int) -> list[dict]:
+    if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
+        return []
+    with _algo_con(guild_id) as con:
+        rows = con.execute("SELECT query, track_key, title, author, yt_id, listens, skips, last_used "
+                           "FROM user_queries WHERE user_id = ?", (user_id,)).fetchall()
+    return [dict(r) for r in rows]
+
 def record_skip(guild_id: int, user_id: int, key: str) -> None:
     """A quick skip lowers a saved song's score. Unsaved songs are not added."""
     if not key:
@@ -152,6 +203,22 @@ def user_tracks(guild_id: int, user_id: int, limit: int = 100_000) -> list[dict]
         ).fetchall()
     return [dict(r) for r in rows]
 
+
+def reset_user(guild_id: int, user_id: int) -> tuple[int, int]:
+    """/reset-algo: delete one user's saved songs and search memory on one server.
+    Returns (songs deleted, search-memory entries deleted). Never touches other users."""
+    if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
+        return 0, 0
+    with _algo_con(guild_id) as con:
+        songs   = con.execute("DELETE FROM user_tracks WHERE user_id = ?", (user_id,)).rowcount
+        queries = con.execute("DELETE FROM user_queries WHERE user_id = ?", (user_id,)).rowcount
+    return songs, queries
+
+def user_query_count(guild_id: int, user_id: int) -> int:
+    if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
+        return 0
+    with _algo_con(guild_id) as con:
+        return con.execute("SELECT COUNT(*) FROM user_queries WHERE user_id = ?", (user_id,)).fetchone()[0]
 
 def user_stats(guild_id: int, user_id: int) -> tuple[int, int]:
     """(song count, approx bytes) for one user."""

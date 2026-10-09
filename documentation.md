@@ -92,6 +92,7 @@ When playback is started with a private command (`P_EPH`, `PL_EPH` or `AP_EPH` o
 ### Discord permissions the bots need
 
 - **Main bot:** Message Content Intent enabled in the Developer Portal (for the ``prefix`` commands). Send Messages in the server's first channel (for the whitelist notice).
+- **Lavalink:** the **LavaDSPX** plugin for the Normalize button (`com.github.Devoxin:LavaDSPX-Plugin:0.0.5`, repository `https://jitpack.io`, tested with Lavalink 4.2.2). Without it, Normalize replies with an error and everything else works.
 - **Workers:** Connect and Speak in voice channels, Send Messages in the control channel, and **Set Voice Channel Status** (to show the song title on the channel; without it playback still works and a log line notes the missing permission).
 - Every server needs the main bot **and** all worker bots invited.
 
@@ -110,6 +111,7 @@ When playback is started with a private command (`P_EPH`, `PL_EPH` or `AP_EPH` o
 | `/control [worker]` | Controller (or anyone in "All" mode), devs | Opens the playback control panel. |
 | `/hctest` | Anyone | Health check of the controller and every worker. |
 | `/settings` | Manage Server or dev | Opens the per-server settings panel (only you can use it). |
+| `/reset-algo` | Anyone (only themselves) | Deletes your own saved songs and search memory on this server, after a confirm button. There is no way to reset someone else's. Works in any channel; always private. |
 | `/purge [limit]` | Manage Messages or dev | Deletes bot messages among the last `limit` (1–100, default 20) messages in the channel. |
 
 The `worker` option forces a specific worker (0 = automatic). It is needed to use a worker fixed to a channel you are not in.
@@ -122,7 +124,7 @@ The `worker` option forces a specific worker (0 = automatic). It is needed to us
 | 1 | ⏮ Backward (restart track), ⏸/▶ Pause/Play, ⏹ Stop, ⏭ Skip, 🔇 Mute (hides now-playing messages) |
 | 2 | Queue dropdown (25 per page; 🎲 marks autoplay picks) |
 | 3 | ⏭ Jump To, 🗑 Remove, ✖ Clear selection, 🎲 Autoplay, 🔒 Control: Me / 🔓 Control: All |
-| 4 | Page buttons (only for queues longer than one page) |
+| 4 | 🎚️ Normalize (evens out loud and quiet songs; default off; also applies to the shutdown message), then page buttons for queues longer than one page |
 
 The panel stops working after 15 minutes; run `/control` again.
 
@@ -177,15 +179,30 @@ Typed as a message wrapped in two backticks on each side. Only users in `dev_ids
 - Each server has its own file `database/algo/<server id>.db`, holding every user's saved songs for that server.
 - Songs are keyed by their YouTube video id when known (stable across Spotify/YouTube lookups), else their URL.
 
-### Saved songs influence search
+### Search memory
 
-When you `/play` something, your saved songs on that server nudge which result is picked:
+For every `/play` search, the bot remembers what it led to *for you*: a listen (30 s or more) or a quick skip. Stored in the same per-server file (`user_queries`), using up to a quarter of your storage cap; the least recently used entries go first.
 
-- A result that is an upload you have already listened to gets +25 (+2 per play, up to +10 more).
-- A result by an artist you play a lot gets up to +20 (grows with how often you play them).
-- Both stay below one matching query word (+40), so they break ties between equally good matches but never override what you searched for.
-- The AI pick is told which results you've played or whose artist you often play.
-- If you have a saved upload of the exact song that was picked, that upload is played (the one you know).
+### Your history steers search
+
+When you `/play` something, your history on that server is a real part of the ranking (`_personal`):
+
+| Signal | Effect |
+|---|---|
+| You listened to a result for **this same search** before | +60, more with repeat listens |
+| You **skipped** a result for this same search | −40 |
+| The exact upload is in your saved songs | +35, more with plays (a quick skip cancels a listen) |
+| The same song (title + artist) from another upload | +30, more with plays |
+| You know a song with this title by a **different** artist | −15 (probably not the one you mean) |
+| Artist share of your listening | up to +25 |
+
+- Song boosts fade with time since you last listened (half strength after about a month without listening).
+- Uploads you listened to that **aren't in the search results** (e.g. found earlier via Spotify) are fetched and added as candidates, so "noite quente" can find the Flame Runner upload you played without typing the artist.
+- Artist names are matched without YouTube channel suffixes ("Sxilwix - Topic" = "Sxilwix").
+- **Your words still win:** if the search names an artist ("noite quente m22"), history can't pull results by other artists. Altered versions still need to be asked for.
+- With strong personal evidence (+40 or more) for a result that matches the search, it beats the AI's generic "most popular official upload" pick.
+- When Spotify is used, its match also prefers a song or artist you know (many songs share a title).
+- `/reset-algo` deletes your saved songs and search memory on that server (with a confirm button; only ever your own).
 
 ### Autoplay from /control (🎲 button)
 
@@ -536,10 +553,19 @@ Lower-case and strip accents ("Tântrico" → "tantrico"); split into words of 2
 Relevance of a search candidate. Each query word in the title +40, in the author +20. With a reference track (the Spotify match) each of its words +15 in the title or +5 in the author, and the length difference +60 (≤ 3 s), +25 (≤ 8 s) or −40 (> 20 s). "Official" +10; altered-version words −20 (`_ALTERED_QUICK`). Medleys (titles with two or more "/") −60; tracks over 10 minutes −30 unless the query asks for a mix/full/album/hour/live; mashups ("Song A x Song B") −50 and snippets ("best part") −30 unless the query has them.
 
 **`async def _taste(guild_id, user_id)`**
-The requester's saved songs summarised for searching: plays per YouTube id and per artist (cached 60 s).
+The requester's history summarised for searching: saved uploads, songs (title + artist), titles, artist play counts and search memory. Cached 60 s; dropped when they finish or skip a song, or reset.
 
-**`def _taste_bonus(track, taste)`**, **`def _taste_note(track, taste)`**
-The personal score boost for a result, and the note shown to the AI (section 5).
+**`def _personal(track, taste, query_norm)`**
+The personal score for one search result and a note for the AI (table in section 5).
+
+**`async def _remembered_candidates(taste, query_norm, existing)`**
+Up to 3 uploads from the user's history that fit the search but aren't among the results, fetched by video id.
+
+**`def _artist_key(author)`**, **`def _song_id(title, author)`**, **`def _query_norm(query)`**
+Normalised artist (no "- Topic"/"VEVO"), song identity and search text used by the history features.
+
+**`async def _apply_normalize(player, on)`**
+Turns the LavaDSPX `normalization` filter (`maxAmplitude` 0.75, adaptive) on or off for a player. Filters stay on the player across songs, including the shutdown message.
 
 **`def _popularity(meta)`**
 Popularity points from YouTube stats: `8 × log10(views + 1) + 4 × log10(likes + 1)`. About 99 for a billion-view hit, 48 for 50k views, 0 for an unwatched upload. Relevance still dominates: a song matching one fewer query word (−40) needs roughly 100× more views to win.
@@ -794,6 +820,15 @@ Removes the user's lowest-score songs (oldest play breaks ties) until they are w
 **`def user_tracks(guild_id, user_id, limit=100000)`**
 The user's saved songs, best score first, with a `score` field.
 
+**`def record_query(guild_id, user_id, query, meta, listened, max_kb)`**
+Search memory: +1 listen or +1 skip for (user, search text, song). Capped at a quarter of `max_kb`, least recently used first.
+
+**`def user_queries(guild_id, user_id)`**, **`def user_query_count(guild_id, user_id)`**
+A user's search memory / its size.
+
+**`def reset_user(guild_id, user_id)`**
+`/reset-algo`: deletes one user's saved songs and search memory on one server; returns the counts.
+
 **`def user_stats(guild_id, user_id)`**
 `(song count, approximate bytes)` for a user.
 
@@ -837,6 +872,8 @@ The controller sends one JSON object per connection to `.worker<N>.sock`, with `
 | `toggle_loop` | Repeats the current track or not. | `loop_on` or `loop_off` |
 | `toggle_autoplay` | Turns autoplay on (needs played history unless in algo mode; starts playing if idle) or off (drops queued picks). | `autoplay_on` or `autoplay_off`, `session` |
 | `set_mode` | Sets `mode` to `me` or `all`. | `mode_me` or `mode_all`, `session` |
+| `toggle_normalize` | Turns the normalization filter on or off. | `normalize_on` or `normalize_off` |
+| `forget_user` | After `/reset-algo`: drops the user's cached history and doesn't re-save the song playing now. | `forgotten` |
 | `jump_to` | Records a listen or quick skip for the current track, drops the queue up to the song with `qid` and plays it. Error if it already played or was removed. | `jumped` with `title`, `author`, `queue_remaining` |
 | `shutdown_graceful` | Ends every session, replies, then exits. | `shutdown_graceful` |
 | `drain` | Graceful restart: blocks new playback; each session finishes its song, plays the message at `message_url` and leaves. | `draining` with `remaining` |
@@ -862,6 +899,7 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 |---|---|---|---|
 | `SERVICE_NAME` | main.py | `SERVER_musicbots` | systemd unit used by ``restart full`` / ``shutdown full``. |
 | `DRAIN_TIMEOUT` | main.py | 300 s | Graceful restart: longest wait for current songs before they are cut. |
+| `RESTART_EXIT_CODE` | main.py | 75 | Exit code after a `reload`; the unit restarts the bot on it. |
 | `DRAIN_MESSAGE_MAX` | main.py | 130 s | Graceful restart: extra wait for the shutdown messages after the timeout. |
 | `SHUTDOWN_MESSAGE_MAX` | worker.py | 120 s | A worker leaves this long after starting the message, even if it never reports finishing. |
 | `PENDING_TTL` | main.py | 90 s | How long a `/play` reservation holds a worker without confirmation. |
@@ -883,6 +921,9 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `ALGO_DIRECT_CHANCE` | worker.py | 0.3 | `/autoplay`: chance of replaying a saved song instead of a related one. |
 | `_STATUS_DELETE_DELAY` | worker.py | 10 s | Lifetime of the now-playing messages. |
 | `AI_PICK_CANDIDATES` | worker.py | 8 | Search results shown to the AI per search. |
+| `PERSONAL_STRONG` | worker.py | 40 | Personal score at which your history overrides the AI pick. |
+| `PERSONAL_HALF_LIFE_DAYS` | worker.py | 30 | How fast personal boosts fade without listening. |
+| `NORMALIZE_SETTINGS` | worker.py | maxAmplitude 0.75, adaptive | Normalize filter settings. |
 | `_GROQ_ARGS` | worker.py | 400 tokens, low reasoning | Settings for every Groq call (the AI pick allows 1200 tokens). |
 
 | File | Created by | Purpose |
@@ -903,9 +944,18 @@ To reset a server's settings, delete its row from `servers.db` (or the whole fil
 
 ## 11. Graceful restart
 
-`systemctl restart SERVER_musicbots` (and ``restart full``) or `systemctl stop` (``shutdown full``) no longer cut the music:
+Use **`sudo systemctl reload SERVER_musicbots`** to restart. It returns immediately; the bot finishes songs in the background and then restarts itself. ``restart full`` does the same.
 
-1. systemd sends the stop signal to the **main bot only** (`KillMode=mixed`).
+| Command | Returns | What happens |
+|---|---|---|
+| `systemctl reload SERVER_musicbots` | immediately | graceful restart (steps below), then the bot starts again |
+| `systemctl --no-block restart SERVER_musicbots` | immediately | same, through a normal restart |
+| `systemctl --no-block stop SERVER_musicbots` / ``shutdown full`` | immediately | graceful, then stays stopped |
+| `systemctl restart` / `stop` without `--no-block` | when done (up to ~7 min) | same, but systemd makes the command wait — that's how systemd works and can't be changed by the bot |
+
+Steps:
+
+1. `reload` sends SIGHUP; `restart`/`stop` send SIGTERM to the **main bot only** (`KillMode=mixed`).
 2. The main bot blocks new commands ("restarting — try again in a few minutes") and sends `drain` to every worker. A worker that is draining refuses new playback ("hard block"), even after its own song finished.
 3. Each worker, per server:
    - a song is playing → it finishes **that song**; the rest of the queue/playlist and autoplay are dropped;
@@ -913,17 +963,20 @@ To reset a server's settings, delete its row from `servers.db` (or the whole fil
    - nobody in the voice channel → it leaves without a message.
 4. After the song, the worker plays **`shutdown.mp3`** (next to `main.py`) and leaves when it ends (at most 2 minutes). Without the file, it just leaves.
 5. The main bot waits until **every** worker is done, or `DRAIN_TIMEOUT` (5 minutes). At the timeout, songs still playing are cut and the message plays immediately (`drain_force`); then it waits for those messages.
-6. Everything exits and systemd starts it again (restart) or leaves it stopped (stop).
+6. Everything exits. After a reload the bot exits with code 75 and systemd starts it again (`RestartForceExitStatus=75`); after a restart systemd starts it; after a stop it stays stopped.
 
-A second stop signal (e.g. running `systemctl kill SERVER_musicbots` while it waits) skips the wait and goes straight to step 5. If nothing is playing, it restarts immediately.
+A second signal while it waits (another `reload`, or `systemctl kill SERVER_musicbots`) skips the wait and goes straight to step 5. If nothing is playing, it restarts immediately.
 
 The message is served to Lavalink over a private `http://127.0.0.1:<random port>/shutdown.mp3` by the main bot, so Lavalink must run on the same machine (its `http` source is enabled; its `local` file source is not needed).
 
 Required service settings (in `/etc/systemd/system/SERVER_musicbots.service`):
 
 ```ini
+ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
 TimeoutStopSec=480
+SuccessExitStatus=75
+RestartForceExitStatus=75
 ```
 
 `TimeoutStopSec` must be longer than the 5-minute wait plus the message, otherwise systemd kills everything before it's done.
@@ -945,7 +998,7 @@ venv/bin/pip install -r requirements.txt
 Then copy `server_settings.json.example` to `server_settings.json`, fill it in, create `.env` with `GROQ_API_KEY=...`, and start the service:
 
 ```bash
-sudo systemctl restart SERVER_musicbots
+sudo systemctl start SERVER_musicbots
 ```
 
 Follow the logs (controller and every worker, prefixed `[Worker N]`):
