@@ -1905,6 +1905,11 @@ async def _search(query: str, source: str, sess: Session | None,
         altered = set() if asked else {i for i, t in enumerate(top) if _ALTERED_QUICK.search(t.title or "")}
 
     allowed = [i for i in range(len(top)) if wants_altered or i not in altered]
+    if wants_altered:
+        # An explicit request for an altered version beats history: strong history with the
+        # normal upload must not push every slowed/sped-up result out of the running.
+        alt_allowed = [i for i in allowed if i in altered or _ALTERED_QUICK.search(top[i].title or "")]
+        allowed = alt_allowed or allowed
     if allowed:
         # Relevance guard: the pick must match the search about as well as the best allowed result,
         # so "noite quente slowed" can't land on a slowed version of a different song. Measured on
