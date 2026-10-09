@@ -625,6 +625,7 @@ class Session:
         self.closing      = False
         self.drain_state: str | None = None   # None, "finishing" (current song) or "message" (shutdown.mp3)
         self.created      = time.monotonic()
+        self.stalled      = 0      # watchdog passes in a row with songs queued but nothing playing
         self.mix_cache: dict[str, list] = {}   # seed YouTube id -> its Mix, reused across refills
         self.ai_reserve: list[str] = []        # unused AI suggestions, used before asking Groq again
         self.history: deque[dict] = deque(maxlen=HISTORY_LEN)
@@ -1453,7 +1454,19 @@ async def _watchdog_pass() -> None:
         if player is None or not getattr(player, "connected", True):
             print(f"[Worker {BOT_INDEX}] Watchdog: session in guild {gid} has no voice connection — ending", flush=True)
             await _end_session(gid, disconnect=False)
-        elif player.current is None and not sess.queue and not (sess.idle_task and not sess.idle_task.done()):
+            continue
+        refilling = sess.autoplay_task is not None and not sess.autoplay_task.done()
+        if player.current is None and sess.queue and not sess.skipping and not refilling:
+            # Songs are waiting but nothing plays (e.g. Lavalink restarted mid-song and dropped
+            # the player's track). Two checks in a row (30-60 s) so a normal song change isn't hit.
+            sess.stalled += 1
+            if sess.stalled >= 2:
+                print(f"[Worker {BOT_INDEX}] Watchdog: queue stalled in guild {gid} — resuming playback", flush=True)
+                sess.stalled = 0
+                await _advance_safely(sess, player)
+            continue
+        sess.stalled = 0
+        if player.current is None and not sess.queue and not (sess.idle_task and not sess.idle_task.done()):
             print(f"[Worker {BOT_INDEX}] Watchdog: nothing playing in guild {gid} — starting idle timer", flush=True)
             _start_idle_timer(sess)
 
@@ -1526,6 +1539,26 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         sess.queue.insert(0, QueueItem(orig, "Looping", "", sess.current_requester))
 
     await _advance_safely(sess, player)
+
+@bot.event
+async def on_wavelink_track_stuck(payload: wavelink.TrackStuckEventPayload):
+    """Lavalink says the stream stopped delivering audio. Without this the song just sat silent."""
+    player: wavelink.Player = payload.player
+    sess = _session_for_player(player)
+    if not sess or sess.drain_state == "message":
+        return
+    title = payload.track.title if payload.track else "?"
+    print(f"[Worker {BOT_INDEX}] Track stuck ({payload.threshold} ms without audio): {title!r} — skipping", flush=True)
+    sess.current_meta = None   # a stall isn't the user's skip
+    sess.skipping = True
+    try:
+        try:
+            await player.stop()
+        except Exception:
+            pass
+        await _advance_safely(sess, player)
+    finally:
+        sess.skipping = False
 
 @bot.event
 async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPayload):
