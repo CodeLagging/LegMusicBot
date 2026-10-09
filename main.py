@@ -1,112 +1,145 @@
 import asyncio
-import glob
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import discord
 from discord import app_commands
+
+import appsettings
+import db
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 SERVER_MODE = "--server" in sys.argv
 
-OWNER_ID = 844921681449058326
-
 EPH_KEYS = {
     "P_EPH":  "/play",
     "PL_EPH": "/playlist",
+    "AP_EPH": "/autoplay",
     "HC_EPH": "/hctest",
     "CC_EPH": "/control panel",
     "S_EPH":  "/stop",
-    "RS_EPH": "/restart",
-    "SD_EPH": "/shutdown",
 }
 
 
-CFG_PATH = Path(__file__).parent / "config.json"
-with open(CFG_PATH) as _f:
-    CONFIG = json.load(_f)
+SCRIPT_DIR = Path(__file__).parent
+TOKENS     = appsettings.require_startup()["tokens"]
+PYTHON     = sys.executable
 
-TOKENS         = CONFIG["tokens"]
-DEFAULT_SOURCE = CONFIG.get("default_source", "sp")
-PYTHON         = sys.executable
+SOURCES = {"sp": "Spotify", "yt": "YouTube Music", "sc": "SoundCloud"}
+DEFAULT_SOURCE = "sp"
 
-if len(TOKENS) < 2:
-    sys.exit("config.json needs at least 2 tokens: tokens[0]=main, tokens[1+]=workers")
-
-
-SCRIPT_DIR      = Path(__file__).parent
-_bot_files      = sorted(Path(p) for p in glob.glob(str(SCRIPT_DIR / "musicbot*.py")))
-_worker_scripts = _bot_files[: len(TOKENS) - 1]
-
-if not _worker_scripts:
-    sys.exit("No musicbot*.py files found.")
-if len(_worker_scripts) < len(TOKENS) - 1:
-    print(f"[Main] WARNING: {len(TOKENS)-1} worker token(s) but only {len(_worker_scripts)} script(s). Extra tokens ignored.", flush=True)
+WORKER_SCRIPT = SCRIPT_DIR / "worker.py"
+MAIN_SOCKET   = SCRIPT_DIR / ".main.sock"
+if not WORKER_SCRIPT.exists():
+    sys.exit("worker.py not found.")
 
 
-SETTINGS_PATH = SCRIPT_DIR / "settings.json"
+# ── per-server config (database/server/servers.db) ──────────────────────────
 
-def _load_settings() -> dict:
+_gcfg_cache: dict[int, dict] = {}
+
+def _gcfg(guild_id: int) -> dict:
+    if guild_id not in _gcfg_cache:
+        _gcfg_cache[guild_id] = db.get_guild(guild_id)
+    return _gcfg_cache[guild_id]
+
+def _save_gcfg(guild_id: int) -> None:
+    db.save_guild(guild_id, _gcfg(guild_id))
+
+def _cfg_cc(guild_id: int) -> int | None:
+    return _gcfg(guild_id).get("cc_id") or None
+
+def _cfg_vcw(guild_id: int, index: int) -> int | None:
+    return _gcfg(guild_id)["vcw"].get(str(index)) or None
+
+def _cfg_src(guild_id: int) -> str:
+    src = _gcfg(guild_id).get("src")
+    return src if src in SOURCES else DEFAULT_SOURCE
+
+def _eph(guild_id: int | None, key: str) -> bool:
+    if not guild_id:
+        return False
+    return bool(_gcfg(guild_id)["eph"].get(key, False))
+
+def _migrate_legacy_settings() -> None:
+    """One-time import of the old single-server settings.json into the server DB."""
+    legacy = SCRIPT_DIR / "settings.json"
+    if not legacy.exists():
+        return
     try:
-        with open(SETTINGS_PATH) as f:
+        with open(legacy) as f:
             data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("G_ID", None)
-    data.setdefault("CC_ID", None)
-    if not isinstance(data.get("VCW"), dict):
-        data["VCW"] = {}
-    if not isinstance(data.get("EPH"), dict):
-        data["EPH"] = {}
-    return data
+    except (OSError, json.JSONDecodeError):
+        return
+    gid = data.get("G_ID")
+    if gid and not db.guild_exists(int(gid)):
+        eph = {k: v for k, v in (data.get("EPH") or {}).items() if k in EPH_KEYS}
+        db.save_guild(int(gid), {"cc_id": data.get("CC_ID"), "vcw": data.get("VCW") or {}, "eph": eph})
+        print(f"[Main] Migrated settings.json into the server DB for guild {gid}", flush=True)
+    legacy.rename(legacy.with_name("settings.json.migrated"))
 
-SETTINGS = _load_settings()
 
-def _save_settings() -> None:
-    tmp = SETTINGS_PATH.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(SETTINGS, f, indent=2)
-    os.replace(tmp, SETTINGS_PATH)
+# ── worker processes ────────────────────────────────────────────────────────
 
-def _cfg_guild() -> int | None:
-    return SETTINGS.get("G_ID") or None
-
-def _cfg_cc() -> int | None:
-    return SETTINGS.get("CC_ID") or None
-
-def _cfg_vcw(index: int) -> int | None:
-    return SETTINGS["VCW"].get(str(index)) or None
-
-def _eph(key: str) -> bool:
-    return bool(SETTINGS["EPH"].get(key, False))
-
+PENDING_TTL = 90.0   # how long a reservation made by /play survives without the worker confirming it
 
 class WorkerProcess:
-    def __init__(self, index: int, script: Path):
+    def __init__(self, index: int):
         self.index       = index
-        self.script      = script
         self.socket_path = SCRIPT_DIR / f".worker{index}.sock"
         self.proc: subprocess.Popen | None = None
-        self.busy        = False
-        self.channel_id: int | None = None
         self._pgid: int | None = None
         self._output_task: asyncio.Task | None = None
         self._shutdown_requested = False
+        # Per-guild session snapshots reported by the worker:
+        # {channel_id, controller_id, mode, autoplay, text_channel_id}
+        self.sessions: dict[int, dict] = {}
+        # Reservations made while a /play is in flight, before the worker reports the session.
+        self.pending: dict[int, tuple[dict, float]] = {}
+        self.guild_ids: set[int] = set()
+        self.user_id: int | None = None
+        self.lavalink_ok = False
+
+    def session(self, guild_id: int) -> dict | None:
+        s = self.sessions.get(guild_id)
+        if s:
+            return s
+        p = self.pending.get(guild_id)
+        if p and p[1] > time.monotonic():
+            return p[0]
+        return None
+
+    def busy_in(self, guild_id: int) -> bool:
+        return self.session(guild_id) is not None
+
+    def reserve(self, guild_id: int, channel_id: int, user_id: int) -> None:
+        snap = {"channel_id": channel_id, "controller_id": user_id, "mode": "me",
+                "autoplay": False, "text_channel_id": None}
+        self.pending[guild_id] = (snap, time.monotonic() + PENDING_TTL)
+
+    def apply(self, guild_id: int, snap: dict | None) -> None:
+        if snap:
+            self.sessions[guild_id] = snap
+        else:
+            self.sessions.pop(guild_id, None)
+
+    def clear_state(self) -> None:
+        self.sessions.clear()
+        self.pending.clear()
 
     def start(self):
         if self.socket_path.exists():
             self.socket_path.unlink(missing_ok=True)
         self.proc = subprocess.Popen(
-            [PYTHON, "-u", str(self.script)],
+            [PYTHON, "-u", str(WORKER_SCRIPT), "--index", str(self.index)],
             cwd=str(SCRIPT_DIR),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -183,8 +216,7 @@ class WorkerProcess:
 
     async def restart(self):
         print(f"[Main] Restarting Worker {self.index} ...", flush=True)
-        self.busy                = False
-        self.channel_id          = None
+        self.clear_state()
         self._shutdown_requested = False
         await self.terminate()
         await asyncio.sleep(1)
@@ -219,12 +251,54 @@ class WorkerProcess:
 
 _workers: dict[int, WorkerProcess] = {}
 _shutting_down = False
+_pick_lock = asyncio.Lock()
 
-def _worker_for_channel(channel_id: int) -> WorkerProcess | None:
-    for w in _workers.values():
-        if w.busy and w.channel_id == channel_id:
+def _ordered_workers() -> list[WorkerProcess]:
+    return sorted(_workers.values(), key=lambda x: x.index)
+
+def _worker_for_channel(guild_id: int, channel_id: int) -> WorkerProcess | None:
+    for w in _ordered_workers():
+        s = w.session(guild_id)
+        if s and s["channel_id"] == channel_id:
             return w
     return None
+
+async def _resync_worker(w: WorkerProcess, timeout: float = 4.0) -> bool:
+    """Ask the worker what it is really doing. The worker is the source of truth for busy/free."""
+    resp = await w.send({"op": "sync"}, timeout=timeout)
+    if resp.get("status") != "ok":
+        return False
+    w.user_id     = resp.get("user_id")
+    w.guild_ids   = {int(g) for g in resp.get("guilds") or []}
+    w.lavalink_ok = bool(resp.get("lavalink_ok"))
+    w.sessions    = {int(g): s for g, s in (resp.get("sessions") or {}).items()}
+    return True
+
+async def _resync_all() -> None:
+    await asyncio.gather(*[_resync_worker(w, timeout=3.0) for w in _workers.values()],
+                         return_exceptions=True)
+
+
+# ── worker → main state events ──────────────────────────────────────────────
+
+async def _handle_event(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        msg  = json.loads(data.decode())
+        if msg.get("op") == "state":
+            w = _workers.get(int(msg["index"]))
+            if w:
+                w.apply(int(msg["guild_id"]), msg.get("session"))
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+async def _event_server():
+    MAIN_SOCKET.unlink(missing_ok=True)
+    server = await asyncio.start_unix_server(_handle_event, path=str(MAIN_SOCKET))
+    async with server:
+        await server.serve_forever()
 
 
 COLOUR = discord.Colour.from_str("#5865F2")
@@ -290,25 +364,33 @@ def _simple_embed(title: str, colour: discord.Colour) -> discord.Embed:
 def _err_embed(msg: str) -> discord.Embed:
     return discord.Embed(title=f"❌  {msg}", colour=discord.Colour.red())
 
-def _all_busy_embed() -> discord.Embed:
-    busy = sum(1 for w in _workers.values() if w.busy)
+def _all_busy_embed(guild_id: int) -> discord.Embed:
+    present = [w for w in _workers.values() if guild_id in w.guild_ids]
+    busy = sum(1 for w in present if w.busy_in(guild_id))
     return discord.Embed(
         title="❌  No bots available",
-        description=(f"{busy} of {len(_workers)} music bot(s) are busy and the rest are reserved "
+        description=(f"{busy} of {len(present)} music bot(s) in this server are busy and the rest are reserved "
                      f"for other channels. Wait, use `/stop`, or pick one with the `worker` option."),
         colour=discord.Colour.red(),
     )
 
-def _is_owner(user) -> bool:
-    return user.id == OWNER_ID
+def _is_dev(user) -> bool:
+    return appsettings.is_dev(user.id)
 
-async def _owner_only(interaction: discord.Interaction) -> bool:
-    if _is_owner(interaction.user):
-        return True
-    await interaction.response.send_message(
-        embed=_err_embed("Only the bot owner can use this command"), ephemeral=True
-    )
-    return False
+def _has_perm(user, perm: str) -> bool:
+    perms = getattr(user, "guild_permissions", None)
+    return bool(perms and getattr(perms, perm, False))
+
+def _allowed(session: dict | None, user) -> bool:
+    """Whoever started playback controls it, unless they opened it to everyone. Devs can always control."""
+    if not session:
+        return False
+    return (_is_dev(user) or session.get("controller_id") == user.id
+            or session.get("mode") == "all")
+
+def _locked_msg(w: WorkerProcess, session: dict) -> str:
+    return (f"🔒 Worker {w.index} is controlled by <@{session.get('controller_id')}>. "
+            "Join another voice channel to get your own worker.")
 
 
 class MainBot(discord.Client):
@@ -317,20 +399,11 @@ class MainBot(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self._guild_cmds_cleared = False
 
     async def setup_hook(self):
-        guild_id_str = _cfg_guild() or CONFIG.get("guild_id")
-        if guild_id_str:
-            guild = discord.Object(id=int(guild_id_str))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            print(f"[Main] Commands synced to guild {guild_id_str}", flush=True)
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-            print("[Main] Global commands cleared", flush=True)
-        else:
-            await self.tree.sync()
-            print("[Main] Commands synced globally", flush=True)
+        await self.tree.sync()
+        print("[Main] Commands synced globally", flush=True)
 
 
         print("[Main] Clearing worker bot commands...", flush=True)
@@ -351,146 +424,73 @@ class MainBot(discord.Client):
 
 main_bot = MainBot()
 
+
+async def _enforce_whitelist(guild: discord.Guild) -> bool:
+    if appsettings.is_whitelisted(guild.id):
+        return True
+    print(f"[Main] Leaving non-whitelisted guild {guild.id} ({guild.name})", flush=True)
+    me = guild.me
+    channel = guild.system_channel
+    if not (channel and me and channel.permissions_for(me).send_messages):
+        channel = next((c for c in guild.text_channels if me and c.permissions_for(me).send_messages), None)
+    if channel:
+        try:
+            await channel.send(
+                f"<@{guild.owner_id}> {appsettings.get()['leave_message']}",
+                allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+            )
+        except Exception as exc:
+            print(f"[Main] Could not post leave notice in {guild.id}: {exc}", flush=True)
+    try:
+        await guild.leave()
+    except Exception as exc:
+        print(f"[Main] Could not leave {guild.id}: {exc}", flush=True)
+    return False
+
 @main_bot.event
 async def on_ready():
-    print(f"[Main] Logged in as {main_bot.user} — {len(_workers)} worker(s)", flush=True)
+    print(f"[Main] Logged in as {main_bot.user} — {len(_workers)} worker(s), {len(main_bot.guilds)} server(s)", flush=True)
+    for g in list(main_bot.guilds):
+        if not await _enforce_whitelist(g):
+            continue
+        if not main_bot._guild_cmds_cleared:
+            # Older versions synced commands per-guild; remove those so they don't show up twice.
+            try:
+                main_bot.tree.clear_commands(guild=g)
+                await main_bot.tree.sync(guild=g)
+            except Exception as exc:
+                print(f"[Main] Could not clear guild commands in {g.id}: {exc}", flush=True)
+    main_bot._guild_cmds_cleared = True
+
+@main_bot.event
+async def on_guild_join(guild: discord.Guild):
+    if await _enforce_whitelist(guild):
+        print(f"[Main] Joined whitelisted guild {guild.id} ({guild.name})", flush=True)
 
 
-_ENV_KEY_RE = re.compile(r"^(G_ID|CC_ID|VCW(\d+))$")
-_SET_RE     = re.compile(r"^set-env\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\S*)\s*$", re.IGNORECASE)
-_UNSET_RE   = re.compile(r"^unset-env\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", re.IGNORECASE)
-_ENV_USAGE  = (
-    "**Settings commands** (wrap in double backticks):\n"
-    "``set-env G_ID=<server id>``  — lock the bot to one server\n"
-    "``set-env CC_ID=<text channel id>``  — control channel\n"
-    "``set-env VCW1=<voice channel id>``  — fixed voice channel for worker 1 (VCW2, VCW3, ...)\n"
-    "``set-env P_EPH=true``  — private replies for a command (also PL_EPH, HC_EPH, CC_EPH, S_EPH, RS_EPH, SD_EPH); `false` = shared with everyone\n"
-    "``unset-env <KEY>``  — clear a setting\n"
-    "``get-env``  — show current settings"
-)
+# ── dev prefix commands (``restart``, ``shutdown``, ``get-env``) ─────────────
 
-def _parse_env_value(raw: str) -> int | None:
-    raw = raw.strip().strip("<>#@&!")
-    if raw.lower() in ("", "none", "null", "off", "0"):
-        return None
-    if not raw.isdigit():
-        raise ValueError("The value must be a numeric ID (or `none` to clear).")
-    return int(raw)
+_DEV_RE = re.compile(r"^(restart|shutdown|get-env|show-env)(?:\s+(\S+))?\s*$", re.IGNORECASE)
 
-def _parse_bool_value(raw: str) -> bool | None:
-    raw = raw.strip().lower()
-    if raw in ("", "none", "null", "default"):
-        return None
-    if raw in ("true", "1", "yes", "y", "on", "t"):
-        return True
-    if raw in ("false", "0", "no", "n", "off", "f"):
-        return False
-    raise ValueError("The value must be `true` or `false`.")
-
-def _channel_guild_id(ch) -> int | None:
-    g = getattr(ch, "guild", None)
-    return g.id if g else None
-
-def _apply_env(key: str, value: int | bool | None, home_guild: discord.Guild) -> str:
-    key = key.upper()
-    if key in EPH_KEYS:
-        if value is None:
-            SETTINGS["EPH"].pop(key, None)
-            _save_settings()
-            return f"`{key}` reset to default — {EPH_KEYS[key]} replies are public (shared with everyone)."
-        SETTINGS["EPH"][key] = bool(value)
-        _save_settings()
-        who = "private (only the person who ran it sees them)" if value else "public (shared with everyone)"
-        return f"`{key}` = `{str(bool(value)).lower()}` — {EPH_KEYS[key]} replies are {who}."
-    m = _ENV_KEY_RE.match(key)
-    if not m:
-        raise ValueError("Unknown key. Valid keys: `G_ID`, `CC_ID`, `VCW<n>` (e.g. `VCW1`), " + ", ".join(f"`{k}`" for k in EPH_KEYS) + ".")
-    target_gid = _cfg_guild() or home_guild.id
-
-
-    if key == "G_ID":
-        if value is None:
-            SETTINGS["G_ID"] = None
-            _save_settings()
-            return "`G_ID` cleared — the bot works in any server it is in."
-        g = main_bot.get_guild(value)
-        if not g:
-            raise ValueError("The main bot isn't in a server with that ID.")
-        dropped: list[str] = []
-        if SETTINGS.get("CC_ID"):
-            ch = main_bot.get_channel(SETTINGS["CC_ID"])
-            if not ch or _channel_guild_id(ch) != value:
-                SETTINGS["CC_ID"] = None
-                dropped.append("CC_ID")
-        for idx, cid in list(SETTINGS["VCW"].items()):
-            ch = main_bot.get_channel(cid)
-            if not ch or _channel_guild_id(ch) != value:
-                del SETTINGS["VCW"][idx]
-                dropped.append(f"VCW{idx}")
-        SETTINGS["G_ID"] = value
-        _save_settings()
-        msg = f"`G_ID` = `{value}` ({g.name})."
-        if dropped:
-            msg += " Cleared (belonged to another server): " + ", ".join(f"`{d}`" for d in dropped) + "."
-        msg += " Restart the service once so slash commands sync to this server."
-        return msg
-
-
-    if key == "CC_ID":
-        if value is None:
-            SETTINGS["CC_ID"] = None
-            _save_settings()
-            return "`CC_ID` cleared — commands work in any channel."
-        ch = main_bot.get_channel(value)
-        if not isinstance(ch, discord.TextChannel) or ch.guild.id != target_gid:
-            raise ValueError("That isn't a text channel in the bot's server.")
-        SETTINGS["CC_ID"] = value
-        _save_settings()
-        return f"`CC_ID` = `{value}` (#{ch.name}). Slash commands now only work there, and workers post status messages there."
-
-
-    idx = int(m.group(2))
-    if idx not in _workers:
-        raise ValueError(f"No worker #{idx}. Valid: {', '.join(str(i) for i in sorted(_workers))}.")
-    if value is None:
-        SETTINGS["VCW"].pop(str(idx), None)
-        _save_settings()
-        return f"`VCW{idx}` cleared — worker {idx} joins whichever voice channel the user is in."
-    ch = main_bot.get_channel(value)
-    if not isinstance(ch, discord.VoiceChannel) or ch.guild.id != target_gid:
-        raise ValueError("That isn't a (non-stage) voice channel in the bot's server.")
-    for other, cid in SETTINGS["VCW"].items():
-        if cid == value and other != str(idx):
-            raise ValueError(f"Worker {other} is already fixed to that channel.")
-    SETTINGS["VCW"][str(idx)] = value
-    _save_settings()
-    note = ""
-    w = _workers[idx]
-    if w.busy and w.channel_id != value:
-        note = " (it is playing elsewhere right now — applies from its next play)"
-    return f"`VCW{idx}` = `{value}` (🔊 {ch.name}). Worker {idx} always joins this channel, with or without people{note}."
-
-def _env_summary() -> str:
-    lines = []
-    gid = _cfg_guild()
-    g = main_bot.get_guild(gid) if gid else None
-    guild_summary = f"`{gid}` ({g.name if g else 'unknown server'})" if gid else "not set (any server)"
-    lines.append(f"`G_ID`  = {guild_summary}")
-    cc = _cfg_cc()
-    cch = main_bot.get_channel(cc) if cc else None
-    channel_summary = f"`{cc}` (#{cch.name if cch else 'unknown'})" if cc else "not set (any channel)"
-    lines.append(f"`CC_ID` = {channel_summary}")
-    for idx in sorted(_workers):
-        vc = _cfg_vcw(idx)
-        vch = main_bot.get_channel(vc) if vc else None
-        state = "🔴 busy" if _workers[idx].busy else "🟢 free"
+def _env_summary(guild: discord.Guild) -> str:
+    gid   = guild.id
+    lines = [f"**{guild.name}** (`{gid}`) — whitelisted: `{str(appsettings.is_whitelisted(gid)).lower()}`"]
+    cc  = _cfg_cc(gid)
+    cch = guild.get_channel(cc) if cc else None
+    lines.append("`CC_ID` = " + (f"`{cc}` (#{cch.name if cch else 'unknown'})" if cc else "not set (any channel)"))
+    lines.append(f"`SRC` = `{_cfg_src(gid)}` ({SOURCES[_cfg_src(gid)]})")
+    for w in _ordered_workers():
+        vc  = _cfg_vcw(gid, w.index)
+        vch = guild.get_channel(vc) if vc else None
+        s   = w.session(gid)
+        state = ("🔴 busy" if s else "🟢 free") if gid in w.guild_ids else "⚫ not in server"
         lines.append(
-            f"`VCW{idx}`  = "
+            f"`VCW{w.index}` = "
             + (f"`{vc}` (🔊 {vch.name if vch else 'unknown'})" if vc else "not set (joins where the user is)")
             + f"  — {state}"
         )
     for k, label in EPH_KEYS.items():
-        lines.append(f"`{k}` = `{str(_eph(k)).lower()}`  — {label} replies {'private' if _eph(k) else 'public'}")
+        lines.append(f"`{k}` = `{str(_eph(gid, k)).lower()}`  — {label} replies {'private' if _eph(gid, k) else 'public'}")
     return "\n".join(lines)
 
 @main_bot.event
@@ -500,60 +500,124 @@ async def on_message(message: discord.Message):
     text = message.content.strip()
     if len(text) < 5 or not (text.startswith("``") and text.endswith("``")):
         return
-    inner = text.strip("`").strip()
-    low = inner.lower()
-    if not (low.startswith("set-env") or low.startswith("unset-env") or low in ("get-env", "show-env")):
+    m = _DEV_RE.match(text.strip("`").strip())
+    if not m or not _is_dev(message.author):
+        return
+    cmd, arg = m.group(1).lower(), (m.group(2) or "").lower()
+
+    if cmd in ("get-env", "show-env"):
+        await message.reply(_env_summary(message.guild), mention_author=False)
         return
 
-    g = _cfg_guild()
-    if g and message.guild.id != g:
+    await _dev_power(message, cmd, arg)
+
+
+SERVICE_NAME = "SERVER_musicbots"
+
+async def _systemctl(action: str):
+    proc = await asyncio.create_subprocess_exec(
+        "systemctl", action, SERVICE_NAME,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+
+async def _delayed_systemctl(action: str, delay: float = 2.0):
+    await asyncio.sleep(delay)
+    await _systemctl(action)
+
+async def _dev_power(message: discord.Message, cmd: str, arg: str) -> None:
+    """``restart [n|full]`` / ``shutdown [n|full]`` — no argument means all workers."""
+    restart = cmd == "restart"
+
+    if arg == "full":
+        action = "restart" if restart else "stop"
+        embed = discord.Embed(
+            title="🔄  Restarting entire service…" if restart else "🔴  Shutting down entire service…",
+            description=(f"Running `systemctl {action} {SERVICE_NAME}`.\n"
+                         + ("All workers and the main controller will restart. Music will stop in every server."
+                            if restart else
+                            f"Everything stops until `systemctl start {SERVICE_NAME}` is run on the server.")),
+            colour=COLOUR if restart else discord.Colour.red(),
+        )
+        embed.set_footer(text="This message will not update.")
+        await message.reply(embed=embed, mention_author=False)
+        asyncio.ensure_future(_delayed_systemctl(action, delay=2.0))
         return
 
-    if not _is_owner(message.author):
-        await message.reply("❌ Only the bot owner can change settings.", mention_author=False)
+    if arg in ("", "all", "0"):
+        targets = _ordered_workers()
+    elif arg.isdigit() and int(arg) in _workers:
+        targets = [_workers[int(arg)]]
+    else:
+        await message.reply(
+            embed=_err_embed(f"Unknown target `{arg}`. Use a worker number ({', '.join(str(i) for i in sorted(_workers))}), "
+                             "`full`, or nothing for all workers"),
+            mention_author=False)
         return
 
-    if low in ("get-env", "show-env"):
-        await message.reply(_env_summary(), mention_author=False)
-        return
+    label = f"all {len(targets)} worker(s)" if len(targets) > 1 else f"Worker {targets[0].index}"
+    status = await message.reply(
+        embed=discord.Embed(
+            title=f"{'🔄  Restarting' if restart else '🔴  Shutting down'} {label}…",
+            description=("Stopping music in every server and reconnecting." if restart
+                         else "Stopping music in every server. Workers will **not** restart."),
+            colour=COLOUR if restart else discord.Colour.red(),
+        ),
+        mention_author=False,
+    )
 
+    lines: list[str] = []
+    for w in targets:
+        try:
+            if restart:
+                await w.restart()
+                for _ in range(15):
+                    await asyncio.sleep(1)
+                    resp = await w.send({"op": "ping"}, timeout=3.0)
+                    if resp.get("status") == "ok":
+                        lines.append(f"✅ Worker {w.index} — online (Lavalink: {'✅' if resp.get('lavalink_ok') else '❌'})")
+                        break
+                else:
+                    lines.append(f"⚠️ Worker {w.index} — started but socket not yet ready")
+            else:
+                w._shutdown_requested = True
+                await w.terminate()
+                w.clear_state()
+                lines.append(f"🔴 Worker {w.index} — shut down")
+        except Exception as exc:
+            lines.append(f"❌ Worker {w.index} — error: {exc}")
+
+    if restart:
+        colour = discord.Colour.green() if all("✅" in l for l in lines) else discord.Colour.orange()
+    else:
+        colour = discord.Colour.red()
+    result = discord.Embed(title=f"{'🔄  Restart' if restart else '🔴  Shutdown'} complete — {label}",
+                           description="\n".join(lines), colour=colour)
+    result.set_footer(text="``restart <n>`` brings workers back. ``restart full`` / ``shutdown full`` affect the whole service.")
     try:
-        m = _SET_RE.match(inner)
-        if m:
-            key = m.group(1).upper()
-            value = _parse_bool_value(m.group(2)) if key in EPH_KEYS else _parse_env_value(m.group(2))
-            _apply_env(key, value, message.guild)
-            value_text = str(value).lower() if isinstance(value, bool) else "none" if value is None else str(value)
-            reply = f"{key}={value_text} successfully set"
-        else:
-            m = _UNSET_RE.match(inner)
-            if not m:
-                await message.reply("❌ Couldn't read that.\n" + _ENV_USAGE, mention_author=False)
-                return
-            result = _apply_env(m.group(1), None, message.guild)
-            reply = "✅ " + result
-    except ValueError as exc:
-        await message.reply(f"❌ {exc}", mention_author=False)
-        return
-    await message.reply(reply, mention_author=False)
+        await status.edit(embed=result)
+    except Exception:
+        await message.channel.send(embed=result)
 
+
+# ── shared slash-command helpers ─────────────────────────────────────────────
 
 async def _guard(interaction: discord.Interaction) -> bool:
     if not interaction.guild_id:
         await interaction.response.send_message(embed=_err_embed("Server only"), ephemeral=True)
         return False
-    g = _cfg_guild()
-    if g and interaction.guild_id != g:
-        await interaction.response.send_message(embed=_err_embed("This bot is locked to a different server"), ephemeral=True)
+    if not appsettings.is_whitelisted(interaction.guild_id):
+        await interaction.response.send_message(embed=_err_embed("This server is not whitelisted"), ephemeral=True)
         return False
-    cc = _cfg_cc()
+    cc = _cfg_cc(interaction.guild_id)
     if cc and interaction.channel_id != cc:
         await interaction.response.send_message(embed=_err_embed(f"Use the control channel: <#{cc}>"), ephemeral=True)
         return False
     return True
 
 def _text_channel_id(interaction: discord.Interaction) -> int | None:
-    return _cfg_cc() or interaction.channel_id
+    return _cfg_cc(interaction.guild_id) or interaction.channel_id
 
 def _user_vc_id(interaction: discord.Interaction) -> int | None:
     m = interaction.user
@@ -565,169 +629,219 @@ async def _fail(interaction: discord.Interaction, msg: str, embed: discord.Embed
     await interaction.followup.send(embed=embed or _err_embed(msg), ephemeral=True)
 
 async def _pick_for_play(interaction: discord.Interaction, worker_arg: int):
+    """Pick (and reserve) the worker for a /play-style command. Returns (worker, voice channel id)."""
     guild_id = interaction.guild_id
+    user     = interaction.user
     user_vc  = _user_vc_id(interaction)
-    ordered  = sorted(_workers.values(), key=lambda x: x.index)
 
-    if worker_arg:
-        w = _workers.get(worker_arg)
-        if not w:
-            await _fail(interaction, f"No worker #{worker_arg}. Valid: {', '.join(str(i) for i in sorted(_workers))}")
+    async with _pick_lock:
+        # Fresh state from every worker, so a worker that went idle on its own is seen as free.
+        await _resync_all()
+        present = [w for w in _ordered_workers() if guild_id in w.guild_ids]
+        if not present:
+            await _fail(interaction, "No music workers are in this server — invite the worker bots first")
             return None
-        target = _cfg_vcw(w.index) or user_vc
-        if target is None:
-            await _fail(interaction, f"Worker {w.index} has no fixed channel — join a voice channel first")
-            return None
-        if w.busy and w.channel_id != target:
-            await _fail(interaction, f"Worker {w.index} is busy in another channel")
-            return None
-        return guild_id, target, w
 
-    if user_vc:
-        w = _worker_for_channel(user_vc)
-        if w:
-            return guild_id, user_vc, w
-        for w in ordered:
-            if not w.busy and _cfg_vcw(w.index) == user_vc:
-                return guild_id, user_vc, w
-        for w in ordered:
-            if not w.busy and _cfg_vcw(w.index) is None:
-                return guild_id, user_vc, w
-        await interaction.followup.send(embed=_all_busy_embed(), ephemeral=True)
+        if worker_arg:
+            w = _workers.get(worker_arg)
+            if not w:
+                await _fail(interaction, f"No worker #{worker_arg}. Valid: {', '.join(str(i) for i in sorted(_workers))}")
+                return None
+            if guild_id not in w.guild_ids:
+                await _fail(interaction, f"Worker {w.index} isn't in this server")
+                return None
+            s = w.session(guild_id)
+            if s:
+                if not _allowed(s, user):
+                    await _fail(interaction, _locked_msg(w, s))
+                    return None
+                return w, s["channel_id"]
+            target = _cfg_vcw(guild_id, w.index) or user_vc
+            if target is None:
+                await _fail(interaction, f"Worker {w.index} has no fixed channel — join a voice channel first")
+                return None
+            other = _worker_for_channel(guild_id, target)
+            if other:
+                await _fail(interaction, f"Worker {other.index} is already playing in that channel")
+                return None
+            w.reserve(guild_id, target, user.id)
+            return w, target
+
+        if user_vc:
+            w = _worker_for_channel(guild_id, user_vc)
+            if w:
+                s = w.session(guild_id)
+                if not _allowed(s, user):
+                    await _fail(interaction, _locked_msg(w, s))
+                    return None
+                return w, user_vc
+            free = [w for w in present if not w.busy_in(guild_id)]
+            for w in free:
+                if _cfg_vcw(guild_id, w.index) == user_vc:
+                    w.reserve(guild_id, user_vc, user.id)
+                    return w, user_vc
+            for w in free:
+                if _cfg_vcw(guild_id, w.index) is None:
+                    w.reserve(guild_id, user_vc, user.id)
+                    return w, user_vc
+            await interaction.followup.send(embed=_all_busy_embed(guild_id), ephemeral=True)
+            return None
+
+        for w in present:
+            vcw = _cfg_vcw(guild_id, w.index)
+            if not w.busy_in(guild_id) and vcw:
+                w.reserve(guild_id, vcw, user.id)
+                return w, vcw
+        await _fail(interaction, "Join a voice channel first")
         return None
 
-    for w in ordered:
-        vcw = _cfg_vcw(w.index)
-        if not w.busy and vcw:
-            return guild_id, vcw, w
-    await _fail(interaction, "Join a voice channel first")
-    return None
-
-async def _pick_for_control(interaction: discord.Interaction, worker_arg: int):
+async def _pick_for_control(interaction: discord.Interaction, worker_arg: int, for_stop: bool = False):
+    """Find the session the user means and check they may control it. Returns (worker, session)."""
     guild_id = interaction.guild_id
+    user     = interaction.user
+    is_mod   = for_stop and _has_perm(user, "manage_guild")
+    await _resync_all()
+
     if worker_arg:
         w = _workers.get(worker_arg)
         if not w:
             await _fail(interaction, f"No worker #{worker_arg}. Valid: {', '.join(str(i) for i in sorted(_workers))}")
             return None
-        if not w.busy or w.channel_id is None:
-            await _fail(interaction, f"Worker {w.index} isn't playing anything")
+        s = w.session(guild_id)
+        if not s:
+            await _fail(interaction, f"Worker {w.index} isn't playing anything here")
             return None
-        return guild_id, w.channel_id, w
-    user_vc = _user_vc_id(interaction)
-    if user_vc:
-        w = _worker_for_channel(user_vc)
+    else:
+        user_vc = _user_vc_id(interaction)
+        w = _worker_for_channel(guild_id, user_vc) if user_vc else None
         if w:
-            return guild_id, user_vc, w
-        await _fail(interaction, "Nothing playing in your channel. Use /play first")
-        return None
-    busy = [w for w in sorted(_workers.values(), key=lambda x: x.index) if w.busy and w.channel_id]
-    if len(busy) == 1:
-        return guild_id, busy[0].channel_id, busy[0]
-    if not busy:
-        await _fail(interaction, "Nothing is playing")
-        return None
-    await _fail(interaction, "Several bots are playing — pick one with the `worker` option")
-    return None
+            s = w.session(guild_id)
+        else:
+            busy = [(x, x.session(guild_id)) for x in _ordered_workers() if x.busy_in(guild_id)]
+            usable = [(x, s) for x, s in busy if _allowed(s, user)] or (busy if is_mod else [])
+            if not busy:
+                await _fail(interaction, "Nothing is playing")
+                return None
+            if not usable:
+                await _fail(interaction, "Nothing you control is playing")
+                return None
+            if len(usable) > 1:
+                await _fail(interaction, "Several bots are playing — pick one with the `worker` option")
+                return None
+            w, s = usable[0]
 
-async def _dispatch(interaction: discord.Interaction, cmd: dict, worker: WorkerProcess, eph: bool = False) -> bool:
-    resp = await worker.send(cmd, timeout=30.0)
-    if resp.get("status") == "error":
-        await interaction.followup.send(embed=_err_embed(resp.get("message", "Unknown error")), ephemeral=eph)
-        return False
-    embed = _embed_from_response(resp)
-    if embed:
-        await interaction.followup.send(embed=embed, ephemeral=eph)
-    elif resp.get("message") == "stopped":
-        await interaction.followup.send(embed=_simple_embed("⏹️  Stopped", discord.Colour.red()), ephemeral=eph)
-    elif resp.get("message") == "paused":
-        await interaction.followup.send(embed=_simple_embed("⏸️  Paused", COLOUR), ephemeral=eph)
-    elif resp.get("message") == "resumed":
-        await interaction.followup.send(embed=_simple_embed("▶️  Resumed", COLOUR), ephemeral=eph)
-    elif resp.get("message") == "skipped":
-        await interaction.followup.send(embed=_simple_embed("⏭️  Skipped", COLOUR), ephemeral=eph)
-    elif resp.get("message") == "restarted":
-        await interaction.followup.send(embed=_simple_embed("⏮️  Restarted track", COLOUR), ephemeral=eph)
-    elif resp.get("message") == "seeked":
+    if not (_allowed(s, user) or is_mod):
+        await _fail(interaction, _locked_msg(w, s))
+        return None
+    return w, s
+
+_MESSAGE_EMBEDS = {
+    "stopped":      ("⏹️  Stopped", discord.Colour.red()),
+    "paused":       ("⏸️  Paused", COLOUR),
+    "resumed":      ("▶️  Resumed", COLOUR),
+    "skipped":      ("⏭️  Skipped", COLOUR),
+    "restarted":    ("⏮️  Restarted track", COLOUR),
+    "muted":        ("🔇  Muted — bot will play silently", COLOUR),
+    "unmuted":      ("🔊  Unmuted", COLOUR),
+    "loop_on":      ("🔁  Loop ON — current track will repeat", COLOUR),
+    "loop_off":     ("➡️  Loop OFF", COLOUR),
+    "autoplay_on":  ("🎲  Autoplay ON — I'll keep picking songs when the queue runs out", COLOUR),
+    "autoplay_off": ("🎲  Autoplay OFF", COLOUR),
+    "mode_all":     ("🔓  Control: everyone in the voice channel", COLOUR),
+    "mode_me":      ("🔒  Control: only the person who started playback", COLOUR),
+}
+
+def _message_embed(resp: dict) -> discord.Embed | None:
+    msg = resp.get("message", "")
+    if msg in _MESSAGE_EMBEDS:
+        title, colour = _MESSAGE_EMBEDS[msg]
+        return _simple_embed(title, colour)
+    if msg == "seeked":
         delta = resp.get("delta_ms", 0)
         sign  = "+" if delta > 0 else ""
         icon  = "⏩" if delta > 0 else "⏪"
-        await interaction.followup.send(embed=_simple_embed(f"{icon}  {sign}{delta//1000}s", COLOUR), ephemeral=eph)
-    return True
+        return _simple_embed(f"{icon}  {sign}{delta//1000}s", COLOUR)
+    return None
 
-_source_choices = [
-    app_commands.Choice(name="Spotify (default)", value="sp"),
-    app_commands.Choice(name="YouTube",           value="yt"),
-    app_commands.Choice(name="SoundCloud",        value="sc"),
-]
+async def _dispatch(interaction: discord.Interaction, cmd: dict, worker: WorkerProcess,
+                    eph: bool = False, timeout: float = 30.0) -> dict:
+    resp = await worker.send(cmd, timeout=timeout)
+    if resp.get("status") == "error":
+        await interaction.followup.send(embed=_err_embed(resp.get("message", "Unknown error")), ephemeral=eph)
+        return resp
+    embed = _embed_from_response(resp) or _message_embed(resp)
+    if embed:
+        await interaction.followup.send(embed=embed, ephemeral=eph)
+    return resp
+
+async def _start_playback(interaction: discord.Interaction, op: str, eph_key: str,
+                          worker_arg: int, timeout: float = 30.0, **extra) -> None:
+    """Shared body of /play, /playlist and /autoplay."""
+    eph = _eph(interaction.guild_id, eph_key)
+    await interaction.response.defer(thinking=True, ephemeral=eph)
+    pick = await _pick_for_play(interaction, worker_arg)
+    if pick is None:
+        return
+    w, channel_id = pick
+    guild_id = interaction.guild_id
+    try:
+        resp = await _dispatch(interaction, {
+            "op": op, "guild_id": guild_id, "channel_id": channel_id,
+            "text_channel_id": _text_channel_id(interaction),
+            "user_id": interaction.user.id, **extra,
+        }, w, eph, timeout=timeout)
+    finally:
+        w.pending.pop(guild_id, None)
+    if resp.get("session"):
+        w.apply(guild_id, resp["session"])
+
+_source_choices = [app_commands.Choice(name=label, value=key) for key, label in SOURCES.items()]
 
 
 @main_bot.tree.command(name="play", description="Play a song — name or URL (YouTube / SoundCloud / Spotify)")
-@app_commands.describe(query="Song name or URL", source="Search source (ignored for URLs)",
+@app_commands.describe(query="Song name or URL", source="Search source (ignored for URLs; default set in /settings)",
                        worker="Force a specific worker bot (0 = automatic)")
 @app_commands.choices(source=_source_choices)
 async def slash_play(interaction: discord.Interaction, query: str,
                      source: app_commands.Choice[str] | None = None, worker: int = 0):
     if not await _guard(interaction): return
-    await interaction.response.defer(thinking=True, ephemeral=_eph("P_EPH"))
-    pick = await _pick_for_play(interaction, worker)
-    if pick is None: return
-    guild_id, channel_id, w = pick
-    src      = source.value if source else DEFAULT_SOURCE
-    was_busy = w.busy
-    op       = "queue_track" if (w.busy and w.channel_id == channel_id) else "search_and_play"
-    w.busy       = True
-    w.channel_id = channel_id
-    ok = await _dispatch(interaction, {
-        "op": op, "query": query, "source": src,
-        "guild_id": guild_id, "channel_id": channel_id,
-        "text_channel_id": _text_channel_id(interaction),
-    }, w, _eph("P_EPH"))
-    if not ok and not was_busy:
-        w.busy       = False
-        w.channel_id = None
+    await _start_playback(interaction, "search_and_play", "P_EPH", worker,
+                          query=query, source=source.value if source else _cfg_src(interaction.guild_id))
 
 
 @main_bot.tree.command(name="playlist", description="Queue a full playlist — YouTube, SoundCloud, or Spotify URL")
-@app_commands.describe(query="Playlist URL or search term", source="Search source (ignored for URLs)",
+@app_commands.describe(query="Playlist URL or search term", source="Search source (ignored for URLs; default set in /settings)",
                        worker="Force a specific worker bot (0 = automatic)")
 @app_commands.choices(source=_source_choices)
 async def slash_playlist(interaction: discord.Interaction, query: str,
                          source: app_commands.Choice[str] | None = None, worker: int = 0):
     if not await _guard(interaction): return
-    await interaction.response.defer(thinking=True, ephemeral=_eph("PL_EPH"))
-    pick = await _pick_for_play(interaction, worker)
-    if pick is None: return
-    guild_id, channel_id, w = pick
-    src      = source.value if source else DEFAULT_SOURCE
-    was_busy = w.busy
-    w.busy       = True
-    w.channel_id = channel_id
-    ok = await _dispatch(interaction, {
-        "op": "search_and_playlist", "query": query, "source": src,
-        "guild_id": guild_id, "channel_id": channel_id,
-        "text_channel_id": _text_channel_id(interaction),
-    }, w, _eph("PL_EPH"))
-    if not ok and not was_busy:
-        w.busy       = False
-        w.channel_id = None
+    await _start_playback(interaction, "search_and_playlist", "PL_EPH", worker,
+                          query=query, source=source.value if source else _cfg_src(interaction.guild_id))
+
+
+@main_bot.tree.command(name="autoplay", description="Autoplay music picked from your saved listening history")
+@app_commands.describe(worker="Force a specific worker bot (0 = automatic)")
+async def slash_autoplay(interaction: discord.Interaction, worker: int = 0):
+    if not await _guard(interaction): return
+    await _start_playback(interaction, "autoplay_start", "AP_EPH", worker, timeout=60.0)
 
 
 @main_bot.tree.command(name="stop", description="Stop music and disconnect")
 @app_commands.describe(worker="Which worker to stop (0 = the one in your channel)")
 async def slash_stop(interaction: discord.Interaction, worker: int = 0):
     if not await _guard(interaction): return
-    await interaction.response.defer(thinking=True, ephemeral=_eph("S_EPH"))
-    pick = await _pick_for_control(interaction, worker)
+    eph = _eph(interaction.guild_id, "S_EPH")
+    await interaction.response.defer(thinking=True, ephemeral=eph)
+    pick = await _pick_for_control(interaction, worker, for_stop=True)
     if pick is None: return
-    guild_id, channel_id, w = pick
-    resp = await w.send({"op": "stop", "guild_id": guild_id, "channel_id": channel_id})
-    w.busy       = False
-    w.channel_id = None
+    w, _s = pick
+    resp = await w.send({"op": "stop", "guild_id": interaction.guild_id})
     if resp.get("status") == "ok":
-        await interaction.followup.send(embed=_simple_embed("⏹️  Stopped", discord.Colour.red()), ephemeral=_eph("S_EPH"))
+        w.apply(interaction.guild_id, None)
+        await interaction.followup.send(embed=_simple_embed("⏹️  Stopped", discord.Colour.red()), ephemeral=eph)
     else:
-        await interaction.followup.send(embed=_err_embed(resp.get("message", "Error")), ephemeral=_eph("S_EPH"))
+        await interaction.followup.send(embed=_err_embed(resp.get("message", "Error")), ephemeral=eph)
 
 
 PAGE_SIZE = 25
@@ -763,7 +877,7 @@ class QueueSelect(discord.ui.Select):
                 selected = (idx == selected_idx)
                 options.append(discord.SelectOption(
                     label=label, value=str(idx), description=desc,
-                    emoji="▶️" if selected else "🎶",
+                    emoji="▶️" if selected else ("🎲" if item.get("autoplay") else "🎶"),
                     default=selected,
                 ))
 
@@ -784,17 +898,14 @@ class QueueSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=_eph("CC_EPH"))
+        await interaction.response.defer(ephemeral=self._ctrl.eph)
         if not self.values or self.values[0] == "__empty__":
             return
 
         self._ctrl._selected_idx = int(self.values[0])
-        await _refresh_control_panel(
-            interaction, self._ctrl.worker,
-            self._ctrl.guild_id, self._ctrl.channel_id,
-            page=self._ctrl._queue_page,
-            selected_idx=self._ctrl._selected_idx,
-        )
+        await _refresh_control_panel(interaction, self._ctrl,
+                                     page=self._ctrl._queue_page,
+                                     selected_idx=self._ctrl._selected_idx)
 
 
 class JumpToButton(discord.ui.Button):
@@ -807,24 +918,21 @@ class JumpToButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=_eph("CC_EPH"))
+        await interaction.response.defer(ephemeral=self._ctrl.eph)
         idx  = self._ctrl._selected_idx
         resp = await self._ctrl.worker.send({
-            "op": "jump_to", "guild_id": self._ctrl.guild_id,
-            "channel_id": self._ctrl.channel_id, "index": idx,
+            "op": "jump_to", "guild_id": self._ctrl.guild_id, "index": idx,
         }, timeout=30.0)
         if resp.get("status") == "error":
-            await interaction.followup.send(embed=_err_embed(resp.get("message", "Error")), ephemeral=_eph("CC_EPH"))
+            await interaction.followup.send(embed=_err_embed(resp.get("message", "Error")), ephemeral=self._ctrl.eph)
         else:
             title = resp.get("title", "track")
             rem   = resp.get("queue_remaining", 0)
             await interaction.followup.send(
                 embed=_simple_embed(f"⏭  Jumped to **{_truncate(title, 60)}** — {rem} remaining", COLOUR),
-                ephemeral=_eph("CC_EPH"),
+                ephemeral=self._ctrl.eph,
             )
-        await _refresh_control_panel(interaction, self._ctrl.worker,
-                                     self._ctrl.guild_id, self._ctrl.channel_id,
-                                     page=0, selected_idx=None)
+        await _refresh_control_panel(interaction, self._ctrl, page=0, selected_idx=None)
 
 
 class RemoveButton(discord.ui.Button):
@@ -837,24 +945,22 @@ class RemoveButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=_eph("CC_EPH"))
+        await interaction.response.defer(ephemeral=self._ctrl.eph)
         idx  = self._ctrl._selected_idx
         resp = await self._ctrl.worker.send({
-            "op": "remove_from_queue", "guild_id": self._ctrl.guild_id,
-            "channel_id": self._ctrl.channel_id, "index": idx,
+            "op": "remove_from_queue", "guild_id": self._ctrl.guild_id, "index": idx,
         }, timeout=15.0)
         if resp.get("status") == "error":
-            await interaction.followup.send(embed=_err_embed(resp.get("message", "Error")), ephemeral=_eph("CC_EPH"))
+            await interaction.followup.send(embed=_err_embed(resp.get("message", "Error")), ephemeral=self._ctrl.eph)
         else:
             title = resp.get("title", "track")
             rem   = resp.get("queue_remaining", 0)
             await interaction.followup.send(
                 embed=_simple_embed(f"🗑  Removed **{_truncate(title, 60)}** — {rem} remaining", discord.Colour.orange()),
-                ephemeral=_eph("CC_EPH"),
+                ephemeral=self._ctrl.eph,
             )
 
-        await _refresh_control_panel(interaction, self._ctrl.worker,
-                                     self._ctrl.guild_id, self._ctrl.channel_id,
+        await _refresh_control_panel(interaction, self._ctrl,
                                      page=self._ctrl._queue_page, selected_idx=None)
 
 
@@ -867,10 +973,34 @@ class ClearSelectionButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=_eph("CC_EPH"))
-        await _refresh_control_panel(interaction, self._ctrl.worker,
-                                     self._ctrl.guild_id, self._ctrl.channel_id,
+        await interaction.response.defer(ephemeral=self._ctrl.eph)
+        await _refresh_control_panel(interaction, self._ctrl,
                                      page=self._ctrl._queue_page, selected_idx=None)
+
+
+class AutoplayButton(discord.ui.Button):
+    def __init__(self, view: "ControlView"):
+        self._ctrl = view
+        on = view._autoplay
+        super().__init__(label="🎲 Autoplay ON" if on else "🎲 Autoplay",
+                         style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
+                         row=3, custom_id=f"ctl_autoplay:{view.worker.index}:{view.guild_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        await self._ctrl._dispatch(interaction, "toggle_autoplay", timeout=45.0)
+
+
+class ModeButton(discord.ui.Button):
+    def __init__(self, view: "ControlView"):
+        self._ctrl = view
+        everyone = view._mode == "all"
+        super().__init__(label="🔓 Control: All" if everyone else "🔒 Control: Me",
+                         style=discord.ButtonStyle.success if everyone else discord.ButtonStyle.secondary,
+                         row=3, custom_id=f"ctl_mode:{view.worker.index}:{view.guild_id}")
+
+    async def callback(self, interaction: discord.Interaction):
+        new_mode = "me" if self._ctrl._mode == "all" else "all"
+        await self._ctrl._dispatch(interaction, "set_mode", mode=new_mode)
 
 
 class PrevPageButton(discord.ui.Button):
@@ -880,9 +1010,8 @@ class PrevPageButton(discord.ui.Button):
                          disabled=(view._queue_page == 0), row=4)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=_eph("CC_EPH"))
-        await _refresh_control_panel(interaction, self._ctrl.worker,
-                                     self._ctrl.guild_id, self._ctrl.channel_id,
+        await interaction.response.defer(ephemeral=self._ctrl.eph)
+        await _refresh_control_panel(interaction, self._ctrl,
                                      page=self._ctrl._queue_page - 1, selected_idx=None)
 
 
@@ -892,7 +1021,7 @@ class PageLabelButton(discord.ui.Button):
                          style=discord.ButtonStyle.secondary, disabled=True, row=4)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=_eph("CC_EPH"))
+        await interaction.response.defer()
 
 
 class NextPageButton(discord.ui.Button):
@@ -903,27 +1032,28 @@ class NextPageButton(discord.ui.Button):
                          disabled=(view._queue_page >= total_pages - 1), row=4)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=_eph("CC_EPH"))
-        await _refresh_control_panel(interaction, self._ctrl.worker,
-                                     self._ctrl.guild_id, self._ctrl.channel_id,
+        await interaction.response.defer(ephemeral=self._ctrl.eph)
+        await _refresh_control_panel(interaction, self._ctrl,
                                      page=self._ctrl._queue_page + 1, selected_idx=None)
 
 
 class ControlView(discord.ui.View):
-    def __init__(self, worker: WorkerProcess, guild_id: int, channel_id: int,
+    def __init__(self, worker: WorkerProcess, guild_id: int,
                  queue: list[dict], current_title: str, page: int = 0,
-                 muted: bool = False, loop: bool = False,
-                 selected_idx: int | None = None):
+                 muted: bool = False, loop: bool = False, autoplay: bool = False,
+                 mode: str = "me", selected_idx: int | None = None):
         super().__init__(timeout=900)
         self.worker          = worker
         self.guild_id        = guild_id
-        self.channel_id      = channel_id
+        self.eph             = _eph(guild_id, "CC_EPH")
         self._stopped        = False
         self._queue_page     = page
         self._queue          = queue
         self._current_title  = current_title
         self._muted          = muted
         self._loop           = loop
+        self._autoplay       = autoplay
+        self._mode           = mode
         self._selected_idx   = selected_idx
 
         total_pages = max(1, -(-len(queue) // PAGE_SIZE))
@@ -935,6 +1065,8 @@ class ControlView(discord.ui.View):
         self.add_item(JumpToButton(self))
         self.add_item(RemoveButton(self))
         self.add_item(ClearSelectionButton(self))
+        self.add_item(AutoplayButton(self))
+        self.add_item(ModeButton(self))
 
 
         if total_pages > 1:
@@ -942,47 +1074,45 @@ class ControlView(discord.ui.View):
             self.add_item(PageLabelButton(page, total_pages))
             self.add_item(NextPageButton(self, total_pages))
 
-    async def _dispatch(self, interaction: discord.Interaction, op: str, **extra):
-        await interaction.response.defer(ephemeral=_eph("CC_EPH"))
-        resp = await self.worker.send({
-            "op": op, "guild_id": self.guild_id,
-            "channel_id": self.channel_id, **extra
-        })
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        s = self.worker.session(self.guild_id)
+        if not s:
+            await interaction.response.send_message(
+                embed=_err_embed("This session has ended — use /play or /control again"), ephemeral=True)
+            return False
+        custom_id = (interaction.data or {}).get("custom_id", "")
+        user = interaction.user
+        if custom_id.startswith("ctl_mode:"):
+            # Only the person who started playback can hand control to everyone (or take it back).
+            if s.get("controller_id") == user.id or _is_dev(user):
+                return True
+            await interaction.response.send_message(
+                embed=_err_embed("Only the person who started playback can change who controls it"), ephemeral=True)
+            return False
+        if _allowed(s, user):
+            return True
+        if custom_id.startswith("ctl_stop:") and _has_perm(user, "manage_guild"):
+            return True
+        await interaction.response.send_message(embed=_err_embed(_locked_msg(self.worker, s)), ephemeral=True)
+        return False
+
+    async def _dispatch(self, interaction: discord.Interaction, op: str,
+                        timeout: float = 15.0, **extra) -> dict:
+        await interaction.response.defer(ephemeral=self.eph)
+        resp = await self.worker.send({"op": op, "guild_id": self.guild_id, **extra}, timeout=timeout)
         if resp.get("status") == "error":
             await interaction.followup.send(
-                embed=_err_embed(resp.get("message", "Error")), ephemeral=_eph("CC_EPH"))
-            return
-        msg = resp.get("message", "")
-        labels = {
-            "paused":    "⏸️  Paused",   "resumed":   "▶️  Resumed",
-            "skipped":   "⏭️  Skipped",  "restarted": "⏮️  Restarted track",
-            "stopped":   "⏹️  Stopped",
-        }
-        if msg in labels:
-            await interaction.followup.send(
-                embed=_simple_embed(labels[msg], COLOUR), ephemeral=_eph("CC_EPH"))
-        elif msg == "seeked":
-            delta = resp.get("delta_ms", 0)
-            sign  = "+" if delta > 0 else ""
-            icon  = "⏩" if delta > 0 else "⏪"
-            await interaction.followup.send(
-                embed=_simple_embed(f"{icon}  {sign}{delta//1000}s", COLOUR), ephemeral=_eph("CC_EPH"))
-        elif msg == "muted":
-            await interaction.followup.send(
-                embed=_simple_embed("🔇  Muted — bot will play silently", COLOUR), ephemeral=_eph("CC_EPH"))
-        elif msg == "unmuted":
-            await interaction.followup.send(
-                embed=_simple_embed("🔊  Unmuted", COLOUR), ephemeral=_eph("CC_EPH"))
-        elif msg == "loop_on":
-            await interaction.followup.send(
-                embed=_simple_embed("🔁  Loop ON — current track will repeat", COLOUR), ephemeral=_eph("CC_EPH"))
-        elif msg == "loop_off":
-            await interaction.followup.send(
-                embed=_simple_embed("➡️  Loop OFF", COLOUR), ephemeral=_eph("CC_EPH"))
-        if msg in ("skipped", "restarted", "muted", "unmuted", "loop_on", "loop_off"):
-            await _refresh_control_panel(interaction, self.worker,
-                                         self.guild_id, self.channel_id,
-                                         page=self._queue_page, selected_idx=None)
+                embed=_err_embed(resp.get("message", "Error")), ephemeral=self.eph)
+            return resp
+        if resp.get("session"):
+            self.worker.apply(self.guild_id, resp["session"])
+        embed = _message_embed(resp)
+        if embed:
+            await interaction.followup.send(embed=embed, ephemeral=self.eph)
+        if resp.get("message") in ("skipped", "restarted", "muted", "unmuted", "loop_on", "loop_off",
+                                   "autoplay_on", "autoplay_off", "mode_all", "mode_me"):
+            await _refresh_control_panel(interaction, self, page=self._queue_page, selected_idx=None)
+        return resp
 
     @discord.ui.button(label="⏪ 10s", style=discord.ButtonStyle.secondary, row=0)
     async def rw10(self, i, _): await self._dispatch(i, "seek", delta_ms=-10_000)
@@ -1005,34 +1135,38 @@ class ControlView(discord.ui.View):
     @discord.ui.button(label="⏸ Pause / ▶ Play", style=discord.ButtonStyle.primary, row=1)
     async def btn_pause(self, i, _): await self._dispatch(i, "pause_resume")
 
-    @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger, row=1, custom_id="ctl_stop:")
     async def btn_stop(self, i, _):
-        await self._dispatch(i, "stop")
-        if not self._stopped:
+        resp = await self._dispatch(i, "stop")
+        if resp.get("status") == "ok" and not self._stopped:
             self._stopped = True
-            self.worker.busy = False
-            self.worker.channel_id = None
+            self.worker.apply(self.guild_id, None)
             for child in self.children: child.disabled = True
             try: await i.edit_original_response(view=self)
             except Exception: pass
 
     @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.primary, row=1)
-    async def btn_skip(self, i, _): await self._dispatch(i, "skip")
+    async def btn_skip(self, i, _): await self._dispatch(i, "skip", timeout=45.0)
 
     @discord.ui.button(label="🔇 Mute", style=discord.ButtonStyle.secondary, row=1)
     async def btn_mute(self, i, _): await self._dispatch(i, "toggle_mute")
 
 
-async def _build_control_view(worker: WorkerProcess, guild_id: int, channel_id: int,
+async def _build_control_view(worker: WorkerProcess, guild_id: int,
                                page: int = 0,
                                selected_idx: int | None = None) -> tuple[discord.Embed, ControlView]:
-    resp = await worker.send({"op": "get_queue", "guild_id": guild_id,
-                              "channel_id": channel_id}, timeout=10.0)
+    resp = await worker.send({"op": "get_queue", "guild_id": guild_id}, timeout=10.0)
     ok             = resp.get("status") == "ok"
     queue: list[dict] = resp.get("queue", []) if ok else []
     current_title: str = (resp.get("current") or {}).get("title", "Unknown") if ok else "Unknown"
     muted: bool    = resp.get("muted", False) if ok else False
     loop:  bool    = resp.get("loop",  False) if ok else False
+    autoplay: bool = resp.get("autoplay", False) if ok else False
+    session        = (resp.get("session") if ok else None) or worker.session(guild_id) or {}
+    if ok:
+        worker.apply(guild_id, resp.get("session"))
+    mode           = session.get("mode", "me")
+    controller     = session.get("controller_id")
 
     total_pages = max(1, -(-len(queue) // PAGE_SIZE))
     page        = max(0, min(page, total_pages - 1))
@@ -1042,8 +1176,8 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int, channel_id: 
         if not any(q["index"] == selected_idx for q in queue):
             selected_idx = None
 
-    view  = ControlView(worker, guild_id, channel_id, queue, current_title,
-                        page, muted, loop, selected_idx)
+    view  = ControlView(worker, guild_id, queue, current_title,
+                        page, muted, loop, autoplay, mode, selected_idx)
 
 
     for child in view.children:
@@ -1059,14 +1193,16 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int, channel_id: 
     start     = page * PAGE_SIZE
     end       = min(start + PAGE_SIZE, len(queue))
     page_info = f"  (page {page + 1}/{total_pages})" if total_pages > 1 else ""
-    flags     = ("  🔇 muted" if muted else "") + ("  🔁 loop" if loop else "")
+    flags     = ("  🔇 muted" if muted else "") + ("  🔁 loop" if loop else "") + ("  🎲 autoplay" if autoplay else "")
     sel_info  = f"\n✅ **Selected:** #{selected_idx + 1}" if selected_idx is not None else ""
+    who       = (f"🔒 Controlled by <@{controller}>" if mode == "me" else
+                 f"🔓 Anyone can control (started by <@{controller}>)") if controller else ""
     embed = discord.Embed(
         title=f"🎛️  Playback Controls — Worker {worker.index}",
         description=(
             f"▶ **{_truncate(current_title, 80)}**{flags}\n"
             f"{'📋 **' + str(len(queue)) + '** track(s) in queue' + page_info + f' — showing #{start+1}–#{end}' if queue else '📭 No tracks queued'}"
-            f"{sel_info}\n\n"
+            f"{sel_info}\n{who}\n\n"
             "⚠️ **Panel expires in 15 minutes** — run `/control` again if buttons stop working."
         ),
         colour=COLOUR,
@@ -1074,11 +1210,10 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int, channel_id: 
     return embed, view
 
 
-async def _refresh_control_panel(interaction: discord.Interaction,
-                                 worker: WorkerProcess, guild_id: int, channel_id: int,
+async def _refresh_control_panel(interaction: discord.Interaction, ctrl: ControlView,
                                  page: int = 0, selected_idx: int | None = None):
     try:
-        embed, view = await _build_control_view(worker, guild_id, channel_id, page, selected_idx)
+        embed, view = await _build_control_view(ctrl.worker, ctrl.guild_id, page, selected_idx)
         await interaction.edit_original_response(embed=embed, view=view)
     except Exception as exc:
         print(f"[Main] Control panel refresh failed: {exc}", flush=True)
@@ -1088,26 +1223,30 @@ async def _refresh_control_panel(interaction: discord.Interaction,
 @app_commands.describe(worker="Which worker to control (0 = the one in your channel)")
 async def slash_control(interaction: discord.Interaction, worker: int = 0):
     if not await _guard(interaction): return
-    await interaction.response.defer(thinking=True, ephemeral=_eph("CC_EPH"))
+    eph = _eph(interaction.guild_id, "CC_EPH")
+    await interaction.response.defer(thinking=True, ephemeral=eph)
     pick = await _pick_for_control(interaction, worker)
     if pick is None: return
-    guild_id, channel_id, w = pick
-    embed, view = await _build_control_view(w, guild_id, channel_id, page=0)
-    await interaction.followup.send(embed=embed, view=view, ephemeral=_eph("CC_EPH"))
+    w, _s = pick
+    embed, view = await _build_control_view(w, interaction.guild_id, page=0)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=eph)
 
 
 @main_bot.tree.command(name="hctest", description="Health check — tests all systems")
 async def slash_hctest(interaction: discord.Interaction):
     if not await _guard(interaction): return
-    await interaction.response.defer(thinking=True, ephemeral=_eph("HC_EPH"))
-    import time
+    gid = interaction.guild_id
+    eph = _eph(gid, "HC_EPH")
+    await interaction.response.defer(thinking=True, ephemeral=eph)
     start = time.monotonic()
+    await _resync_all()
     results = []
-    for w in sorted(_workers.values(), key=lambda x: x.index):
-        resp = await w.send({"op": "ping"}, timeout=10.0)
-        results.append((w.index, resp))
+    for w in _ordered_workers():
+        resp = await w.send({"op": "ping", "guild_id": gid}, timeout=10.0)
+        results.append((w, resp))
     elapsed = round((time.monotonic() - start) * 1000)
     all_ok  = all(r.get("status") == "ok" and r.get("lavalink_ok") for _, r in results)
+    busy_here = sum(1 for w in _workers.values() if w.busy_in(gid))
     embed   = discord.Embed(
         title="🏥  Health Check",
         description="**✅ All systems operational**" if all_ok else "**⚠️ Some systems degraded**",
@@ -1118,199 +1257,222 @@ async def slash_hctest(interaction: discord.Interaction):
         value=(
             f"Status: ✅ Online\n"
             f"Discord latency: `{round(main_bot.latency * 1000)}ms`\n"
-            f"Workers: `{len(_workers)}` total, `{sum(1 for w in _workers.values() if w.busy)}` busy"
+            f"Workers: `{len(_workers)}` total, `{busy_here}` busy in this server\n"
+            f"Servers: `{len(main_bot.guilds)}`"
         ),
         inline=False,
     )
-    for idx, r in results:
-        vcw = _cfg_vcw(idx)
+    for w, r in results:
+        vcw = _cfg_vcw(gid, w.index)
         fixed = f"\nFixed VC: <#{vcw}>" if vcw else ""
         if r.get("status") == "ok":
             disc  = "✅" if r.get("discord_ok") else "❌"
             lava  = "✅" if r.get("lavalink_ok") else "❌"
             dms   = r.get("discord_ms", -1)
-            state = "🔴 Busy" if r.get("busy") else "🟢 Free"
-            qlen  = r.get("queue_len", 0)
+            s     = r.get("session")
+            if gid not in w.guild_ids:
+                state = "⚫ Not in this server"
+            elif s:
+                state = f"🔴 Busy in <#{s['channel_id']}> for <@{s['controller_id']}>  |  Queue: `{r.get('queue_len', 0)}`"
+            else:
+                state = "🟢 Free"
             val   = (
                 f"Discord: {disc} `{dms}ms`\n"
                 f"Lavalink: {lava} `{r.get('lavalink_uri','?')}`\n"
-                f"Status: {state}" + (f"  |  Queue: `{qlen}`" if r.get("busy") else "") + fixed
+                f"Status: {state}\n"
+                f"Active in `{r.get('sessions', 0)}` server(s)" + fixed
             )
         else:
             val = f"❌ {r.get('message', 'Not responding')}{fixed}"
-        embed.add_field(name=f"🎵  Worker {idx}", value=val, inline=True)
+        embed.add_field(name=f"🎵  Worker {w.index}", value=val, inline=True)
     embed.set_footer(text=f"Check completed in {elapsed}ms")
-    await interaction.followup.send(embed=embed, ephemeral=_eph("HC_EPH"))
+    await interaction.followup.send(embed=embed, ephemeral=eph)
 
 
-SERVICE_NAME = "SERVER_musicbots"
+# ── /settings GUI ────────────────────────────────────────────────────────────
 
-async def _systemctl(action: str):
-    proc = await asyncio.create_subprocess_exec(
-        "systemctl", action, SERVICE_NAME,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await proc.wait()
+def _settings_embed(guild: discord.Guild, worker_idx: int, note: str | None = None) -> discord.Embed:
+    gid = guild.id
+    cc  = _cfg_cc(gid)
+    lines = []
+    if note:
+        lines += [note, ""]
+    lines.append("**Control channel:** " + (f"<#{cc}>" if cc else "any channel"))
+    lines.append("**Fixed voice channels:**")
+    for w in _ordered_workers():
+        vc = _cfg_vcw(gid, w.index)
+        here = "" if gid in w.guild_ids else "  *(not in this server)*"
+        marker = "▸ " if w.index == worker_idx else ""
+        lines.append(f"{marker}Worker {w.index}: " + (f"<#{vc}>" if vc else "joins where the user is") + here)
+    lines.append(f"**Default search source:** {SOURCES[_cfg_src(gid)]}")
+    private = [label for k, label in EPH_KEYS.items() if _eph(gid, k)]
+    lines.append("**Private replies:** " + (", ".join(private) if private else "none (all public)"))
+    embed = discord.Embed(title=f"⚙️  Settings — {guild.name}", description="\n".join(lines), colour=COLOUR)
+    embed.set_footer(text="Only you can use this panel. Changes apply immediately.")
+    return embed
 
-async def _delayed_systemctl(action: str, delay: float = 2.0):
-    await asyncio.sleep(delay)
-    await _systemctl(action)
+def _channel_default(channel_id: int | None) -> list:
+    if not channel_id:
+        return []
+    return [discord.SelectDefaultValue(id=channel_id, type=discord.SelectDefaultValueType.channel)]
 
 
-@main_bot.tree.command(name="restart", description="Restart worker(s) or the entire service")
-@app_commands.describe(
-    worker="Which worker to restart (1, 2, … or 0 = all workers)",
-    full="Restart the entire musicbot service including main controller (default: False)",
-)
-async def slash_restart(interaction: discord.Interaction, worker: int = 0, full: bool = False):
-    if not await _owner_only(interaction): return
-    if not await _guard(interaction): return
-    await interaction.response.defer(thinking=True, ephemeral=_eph("RS_EPH"))
+class SettingsView(discord.ui.View):
+    def __init__(self, invoker_id: int, guild: discord.Guild, worker_idx: int):
+        super().__init__(timeout=600)
+        self.invoker_id = invoker_id
+        self.guild      = guild
+        self.worker_idx = worker_idx
+        gid = guild.id
+        cfg = _gcfg(gid)
+
+        cc_select = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text], min_values=0, max_values=1, row=0,
+            placeholder="Control channel — where commands work (empty = any)",
+            default_values=_channel_default(cfg.get("cc_id")))
+        cc_select.callback = self._on_cc
+        self.cc_select = cc_select
+        self.add_item(cc_select)
+
+        worker_select = discord.ui.Select(
+            row=1, min_values=1, max_values=1,
+            options=[discord.SelectOption(label=f"Worker {w.index}", value=str(w.index),
+                                          description="Choose which worker's fixed channel to edit",
+                                          default=(w.index == worker_idx))
+                     for w in _ordered_workers()])
+        worker_select.callback = self._on_worker
+        self.worker_select = worker_select
+        self.add_item(worker_select)
+
+        vc_select = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.voice], min_values=0, max_values=1, row=2,
+            placeholder=f"Worker {worker_idx} fixed voice channel (empty = follow the user)",
+            default_values=_channel_default(_cfg_vcw(gid, worker_idx)))
+        vc_select.callback = self._on_vc
+        self.vc_select = vc_select
+        self.add_item(vc_select)
+
+        eph_select = discord.ui.Select(
+            row=3, min_values=0, max_values=len(EPH_KEYS),
+            placeholder="Private replies (only the person who ran it sees them)",
+            options=[discord.SelectOption(label=f"{label} replies private", value=k,
+                                          default=bool(cfg["eph"].get(k)))
+                     for k, label in EPH_KEYS.items()])
+        eph_select.callback = self._on_eph
+        self.eph_select = eph_select
+        self.add_item(eph_select)
+
+        self.btn_source.label = f"🔎 Source: {SOURCES[_cfg_src(gid)]}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.invoker_id:
+            return True
+        await interaction.response.send_message(
+            embed=_err_embed("Only the person who ran /settings can use this panel"), ephemeral=True)
+        return False
+
+    async def _redraw(self, interaction: discord.Interaction, note: str | None = None,
+                      worker_idx: int | None = None) -> None:
+        idx = worker_idx or self.worker_idx
+        self.stop()
+        await interaction.response.edit_message(
+            embed=_settings_embed(self.guild, idx, note),
+            view=SettingsView(self.invoker_id, self.guild, idx))
+
+    async def _on_cc(self, interaction: discord.Interaction):
+        gid = self.guild.id
+        cfg = _gcfg(gid)
+        ch  = self.cc_select.values[0] if self.cc_select.values else None
+        cfg["cc_id"] = ch.id if ch else None
+        _save_gcfg(gid)
+        await self._redraw(interaction, f"✅ Control channel {'set to <#' + str(ch.id) + '>' if ch else 'cleared'}.")
+
+    async def _on_worker(self, interaction: discord.Interaction):
+        await self._redraw(interaction, worker_idx=int(self.worker_select.values[0]))
+
+    async def _on_vc(self, interaction: discord.Interaction):
+        gid = self.guild.id
+        cfg = _gcfg(gid)
+        idx = self.worker_idx
+        ch  = self.vc_select.values[0] if self.vc_select.values else None
+        if ch is None:
+            cfg["vcw"].pop(str(idx), None)
+            _save_gcfg(gid)
+            await self._redraw(interaction, f"✅ Worker {idx} now joins whichever voice channel the user is in.")
+            return
+        for other, cid in cfg["vcw"].items():
+            if cid == ch.id and other != str(idx):
+                await self._redraw(interaction, f"❌ Worker {other} is already fixed to <#{ch.id}>.")
+                return
+        cfg["vcw"][str(idx)] = ch.id
+        _save_gcfg(gid)
+        note = f"✅ Worker {idx} always joins <#{ch.id}>."
+        s = _workers[idx].session(gid) if idx in _workers else None
+        if s and s["channel_id"] != ch.id:
+            note += " It is playing elsewhere right now — applies from its next play."
+        await self._redraw(interaction, note)
+
+    async def _on_eph(self, interaction: discord.Interaction):
+        gid = self.guild.id
+        cfg = _gcfg(gid)
+        cfg["eph"] = {k: (k in self.eph_select.values) for k in EPH_KEYS}
+        _save_gcfg(gid)
+        await self._redraw(interaction, "✅ Private reply settings saved.")
+
+    @discord.ui.button(label="🔎 Source", style=discord.ButtonStyle.primary, row=4)
+    async def btn_source(self, interaction: discord.Interaction, _):
+        keys = list(SOURCES)
+        nxt  = keys[(keys.index(_cfg_src(self.guild.id)) + 1) % len(keys)]
+        _gcfg(self.guild.id)["src"] = nxt
+        _save_gcfg(self.guild.id)
+        await self._redraw(interaction, f"✅ Default search source: {SOURCES[nxt]}.")
+
+    @discord.ui.button(label="Clear control channel", style=discord.ButtonStyle.secondary, row=4)
+    async def btn_clear_cc(self, interaction: discord.Interaction, _):
+        _gcfg(self.guild.id)["cc_id"] = None
+        _save_gcfg(self.guild.id)
+        await self._redraw(interaction, "✅ Control channel cleared — commands work in any channel.")
+
+    @discord.ui.button(label="Clear worker channel", style=discord.ButtonStyle.secondary, row=4)
+    async def btn_clear_vc(self, interaction: discord.Interaction, _):
+        _gcfg(self.guild.id)["vcw"].pop(str(self.worker_idx), None)
+        _save_gcfg(self.guild.id)
+        await self._redraw(interaction, f"✅ Worker {self.worker_idx} now follows the user.")
+
+    @discord.ui.button(label="Done", style=discord.ButtonStyle.primary, row=4)
+    async def btn_done(self, interaction: discord.Interaction, _):
+        await interaction.response.edit_message(
+            embed=_settings_embed(self.guild, self.worker_idx, "✅ Settings saved."), view=None)
+        self.stop()
 
 
-    if full:
-        embed = discord.Embed(
-            title="🔄  Restarting entire service…",
-            description=(
-                f"Running `systemctl restart {SERVICE_NAME}`.\n"
-                "All workers and the main controller will restart. "
-                "Music will stop and resume from scratch."
-            ),
-            colour=COLOUR,
-        )
-        embed.set_footer(text="This message will not update — the bot is restarting.")
-        await interaction.followup.send(embed=embed, ephemeral=_eph("RS_EPH"))
-
-        asyncio.ensure_future(_delayed_systemctl("restart", delay=2.0))
+@main_bot.tree.command(name="settings", description="Server settings for the music bots (Manage Server)")
+async def slash_settings(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message(embed=_err_embed("Server only"), ephemeral=True)
         return
-
-
-    targets: list[WorkerProcess] = []
-    if worker == 0:
-        targets = sorted(_workers.values(), key=lambda x: x.index)
-    elif worker in _workers:
-        targets = [_workers[worker]]
-    else:
-        await interaction.followup.send(
-            embed=_err_embed(f"No worker #{worker}. Valid: 0 (all), {', '.join(str(i) for i in sorted(_workers))}"),
-            ephemeral=_eph("RS_EPH"),
-        )
+    if not appsettings.is_whitelisted(interaction.guild_id):
+        await interaction.response.send_message(embed=_err_embed("This server is not whitelisted"), ephemeral=True)
         return
-
-    label = f"all {len(targets)} worker(s)" if len(targets) > 1 else f"Worker {targets[0].index}"
-    await interaction.followup.send(
-        embed=discord.Embed(
-            title=f"🔄  Restarting {label}…",
-            description="Stopping music and reconnecting. This takes a few seconds.",
-            colour=COLOUR,
-        ),
-        ephemeral=_eph("RS_EPH"),
-    )
-
-    lines: list[str] = []
-    for w in targets:
-        try:
-            await w.restart()
-            for _ in range(15):
-                await asyncio.sleep(1)
-                resp = await w.send({"op": "ping"}, timeout=3.0)
-                if resp.get("status") == "ok":
-                    lines.append(f"✅ Worker {w.index} — online (Lavalink: {'✅' if resp.get('lavalink_ok') else '❌'})")
-                    break
-            else:
-                lines.append(f"⚠️ Worker {w.index} — started but socket not yet ready")
-        except Exception as exc:
-            lines.append(f"❌ Worker {w.index} — error: {exc}")
-
-    result_embed = discord.Embed(
-        title=f"🔄  Restart complete — {label}",
-        description="\n".join(lines),
-        colour=discord.Colour.green() if all("✅" in l for l in lines) else discord.Colour.orange(),
-    )
-    result_embed.set_footer(text="Use full:True to restart the entire service including main controller.")
-    try:
-        await interaction.edit_original_response(embed=result_embed)
-    except Exception:
-        await interaction.followup.send(embed=result_embed, ephemeral=_eph("RS_EPH"))
-
-
-@main_bot.tree.command(name="shutdown", description="Shut down worker(s) or the entire service")
-@app_commands.describe(
-    worker="Which worker to shut down (1, 2, … or 0 = all workers)",
-    full="Shut down the entire musicbot service including main controller (default: False)",
-)
-async def slash_shutdown(interaction: discord.Interaction, worker: int = 0, full: bool = False):
-    if not await _owner_only(interaction): return
-    if not await _guard(interaction): return
-    await interaction.response.defer(thinking=True, ephemeral=_eph("SD_EPH"))
-
-
-    if full:
-        embed = discord.Embed(
-            title="🔴  Shutting down entire service…",
-            description=(
-                f"Running `systemctl stop {SERVICE_NAME}`.\n"
-                "All workers and the main controller will stop permanently. "
-                f"Use `systemctl start {SERVICE_NAME}` on the server to bring it back up."
-            ),
-            colour=discord.Colour.red(),
-        )
-        embed.set_footer(text="This message will not update — the bot is shutting down.")
-        await interaction.followup.send(embed=embed, ephemeral=_eph("SD_EPH"))
-        asyncio.ensure_future(_delayed_systemctl("stop", delay=2.0))
+    if not (_has_perm(interaction.user, "manage_guild") or _is_dev(interaction.user)):
+        await interaction.response.send_message(
+            embed=_err_embed("You need the Manage Server permission to change settings"), ephemeral=True)
         return
-
-
-    targets: list[WorkerProcess] = []
-    if worker == 0:
-        targets = sorted(_workers.values(), key=lambda x: x.index)
-    elif worker in _workers:
-        targets = [_workers[worker]]
-    else:
-        await interaction.followup.send(
-            embed=_err_embed(f"No worker #{worker}. Valid: 0 (all), {', '.join(str(i) for i in sorted(_workers))}"),
-            ephemeral=_eph("SD_EPH"),
-        )
-        return
-
-    label = f"all {len(targets)} worker(s)" if len(targets) > 1 else f"Worker {targets[0].index}"
-    await interaction.followup.send(
-        embed=discord.Embed(
-            title=f"🔴  Shutting down {label}…",
-            description="Stopping music and disconnecting. Workers will **not** restart.",
-            colour=discord.Colour.red(),
-        ),
-        ephemeral=_eph("SD_EPH"),
-    )
-
-    lines: list[str] = []
-    for w in targets:
-        w._shutdown_requested = True
-        try:
-            await w.terminate()
-            w.busy       = False
-            w.channel_id = None
-            lines.append(f"🔴 Worker {w.index} — shut down")
-        except Exception as exc:
-            lines.append(f"❌ Worker {w.index} — error: {exc}")
-
-    result_embed = discord.Embed(
-        title=f"🔴  Shutdown complete — {label}",
-        description="\n".join(lines),
-        colour=discord.Colour.red(),
-    )
-    result_embed.set_footer(text="Use /restart to bring worker(s) back up. Use full:True to shut down the entire service.")
-    try:
-        await interaction.edit_original_response(embed=result_embed)
-    except Exception:
-        await interaction.followup.send(embed=result_embed, ephemeral=_eph("SD_EPH"))
+    # Not routed through _guard: the control-channel lock must never lock admins out of fixing it.
+    idx = min(_workers) if _workers else 1
+    await interaction.response.send_message(
+        embed=_settings_embed(interaction.guild, idx),
+        view=SettingsView(interaction.user.id, interaction.guild, idx),
+        ephemeral=True)
 
 
 @main_bot.tree.command(name="purge", description="Delete the last N bot messages in this channel (default: 20)")
 @app_commands.describe(limit="Number of messages to scan (1–100, default 20)")
 async def slash_purge(interaction: discord.Interaction, limit: int = 20):
-    if not await _owner_only(interaction): return
+    if not (_has_perm(interaction.user, "manage_messages") or _is_dev(interaction.user)):
+        await interaction.response.send_message(
+            embed=_err_embed("You need the Manage Messages permission"), ephemeral=True)
+        return
     if not await _guard(interaction): return
     await interaction.response.defer(thinking=True, ephemeral=True)
     if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
@@ -1335,14 +1497,16 @@ async def slash_purge(interaction: discord.Interaction, limit: int = 20):
         title=f"🧹  Purged {deleted} bot message(s)",
         colour=COLOUR,
     )
-    msg = await interaction.followup.send(embed=embed, ephemeral=False)
+    await interaction.followup.send(embed=embed, ephemeral=False)
 
 
 async def _watch_worker(w: WorkerProcess):
+    ticks = 0
     while True:
         await asyncio.sleep(5)
         if _shutting_down:
             return
+        ticks += 1
 
         if w.proc is not None:
             dead = not w.is_alive()
@@ -1354,48 +1518,33 @@ async def _watch_worker(w: WorkerProcess):
                 print(f"[Main] Worker {w.index} is shut down (requested) — not restarting", flush=True)
                 return
             print(f"[Main] Worker {w.index} unresponsive — restarting in 3s", flush=True)
-            w.busy = False
-            w.channel_id = None
+            w.clear_state()
             await asyncio.sleep(3)
             if not _shutting_down:
                 w.start()
-
-
-async def _resync_worker(w: WorkerProcess) -> bool:
-    resp = await w.send({"op": "sync"}, timeout=8.0)
-    if resp.get("status") != "ok":
-        return False
-    if resp.get("busy"):
-        w.busy       = True
-        w.channel_id = resp.get("channel_id")
-        print(
-            f"[Main] Resynced Worker {w.index} — busy ch={w.channel_id} "
-            f"playing={resp.get('current_title','?')!r} queue={resp.get('queue_len',0)}",
-            flush=True,
-        )
-    else:
-        w.busy       = False
-        w.channel_id = None
-        print(f"[Main] Resynced Worker {w.index} — idle", flush=True)
-    return True
+        elif ticks % 6 == 0:
+            await _resync_worker(w)   # backstop in case a state event was lost
 
 
 async def _run(stop_event: asyncio.Event | None = None):
     global _shutting_down
 
+    _migrate_legacy_settings()
+    asyncio.create_task(_event_server(), name="event_server")
+
     main_task = asyncio.create_task(main_bot.start(TOKENS[0]), name="main_bot")
     await asyncio.sleep(5)
 
-    for i, script in enumerate(_worker_scripts, start=1):
-        _workers[i] = WorkerProcess(index=i, script=script)
+    for i in range(1, len(TOKENS)):
+        _workers[i] = WorkerProcess(index=i)
 
 
-    for w in sorted(_workers.values(), key=lambda x: x.index):
+    for w in _ordered_workers():
         if w.socket_path.exists():
             print(f"[Main] Socket exists for Worker {w.index} — attempting resync ...", flush=True)
             alive = await _resync_worker(w)
             if alive:
-                print(f"[Main] Worker {w.index} already running — skipping spawn", flush=True)
+                print(f"[Main] Worker {w.index} already running ({len(w.sessions)} session(s)) — skipping spawn", flush=True)
                 asyncio.create_task(_watch_worker(w))
                 continue
             print(f"[Main] Worker {w.index} socket stale — spawning fresh", flush=True)
@@ -1417,6 +1566,7 @@ async def _run(stop_event: asyncio.Event | None = None):
     print("[Main] Shutting down ...", flush=True)
     await main_bot.close()
     await asyncio.gather(*[w.terminate() for w in _workers.values()], return_exceptions=True)
+    MAIN_SOCKET.unlink(missing_ok=True)
     print("[Main] All workers stopped.", flush=True)
 
 

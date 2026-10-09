@@ -1,0 +1,23 @@
+{
+  "tokens": [
+    "Main controller bot token",
+    "Worker 1 token",
+    "Worker 2 token",
+    "add as many worker tokens as needed"
+  ],
+  "lavalink": {
+    "uri": "http://localhost:2333",
+    "password": "Lavalink server password"
+  },
+  "dev_ids": [
+    123456789012345678
+  ],
+  "whitelist_enabled": true,
+  "whitelist": [
+    123456789012345678
+  ],
+  "leave_message": "This server is not currently whitelisted, bot will not function",
+  "algo_max_songs": 100,
+  "algo_max_kb": 256,
+  "autoplay_seed_count": 5
+}

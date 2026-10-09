@@ -1,13 +1,17 @@
 # secrets / local config
 .env
-config.json
+server_settings.json
 
 # runtime state written by the bots
 settings.json
 .worker*.sock
-.worker*_status_msg
 
 # python
 venv/
 __pycache__/
 *.pyc
+settings.json.migrated
+.main.sock
+
+# per-server config and per-user algo
+database/
