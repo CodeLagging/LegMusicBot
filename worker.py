@@ -53,8 +53,7 @@ MAX_RESOLVE_ATTEMPTS = 2
 MAX_FAIL_STREAK      = 3
 
 POP_CHECK       = 3      # top candidates whose YouTube views/likes are looked up (each is a YouTube request)
-META_CACHE_TTL  = 24 * 3600   # views/likes barely change; fewer requests = less bot-checking by YouTube
-YTDLP_COOKIES   = SCRIPT_DIR / "youtube_cookies.txt"   # optional; helps when YouTube asks "confirm you're not a bot"
+META_CACHE_TTL  = 24 * 3600   # views/likes barely change; fewer YouTube requests
 POP_VIEW_W      = 8      # popularity points per 10x views
 POP_LIKE_W      = 4      # popularity points per 10x likes
 SP_MIN_COVERAGE = 0.5    # share of the query's words a Spotify match must contain
@@ -689,15 +688,10 @@ def _bg(fn, *args) -> None:
 _url_cache: dict[str, tuple[float, str]] = {}
 _inflight: dict[str, asyncio.Future] = {}
 
-def _ytdlp_auth() -> list[str]:
-    """--cookies when youtube_cookies.txt exists (export from a logged-in browser, ideally a spare
-    account). YouTube's bot check ("Sign in to confirm you're not a bot") targets the server's IP."""
-    return ["--cookies", str(YTDLP_COOKIES)] if YTDLP_COOKIES.exists() else []
-
 async def _ytdlp_run(video_url: str) -> str | None:
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "yt_dlp", *_ytdlp_auth(),
+            sys.executable, "-m", "yt_dlp",
             "-g", "-f", "bestaudio/best",
             "--no-playlist", "--no-warnings", "--socket-timeout", "10",
             video_url,
@@ -752,7 +746,7 @@ _meta_inflight: dict[str, asyncio.Future] = {}
 async def _ytdlp_meta_run(video_url: str) -> dict | None:
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "yt_dlp", *_ytdlp_auth(),
+            sys.executable, "-m", "yt_dlp",
             "-j", "-f", "bestaudio/best",
             "--no-playlist", "--no-warnings", "--socket-timeout", "10",
             video_url,

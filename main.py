@@ -1217,7 +1217,8 @@ class ControlView(discord.ui.View):
     async def btn_mute(self, i, _): await self._dispatch(i, "toggle_mute")
 
 
-PANEL_REFRESH = 8.0   # seconds between automatic /control panel updates
+PANEL_REFRESH  = 8.0       # seconds between automatic /control panel updates
+PANEL_LIFETIME = 14 * 60   # Discord allows editing the panel for 15 min; it marks itself expired at 14
 
 class PanelState:
     """One open /control panel: the message, its newest view and what it last showed, so it can
@@ -1313,12 +1314,14 @@ async def _refresh_control_panel(interaction: discord.Interaction, ctrl: Control
 async def _panel_autorefresh(state: PanelState) -> None:
     """Keep an open panel in sync with playback. Interaction messages can only be edited for
     15 minutes, which is also how long the panel's buttons work."""
-    deadline = time.monotonic() + 14 * 60
+    deadline = time.monotonic() + PANEL_LIFETIME
     while time.monotonic() < deadline:
-        await asyncio.sleep(PANEL_REFRESH)
+        await asyncio.sleep(min(PANEL_REFRESH, max(0.0, deadline - time.monotonic())))
         view = state.view
         if view is None or view._stopped or view.is_finished():
             return
+        if time.monotonic() >= deadline:
+            break
         try:
             if not state.worker.session(state.guild_id):
                 for child in view.children:
@@ -1337,6 +1340,16 @@ async def _panel_autorefresh(state: PanelState) -> None:
         except Exception as exc:
             print(f"[Main] Control panel auto-refresh stopped: {exc}", flush=True)
             return
+    # Last edit before Discord stops accepting them: make it obvious the panel is dead.
+    view = state.view
+    if view is not None and not view._stopped:
+        try:
+            await state.message.edit(embed=discord.Embed(
+                title="⌛  Panel expired", description="Run `/control` again to get a new one.",
+                colour=discord.Colour.dark_grey()), view=None)
+        except Exception as exc:
+            print(f"[Main] Could not mark control panel expired: {exc}", flush=True)
+        view.stop()
 
 
 @main_bot.tree.command(name="control", description="Open playback control panel")

@@ -1,7 +1,6 @@
 # secrets / local config
 .env
 server_settings.json
-youtube_cookies.txt
 
 # runtime state written by the bots
 settings.json

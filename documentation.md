@@ -123,7 +123,7 @@ The `worker` option forces a specific worker (0 = automatic). It is needed to us
 | 0 | ⏪ 10s, ⏪ 5s, ⏩ 5s, ⏩ 10s, 🔁 Loop |
 | 1 | ⏮ Backward (restart track), ⏸/▶ Pause/Play, ⏹ Stop, ⏭ Skip, 🔇 Mute (hides now-playing messages) |
 
-The panel **updates itself** every 8 s when the song, queue or a setting changes (keeping your page and selection), and shows "Playback ended" when the session stops.
+The panel **updates itself** every 8 s when the song, queue or a setting changes (keeping your page and selection), and shows "Playback ended" when the session stops. Discord only allows editing it for 15 minutes, so at 14 minutes it turns into "Panel expired — run /control again".
 | 2 | Queue dropdown (25 per page; 🎲 marks autoplay picks) |
 | 3 | ⏭ Jump To, 🗑 Remove, ✖ Clear selection, 🎲 Autoplay, 🔒 Control: Me / 🔓 Control: All |
 | 4 | 🎚️ Normalize (evens out loud and quiet songs; default off; also applies to the shutdown message), then page buttons for queues longer than one page |
@@ -468,7 +468,7 @@ Fetches `get_queue`, stores the session snapshot, clamps the page, drops a selec
 `/reset-algo`: the algo menu (dropdown of saved songs by `track_key`, page buttons, 🗑️ Reset all, 🟠 Remove selected, Cancel) and its confirm step (Yes / Back). Only the person who opened it can use it. After removing, the menu reopens with the updated list; workers drop their cached copy of the user's history (`forget_user`).
 
 **`class PanelState`**, **`async def _panel_autorefresh(state)`**
-An open panel's message and newest view; every `PANEL_REFRESH` (8 s) the panel is rebuilt and edited only if what it shows changed (`view.sig`). Stops after 14 minutes (Discord's edit limit for interaction messages) or when the session ends.
+An open panel's message and newest view; every `PANEL_REFRESH` (8 s) the panel is rebuilt and edited only if what it shows changed (`view.sig`). At 14 minutes (just before Discord's 15-minute edit limit) it replaces itself with "Panel expired — run /control again" and removes the buttons; it also stops when the session ends.
 
 **`async def _refresh_control_panel(interaction, ctrl, page=0, selected_idx=None)`**
 Rebuilds the panel and edits the message in place. Errors are only logged.
@@ -955,7 +955,7 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `MAX_RESOLVE_ATTEMPTS` | worker.py | 2 | Candidates tried per play before handing the original to Lavalink. |
 | `MAX_FAIL_STREAK` | worker.py | 3 | Failed tracks in a row before the worker stops and reports. |
 | `POP_CHECK` | worker.py | 3 | Candidates whose YouTube views/likes are looked up per search (each is a YouTube request). |
-| `META_CACHE_TTL` | worker.py | 24 h | How long views/likes are reused (fewer requests, less bot-checking by YouTube). |
+| `META_CACHE_TTL` | worker.py | 24 h | How long views/likes are reused (fewer YouTube requests). |
 | `POP_VIEW_W`, `POP_LIKE_W` | worker.py | 8, 4 | Popularity points per 10× views / likes. |
 | `SP_MIN_COVERAGE` | worker.py | 0.5 | Share of the query's words a Spotify match must contain to be used. |
 | `PLAY_COUNT_MS` | worker.py | 30 s | Listening time for a song to count as a listen. |
@@ -982,7 +982,6 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `.worker<N>.sock` | worker | Socket the controller uses to talk to worker N. |
 | `.main.sock` | controller | Socket the workers send state events to. |
 | `shutdown.mp3` | you | Message played before a restart (optional). |
-| `youtube_cookies.txt` | you | Optional YouTube cookies (Netscape format) for yt-dlp, for when YouTube answers "Sign in to confirm you're not a bot". Git-ignored. |
 | `launcher.py` | repo | systemd entry point that makes restart/stop return immediately (section 11). |
 | `.bot.pid` | controller | PID of the running bot, so a new launcher can wait for an old one still finishing. |
 | `settings.json.migrated` | controller | The old single-server settings after their one-time import. |
