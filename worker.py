@@ -1,10 +1,12 @@
 import asyncio
 import json
+import math
 import os
 import random
 import re
 import sys
 import time
+import unicodedata
 import logging
 from collections import deque
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +52,11 @@ URL_CACHE_TTL        = 3600
 MAX_RESOLVE_ATTEMPTS = 2
 MAX_FAIL_STREAK      = 3
 
+POP_CHECK       = 4      # top candidates whose YouTube views/likes are looked up
+POP_VIEW_W      = 8      # popularity points per 10x views
+POP_LIKE_W      = 4      # popularity points per 10x likes
+SP_MIN_COVERAGE = 0.5    # share of the query's words a Spotify match must contain
+
 PLAY_COUNT_MS   = 30_000   # a song counts as "listened" for the algo after this long
 HISTORY_LEN     = 25
 AUTOPLAY_BATCH  = 2
@@ -69,7 +76,15 @@ _OFFICIAL_RE = re.compile(
 _ALTERED_QUICK = re.compile(
     r"\b(sped[\s_-]*up|slowed|reverb|nightcore|daycore|lofi|lo[\s_-]*fi|"
     r"bass[\s_-]*boost|8d|cover|acoustic|piano|karaoke|instrumental|remix|"
-    r"mashup|bootleg|extended|phonk|trap)\b",
+    r"mashup|bootleg|extended|phonk|trap|tiktok)\b",
+    re.IGNORECASE,
+)
+
+# Words that, in the user's own query, clearly ask for an altered version. Checked before the AI,
+# so a Groq timeout can't filter out a version the user asked for by name.
+_ALTERED_ASK = re.compile(
+    r"\b(sped[\s_-]*up|slowed|reverb|nightcore|daycore|8d|bass[\s_-]*boost(?:ed)?|"
+    r"lo[\s_-]*fi|remix|cover|karaoke|instrumental|mashup|tiktok)\b",
     re.IGNORECASE,
 )
 
@@ -177,13 +192,22 @@ def _is_local(track: wavelink.Playable) -> bool:
         bool(uri) and not uri.startswith("http") and not _SPOTIFY_RE.search(uri)
     )
 
+def _fold(text: str) -> str:
+    """Lower-case and strip accents, so 'Tântrico' matches 'tantrico'."""
+    nfkd = unicodedata.normalize("NFKD", text or "")
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+def _words(text: str) -> list[str]:
+    return [w for w in re.split(r"\W+", _fold(text)) if len(w) > 1]
+
 def _track_score(track: wavelink.Playable, query: str = "",
                  ref: wavelink.Playable | None = None) -> int:
+    """Relevance of a search candidate to the query (popularity is added separately)."""
     score   = 0
-    title   = (track.title  or "").lower()
-    author  = (track.author or "").lower()
-    q_lower = query.lower()
-    words   = [w for w in re.split(r"\W+", q_lower) if len(w) > 1]
+    title   = _fold(track.title or "")
+    author  = _fold(track.author or "")
+    q_fold  = _fold(query)
+    words   = _words(query)
 
     for w in words:
         if w in title:  score += 40
@@ -191,7 +215,7 @@ def _track_score(track: wavelink.Playable, query: str = "",
 
 
     if ref is not None:
-        ref_words = [w for w in re.split(r"\W+", f"{ref.title or ''} {ref.author or ''}".lower()) if len(w) > 1]
+        ref_words = _words(f"{ref.title or ''} {ref.author or ''}")
         for w in set(ref_words):
             if w in title:  score += 15
             elif w in author: score += 5
@@ -207,7 +231,20 @@ def _track_score(track: wavelink.Playable, query: str = "",
     if _ALTERED_QUICK.search(track.title or ""):
         score -= 20
 
+    # Medleys ("A / B / C / D") and long compilations are rarely what a song search means.
+    if (track.title or "").count("/") >= 2:
+        score -= 60
+    if (track.length or 0) > 10 * 60_000 and not re.search(r"\b(mix|full|album|hour|live)\b", q_fold):
+        score -= 30
+
     return score
+
+def _popularity(meta: dict | None) -> float:
+    if not meta:
+        return 0.0
+    views = meta.get("view_count") or 0
+    likes = meta.get("like_count") or 0
+    return POP_VIEW_W * math.log10(views + 1) + POP_LIKE_W * math.log10(likes + 1)
 
 
 COLOUR = discord.Colour.from_str("#5865F2")
@@ -264,8 +301,20 @@ bot = discord.Client(intents=intents)
 # A Discord bot can be in one voice channel per server, so each worker keeps one
 # Session per guild and can play in several servers at once.
 
-# Queue items are (track, source_label, search_path, requester_id).
-QueueItem = tuple
+class QueueItem(tuple):
+    """(track, source_label, search_path, requester_id) plus a stable `qid`.
+    The control panel refers to songs by qid, not position: positions shift whenever a song
+    ends or autoplay adds picks, which made Jump To / Remove hit the song after the one chosen."""
+    _next_qid = 0
+
+    def __new__(cls, track, label, path, requester):
+        item = super().__new__(cls, (track, label, path, requester))
+        QueueItem._next_qid += 1
+        item.qid = QueueItem._next_qid
+        return item
+
+def _queue_pos(sess: "Session", qid: int) -> int | None:
+    return next((i for i, q in enumerate(sess.queue) if q.qid == qid), None)
 
 class Session:
     def __init__(self, guild_id: int, channel_id: int, controller_id: int):
@@ -420,6 +469,83 @@ async def _ytdlp_url(video_url: str) -> str | None:
                 _url_cache.pop(k, None)
     return url
 
+_meta_cache: dict[str, tuple[float, dict | None]] = {}
+_meta_inflight: dict[str, asyncio.Future] = {}
+
+async def _ytdlp_meta_run(video_url: str) -> dict | None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "yt_dlp",
+            "-j", "-f", "bestaudio/best",
+            "--no-playlist", "--no-warnings", "--socket-timeout", "10",
+            video_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=YTDLP_TIMEOUT)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None
+    except Exception as exc:
+        print(f"[Worker {BOT_INDEX}] yt-dlp metadata failed: {exc}", flush=True)
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        info = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    return {"view_count": info.get("view_count"), "like_count": info.get("like_count"),
+            "url": info.get("url")}
+
+async def _yt_meta(video_url: str) -> dict | None:
+    """Views, likes and the direct stream URL of a YouTube video in one yt-dlp call.
+    The stream URL goes into the resolver cache, so the winning track starts without a second lookup."""
+    hit = _meta_cache.get(video_url)
+    if hit and time.time() - hit[0] < URL_CACHE_TTL:
+        return hit[1]
+    fut = _meta_inflight.get(video_url)
+    if fut is None:
+        fut = asyncio.ensure_future(_ytdlp_meta_run(video_url))
+        _meta_inflight[video_url] = fut
+    try:
+        meta = await fut
+    finally:
+        if _meta_inflight.get(video_url) is fut:
+            _meta_inflight.pop(video_url, None)
+    _meta_cache[video_url] = (time.time(), meta)
+    if len(_meta_cache) > 300:
+        for k, _ in sorted(_meta_cache.items(), key=lambda kv: kv[1][0])[:100]:
+            _meta_cache.pop(k, None)
+    if meta and meta.get("url"):
+        _url_cache[video_url] = (time.time(), meta["url"])
+    return meta
+
+async def _rank_by_popularity(scored: list[tuple[wavelink.Playable, int]],
+                              skip_altered: bool = False) -> list[tuple[wavelink.Playable, float]]:
+    """Adds YouTube popularity to the most relevant candidates and re-sorts.
+    Relevance still dominates: popularity only separates candidates that match about equally well.
+    With skip_altered, obviously altered titles don't use up the popularity lookups."""
+    scored = sorted(scored, key=lambda x: x[1], reverse=True)
+    pool   = [(t, rel) for t, rel in scored
+              if _YT_RE.search(t.uri or "") and not (skip_altered and _ALTERED_QUICK.search(t.title or ""))]
+    top    = pool[:POP_CHECK]
+    metas  = await asyncio.gather(*[_yt_meta(t.uri) for t, _ in top])
+    final: dict[str, float] = {}
+    for (t, rel), meta in zip(top, metas):
+        pop = _popularity(meta)
+        final[_track_key(t)] = rel + pop
+        views = (meta or {}).get("view_count")
+        likes = (meta or {}).get("like_count")
+        print(f"[Worker {BOT_INDEX}]   {rel:>4} + pop {pop:5.1f} = {rel + pop:6.1f}: "
+              f"{t.title!r} by {t.author!r} ({views or 0:,} views, {likes or 0:,} likes)", flush=True)
+    ranked = [(t, final.get(_track_key(t), float(rel))) for t, rel in scored]
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    return ranked
+
 async def _resolve(track: wavelink.Playable
                    ) -> tuple[wavelink.Playable, wavelink.Playable, wavelink.Playable | None] | None:
     """Returns (what Lavalink plays, the track the user asked for, the YouTube track it maps to)."""
@@ -431,6 +557,9 @@ async def _resolve(track: wavelink.Playable
         cands = await _ytm(q)
         if not cands:
             return None
+        # Don't map an original Spotify/Apple Music song onto a sped-up/remix upload.
+        if not _ALTERED_QUICK.search(track.title or ""):
+            cands = [t for t in cands if not _ALTERED_QUICK.search(t.title or "")] or cands
         src = max(cands, key=lambda t: _track_score(t, q, track))
         uri = src.uri or ""
 
@@ -483,7 +612,7 @@ async def _set_vc_status(guild_id: int, channel_id: int, title: str | None) -> N
     if not isinstance(vc, discord.VoiceChannel):
         return
     try:
-        await vc.edit(status=(title[:500] if title else None))
+        await vc.edit(status=(f"🎵Playing - {title}"[:500] if title else None))
     except discord.Forbidden:
         print(f"[Worker {BOT_INDEX}] No permission to set voice status in guild {guild_id}", flush=True)
     except Exception as exc:
@@ -681,7 +810,7 @@ async def _autoplay_refill(sess: Session) -> None:
         return
     requester = sess.autoplay_user or sess.controller_id
     for t, lbl, path in recs:
-        sess.queue.append((t, lbl, path, requester))
+        sess.queue.append(QueueItem(t, lbl, path, requester))
     if recs:
         print(f"[Worker {BOT_INDEX}] Autoplay queued: {', '.join(repr(t.title) for t, _, _ in recs)}", flush=True)
         _prefetch_next(sess)
@@ -850,7 +979,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
 
 
     if sess.loop and orig:
-        sess.queue.insert(0, (orig, "Looping", "", sess.current_requester))
+        sess.queue.insert(0, QueueItem(orig, "Looping", "", sess.current_requester))
 
     await _advance(sess, player)
 
@@ -995,13 +1124,28 @@ async def _connect_vc(sess: Session) -> wavelink.Player:
 
 
 async def _sp_lookup(query: str) -> wavelink.Playable | None:
+    """Clean title/artist/length from Spotify, but only if a top result actually matches the query.
+    Spotify's first hit can be unrelated (e.g. 'noite quente' -> 'Spa Noturno Hindu')."""
     try:
         r = await wavelink.Playable.search(f"spsearch:{query}")
-        if isinstance(r, list) and r:              return r[0]
-        if isinstance(r, wavelink.Playlist) and r.tracks: return r.tracks[0]
     except Exception as exc:
-        print(f"[Worker {BOT_INDEX}] Spotify lookup error: {exc}", flush=True)
-    return None
+        print(f"[Worker {BOT_INDEX}] Spotify lookup error: {str(exc).splitlines()[0][:120]}", flush=True)
+        return None
+    items = r.tracks if isinstance(r, wavelink.Playlist) else list(r or [])
+    q_words = set(_words(query))
+    if not items or not q_words:
+        return None
+    best, best_cov = None, 0.0
+    for t in items[:5]:
+        t_text = _fold(f"{t.title} {t.author}")
+        cov = sum(1 for w in q_words if w in t_text) / len(q_words)
+        if cov > best_cov:
+            best, best_cov = t, cov
+    if best_cov < SP_MIN_COVERAGE:
+        print(f"[Worker {BOT_INDEX}] Spotify results don't match the query — ignoring "
+              f"(best: {items[0].title!r} by {items[0].author!r})", flush=True)
+        return None
+    return best
 
 async def _am_load(url: str) -> wavelink.Playable | wavelink.Playlist | None:
     try:
@@ -1076,7 +1220,7 @@ async def _search(query: str, source: str,
 
     if source == "sc":
         results = await _sc(query)
-        if await _user_wants_altered(query):
+        if _ALTERED_ASK.search(query) or await _user_wants_altered(query):
             return (results[0] if results else None), label, "SoundCloud"
         clean = await _first_clean(results)
         selected = clean or (results[0] if results else None)
@@ -1084,34 +1228,37 @@ async def _search(query: str, source: str,
             _remember_alternates(sess, selected, results, label, "SoundCloud")
         return selected, label, "SoundCloud"
 
-    user_alt = await _user_wants_altered(query)
-    sp = await _sp_lookup(query) if source != "yt" else None
+    # The altered-version check, Spotify and the plain YouTube Music search run at the same time.
+    sp_task = _sp_lookup(query) if source != "yt" else asyncio.sleep(0, result=None)
+    asked = bool(_ALTERED_ASK.search(query))
+    alt_task = asyncio.sleep(0, result=True) if asked else _user_wants_altered(query)
+    user_alt, sp, raw = await asyncio.gather(alt_task, sp_task, _ytm(query))
     if sp:
         yt_q  = f"{sp.title} {sp.author}".strip()
         path  = "Spotify → YouTube Music"
         print(f"[Worker {BOT_INDEX}] Spotify: {sp.title!r} by {sp.author!r} ({(sp.length or 0)//1000}s)", flush=True)
+        # Search with Spotify's clean metadata too, and merge (Spotify-based results first).
+        candidates, seen = [], set()
+        for t in (await _ytm(yt_q)) + raw:
+            if _track_key(t) not in seen:
+                seen.add(_track_key(t))
+                candidates.append(t)
     else:
-        yt_q  = query
-        path  = "YouTube Music"
-
-    if user_alt:
-        results = await _ytm(yt_q)
-        selected = max(results, key=lambda t: _track_score(t, query, sp)) if results else None
-        if selected:
-            ranked = sorted(results, key=lambda t: _track_score(t, query, sp), reverse=True)
-            _remember_alternates(sess, selected, ranked, label, path)
-        return selected, label, path
-
-    candidates = await _ytm(yt_q)
+        yt_q, path, candidates = query, "YouTube Music", raw
 
     scored = [(t, _track_score(t, query, sp)) for t in candidates]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    for t, sc in scored[:3]:
-        print(f"[Worker {BOT_INDEX}]   candidate {sc:>4}: {t.title!r} by {t.author!r} ({(t.length or 0)//1000}s)", flush=True)
-    for t, sc in scored:
+    ranked = await _rank_by_popularity(scored, skip_altered=not user_alt) if scored else []
+
+    if user_alt:
+        selected = ranked[0][0] if ranked else None
+        if selected:
+            _remember_alternates(sess, selected, [t for t, _ in ranked], label, path)
+        return selected, label, path
+
+    for t, sc in ranked:
         if not await _is_altered(t.title or ""):
-            print(f"[Worker {BOT_INDEX}] ✓ {t.title!r} (score {sc})", flush=True)
-            _remember_alternates(sess, t, [candidate for candidate, _ in scored], label, path)
+            print(f"[Worker {BOT_INDEX}] ✓ {t.title!r} by {t.author!r} (score {sc:.1f})", flush=True)
+            _remember_alternates(sess, t, [candidate for candidate, _ in ranked], label, path)
             return t, label, path
 
     if sp:
@@ -1125,11 +1272,10 @@ async def _search(query: str, source: str,
                     _remember_alternates(sess, t, [candidate for candidate, _ in ch_scored], label, path)
                     return t, label, path
 
-    if candidates:
-        ranked = sorted(candidates, key=lambda t: _track_score(t, query, sp), reverse=True)
-        best = ranked[0]
+    if ranked:
+        best = ranked[0][0]
         print(f"[Worker {BOT_INDEX}] ⚠ fallback: {best.title!r}", flush=True)
-        _remember_alternates(sess, best, ranked, label, path)
+        _remember_alternates(sess, best, [t for t, _ in ranked], label, path)
         return best, label, path
 
     return None, label, path
@@ -1269,9 +1415,9 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                                              "author": player.current.author or ""}
                 current = {"title": info["title"], "author": info["author"], "index": -1}
             queue_list = [
-                {"title": t.title or "Unknown", "author": t.author or "", "index": i,
-                 "autoplay": lbl == AUTOPLAY_LABEL}
-                for i, (t, lbl, _path, _req) in enumerate(sess.queue if sess else [])
+                {"title": item[0].title or "Unknown", "author": item[0].author or "", "index": i,
+                 "qid": item.qid, "autoplay": item[1] == AUTOPLAY_LABEL}
+                for i, item in enumerate(sess.queue if sess else [])
             ]
             await reply(True, "queue", current=current, queue=queue_list,
                         muted=sess.muted if sess else False, loop=sess.loop if sess else False,
@@ -1332,9 +1478,9 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             return
 
         if op == "remove_from_queue":
-            idx = int(cmd.get("index", -1))
-            if idx < 0 or idx >= len(sess.queue):
-                await reply(False, "Invalid queue index.")
+            idx = _queue_pos(sess, int(cmd.get("qid", -1)))
+            if idx is None:
+                await reply(False, "That song is no longer in the queue (it already played or was removed).")
                 return
             removed_title = sess.queue[idx][0].title or "Unknown"
             del sess.queue[idx]
@@ -1384,9 +1530,9 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             if not player or not player.playing:
                 await reply(False, "Nothing playing.")
                 return
-            idx = int(cmd.get("index", 0))
-            if idx < 0 or idx >= len(sess.queue):
-                await reply(False, "Invalid queue index.")
+            idx = _queue_pos(sess, int(cmd.get("qid", -1)))
+            if idx is None:
+                await reply(False, "That song is no longer in the queue (it already played or was removed).")
                 return
 
             target_track, target_lbl, target_path, target_req = sess.queue[idx]
@@ -1431,7 +1577,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
             return
         player = await _connect_vc(sess)
         if player.playing:
-            pos = _enqueue(sess, (track, lbl, path, uid))
+            pos = _enqueue(sess, QueueItem(track, lbl, path, uid))
             await reply(True, "queued", session=sess.snapshot(),
                         **_track_reply(track, "queued", lbl, path, queue_pos=pos))
         else:
@@ -1449,7 +1595,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
         player = await _connect_vc(sess)
         first = tracks[0]
         if player.playing:
-            for t in tracks: _enqueue(sess, (t, lbl, "Playlist", uid))
+            for t in tracks: _enqueue(sess, QueueItem(t, lbl, "Playlist", uid))
             await reply(True, "queued_playlist", session=sess.snapshot(),
                         embed_type="queued_playlist",
                         pl_name=pl_name, count=len(tracks),
@@ -1457,7 +1603,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
                         source_label=lbl, skipped=skipped)
         else:
             sess.fail_streak = 0
-            for t in tracks[1:]: _enqueue(sess, (t, lbl, "Playlist", uid))
+            for t in tracks[1:]: _enqueue(sess, QueueItem(t, lbl, "Playlist", uid))
             await _play(sess, player, first, uid)
             await reply(True, "playing_playlist", session=sess.snapshot(),
                         embed_type="playing_playlist",

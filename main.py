@@ -854,7 +854,7 @@ class QueueSelect(discord.ui.Select):
 
     def __init__(self, view: "ControlView", queue: list[dict],
                  page: int, total_pages: int, current_title: str,
-                 selected_idx: int | None = None):
+                 selected_qid: int | None = None):
         self._ctrl = view
         self._page = page
 
@@ -874,19 +874,18 @@ class QueueSelect(discord.ui.Select):
                 idx      = item["index"]
                 label    = _truncate(f"#{idx + 1}  {item['title']}", 100)
                 desc     = _truncate(item["author"], 100) if item.get("author") else None
-                selected = (idx == selected_idx)
+                selected = (item["qid"] == selected_qid)
                 options.append(discord.SelectOption(
-                    label=label, value=str(idx), description=desc,
+                    label=label, value=str(item["qid"]), description=desc,
                     emoji="▶️" if selected else ("🎲" if item.get("autoplay") else "🎶"),
                     default=selected,
                 ))
 
         page_info = f"  [pg {page + 1}/{total_pages}]" if total_pages > 1 else ""
-        if selected_idx is not None:
-
-            sel_item  = next((q for q in queue if q["index"] == selected_idx), None)
-            sel_title = _truncate(sel_item["title"], 40) if sel_item else "?"
-            placeholder = f"✅ #{selected_idx + 1} {sel_title}{page_info} — choose action below"
+        sel_item = next((q for q in queue if q["qid"] == selected_qid), None) if selected_qid is not None else None
+        if sel_item:
+            sel_title = _truncate(sel_item["title"], 40)
+            placeholder = f"✅ #{sel_item['index'] + 1} {sel_title}{page_info} — choose action below"
         else:
             placeholder = f"▶ {_truncate(current_title, 45)}{page_info} — select a track…"
 
@@ -902,16 +901,16 @@ class QueueSelect(discord.ui.Select):
         if not self.values or self.values[0] == "__empty__":
             return
 
-        self._ctrl._selected_idx = int(self.values[0])
+        self._ctrl._selected_qid = int(self.values[0])
         await _refresh_control_panel(interaction, self._ctrl,
                                      page=self._ctrl._queue_page,
-                                     selected_idx=self._ctrl._selected_idx)
+                                     selected_qid=self._ctrl._selected_qid)
 
 
 class JumpToButton(discord.ui.Button):
     def __init__(self, view: "ControlView"):
         self._ctrl = view
-        has_sel    = view._selected_idx is not None
+        has_sel    = view._selected_qid is not None
         super().__init__(
             label="⏭ Jump To", style=discord.ButtonStyle.primary,
             disabled=not has_sel, row=3,
@@ -919,9 +918,8 @@ class JumpToButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=self._ctrl.eph)
-        idx  = self._ctrl._selected_idx
         resp = await self._ctrl.worker.send({
-            "op": "jump_to", "guild_id": self._ctrl.guild_id, "index": idx,
+            "op": "jump_to", "guild_id": self._ctrl.guild_id, "qid": self._ctrl._selected_qid,
         }, timeout=30.0)
         if resp.get("status") == "error":
             await interaction.followup.send(embed=_err_embed(resp.get("message", "Error")), ephemeral=self._ctrl.eph)
@@ -932,13 +930,13 @@ class JumpToButton(discord.ui.Button):
                 embed=_simple_embed(f"⏭  Jumped to **{_truncate(title, 60)}** — {rem} remaining", COLOUR),
                 ephemeral=self._ctrl.eph,
             )
-        await _refresh_control_panel(interaction, self._ctrl, page=0, selected_idx=None)
+        await _refresh_control_panel(interaction, self._ctrl, page=0, selected_qid=None)
 
 
 class RemoveButton(discord.ui.Button):
     def __init__(self, view: "ControlView"):
         self._ctrl = view
-        has_sel    = view._selected_idx is not None
+        has_sel    = view._selected_qid is not None
         super().__init__(
             label="🗑 Remove", style=discord.ButtonStyle.danger,
             disabled=not has_sel, row=3,
@@ -946,9 +944,8 @@ class RemoveButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=self._ctrl.eph)
-        idx  = self._ctrl._selected_idx
         resp = await self._ctrl.worker.send({
-            "op": "remove_from_queue", "guild_id": self._ctrl.guild_id, "index": idx,
+            "op": "remove_from_queue", "guild_id": self._ctrl.guild_id, "qid": self._ctrl._selected_qid,
         }, timeout=15.0)
         if resp.get("status") == "error":
             await interaction.followup.send(embed=_err_embed(resp.get("message", "Error")), ephemeral=self._ctrl.eph)
@@ -961,7 +958,7 @@ class RemoveButton(discord.ui.Button):
             )
 
         await _refresh_control_panel(interaction, self._ctrl,
-                                     page=self._ctrl._queue_page, selected_idx=None)
+                                     page=self._ctrl._queue_page, selected_qid=None)
 
 
 class ClearSelectionButton(discord.ui.Button):
@@ -969,13 +966,13 @@ class ClearSelectionButton(discord.ui.Button):
         self._ctrl = view
         super().__init__(
             label="✖ Clear", style=discord.ButtonStyle.secondary,
-            disabled=(view._selected_idx is None), row=3,
+            disabled=(view._selected_qid is None), row=3,
         )
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=self._ctrl.eph)
         await _refresh_control_panel(interaction, self._ctrl,
-                                     page=self._ctrl._queue_page, selected_idx=None)
+                                     page=self._ctrl._queue_page, selected_qid=None)
 
 
 class AutoplayButton(discord.ui.Button):
@@ -1012,7 +1009,7 @@ class PrevPageButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=self._ctrl.eph)
         await _refresh_control_panel(interaction, self._ctrl,
-                                     page=self._ctrl._queue_page - 1, selected_idx=None)
+                                     page=self._ctrl._queue_page - 1, selected_qid=None)
 
 
 class PageLabelButton(discord.ui.Button):
@@ -1034,14 +1031,14 @@ class NextPageButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=self._ctrl.eph)
         await _refresh_control_panel(interaction, self._ctrl,
-                                     page=self._ctrl._queue_page + 1, selected_idx=None)
+                                     page=self._ctrl._queue_page + 1, selected_qid=None)
 
 
 class ControlView(discord.ui.View):
     def __init__(self, worker: WorkerProcess, guild_id: int,
                  queue: list[dict], current_title: str, page: int = 0,
                  muted: bool = False, loop: bool = False, autoplay: bool = False,
-                 mode: str = "me", selected_idx: int | None = None):
+                 mode: str = "me", selected_qid: int | None = None):
         super().__init__(timeout=900)
         self.worker          = worker
         self.guild_id        = guild_id
@@ -1054,12 +1051,12 @@ class ControlView(discord.ui.View):
         self._loop           = loop
         self._autoplay       = autoplay
         self._mode           = mode
-        self._selected_idx   = selected_idx
+        self._selected_qid   = selected_qid
 
         total_pages = max(1, -(-len(queue) // PAGE_SIZE))
 
 
-        self.add_item(QueueSelect(self, queue, page, total_pages, current_title, selected_idx))
+        self.add_item(QueueSelect(self, queue, page, total_pages, current_title, selected_qid))
 
 
         self.add_item(JumpToButton(self))
@@ -1111,7 +1108,7 @@ class ControlView(discord.ui.View):
             await interaction.followup.send(embed=embed, ephemeral=self.eph)
         if resp.get("message") in ("skipped", "restarted", "muted", "unmuted", "loop_on", "loop_off",
                                    "autoplay_on", "autoplay_off", "mode_all", "mode_me"):
-            await _refresh_control_panel(interaction, self, page=self._queue_page, selected_idx=None)
+            await _refresh_control_panel(interaction, self, page=self._queue_page, selected_qid=None)
         return resp
 
     @discord.ui.button(label="⏪ 10s", style=discord.ButtonStyle.secondary, row=0)
@@ -1154,7 +1151,7 @@ class ControlView(discord.ui.View):
 
 async def _build_control_view(worker: WorkerProcess, guild_id: int,
                                page: int = 0,
-                               selected_idx: int | None = None) -> tuple[discord.Embed, ControlView]:
+                               selected_qid: int | None = None) -> tuple[discord.Embed, ControlView]:
     resp = await worker.send({"op": "get_queue", "guild_id": guild_id}, timeout=10.0)
     ok             = resp.get("status") == "ok"
     queue: list[dict] = resp.get("queue", []) if ok else []
@@ -1172,12 +1169,13 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
     page        = max(0, min(page, total_pages - 1))
 
 
-    if selected_idx is not None:
-        if not any(q["index"] == selected_idx for q in queue):
-            selected_idx = None
+    # The selected song may have played or been removed since it was picked.
+    sel_item = next((q for q in queue if q["qid"] == selected_qid), None) if selected_qid is not None else None
+    if sel_item is None:
+        selected_qid = None
 
     view  = ControlView(worker, guild_id, queue, current_title,
-                        page, muted, loop, autoplay, mode, selected_idx)
+                        page, muted, loop, autoplay, mode, selected_qid)
 
 
     for child in view.children:
@@ -1194,7 +1192,8 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
     end       = min(start + PAGE_SIZE, len(queue))
     page_info = f"  (page {page + 1}/{total_pages})" if total_pages > 1 else ""
     flags     = ("  🔇 muted" if muted else "") + ("  🔁 loop" if loop else "") + ("  🎲 autoplay" if autoplay else "")
-    sel_info  = f"\n✅ **Selected:** #{selected_idx + 1}" if selected_idx is not None else ""
+    sel_info  = (f"\n✅ **Selected:** #{sel_item['index'] + 1} {_truncate(sel_item['title'], 50)}"
+                 if sel_item else "")
     who       = (f"🔒 Controlled by <@{controller}>" if mode == "me" else
                  f"🔓 Anyone can control (started by <@{controller}>)") if controller else ""
     embed = discord.Embed(
@@ -1211,9 +1210,9 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
 
 
 async def _refresh_control_panel(interaction: discord.Interaction, ctrl: ControlView,
-                                 page: int = 0, selected_idx: int | None = None):
+                                 page: int = 0, selected_qid: int | None = None):
     try:
-        embed, view = await _build_control_view(ctrl.worker, ctrl.guild_id, page, selected_idx)
+        embed, view = await _build_control_view(ctrl.worker, ctrl.guild_id, page, selected_qid)
         await interaction.edit_original_response(embed=embed, view=view)
     except Exception as exc:
         print(f"[Main] Control panel refresh failed: {exc}", flush=True)
