@@ -135,6 +135,7 @@ class WorkerProcess:
         self.guild_ids: set[int] = set()
         self.user_id: int | None = None
         self.lavalink_ok = False
+        self.available = True      # False while the worker doesn't answer (see _resync_worker)
         # Serialises start/restart: the watchdog and a dev ``restart`` must never both start a
         # process (that left two copies of one worker logged in, one of them untracked).
         self.lock = asyncio.Lock()
@@ -325,7 +326,12 @@ async def _resync_worker(w: WorkerProcess, timeout: float = 4.0) -> bool:
     """Ask the worker what it is really doing. The worker is the source of truth for busy/free."""
     resp = await w.send({"op": "sync"}, timeout=timeout)
     if resp.get("status") != "ok":
+        # Down (shut down, crashed, restarting): it has no sessions and can't take new songs.
+        # Keeping its last-known state made /play pick a dead worker instead of a working one.
+        w.available = False
+        w.sessions = {}
         return False
+    w.available   = True
     w.user_id     = resp.get("user_id")
     w.guild_ids   = {int(g) for g in resp.get("guilds") or []}
     w.lavalink_ok = bool(resp.get("lavalink_ok"))
@@ -728,9 +734,12 @@ async def _pick_for_play(interaction: discord.Interaction, worker_arg: int):
     async with _pick_lock:
         # Fresh state from every worker, so a worker that went idle on its own is seen as free.
         await _resync_all()
-        present = [w for w in _ordered_workers() if guild_id in w.guild_ids]
+        present = [w for w in _ordered_workers() if guild_id in w.guild_ids and w.available]
         if not present:
-            await _fail(interaction, "No music workers are in this server — invite the worker bots first")
+            if any(guild_id in w.guild_ids for w in _workers.values()):
+                await _fail(interaction, "The music workers are restarting — try again in a moment")
+            else:
+                await _fail(interaction, "No music workers are in this server — invite the worker bots first")
             return None
 
         if worker_arg:
@@ -740,6 +749,9 @@ async def _pick_for_play(interaction: discord.Interaction, worker_arg: int):
                 return None
             if guild_id not in w.guild_ids:
                 await _fail(interaction, f"Worker {w.index} isn't in this server")
+                return None
+            if not w.available:
+                await _fail(interaction, f"Worker {w.index} is down right now — try another one or wait a moment")
                 return None
             s = w.session(guild_id)
             if s:
