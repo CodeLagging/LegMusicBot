@@ -428,11 +428,11 @@ class MainBot(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self._guild_cmds_cleared = False
+        self._cmds_synced = False
 
     async def setup_hook(self):
-        await self.tree.sync()
-        print("[Main] Commands synced globally", flush=True)
+        # Commands are registered per server in on_ready (instant), not globally (can take a
+        # while to show up in Discord apps).
 
 
         print("[Main] Clearing worker bot commands...", flush=True)
@@ -479,22 +479,32 @@ async def _enforce_whitelist(guild: discord.Guild) -> bool:
 @main_bot.event
 async def on_ready():
     print(f"[Main] Logged in as {main_bot.user} — {len(_workers)} worker(s), {len(main_bot.guilds)} server(s)", flush=True)
-    for g in list(main_bot.guilds):
-        if not await _enforce_whitelist(g):
-            continue
-        if not main_bot._guild_cmds_cleared:
-            # Older versions synced commands per-guild; remove those so they don't show up twice.
-            try:
-                main_bot.tree.clear_commands(guild=g)
-                await main_bot.tree.sync(guild=g)
-            except Exception as exc:
-                print(f"[Main] Could not clear guild commands in {g.id}: {exc}", flush=True)
-    main_bot._guild_cmds_cleared = True
+    allowed = [g for g in list(main_bot.guilds) if await _enforce_whitelist(g)]
+    if main_bot._cmds_synced:
+        return   # on_ready also fires after reconnects
+    main_bot._cmds_synced = True
+    await asyncio.gather(*[_sync_guild(g) for g in allowed])
+    try:
+        # Remove the global copies so commands don't show up twice. Done over HTTP so the tree
+        # keeps its global commands for copying to servers joined later.
+        await main_bot.http.bulk_upsert_global_commands(main_bot.application_id, [])
+    except Exception as exc:
+        print(f"[Main] Could not clear global commands: {exc}", flush=True)
+
+async def _sync_guild(guild: discord.Guild) -> None:
+    """Register the slash commands on one server. Per-server commands update instantly."""
+    try:
+        main_bot.tree.copy_global_to(guild=guild)
+        cmds = await main_bot.tree.sync(guild=guild)
+        print(f"[Main] {len(cmds)} commands synced to {guild.name} ({guild.id})", flush=True)
+    except Exception as exc:
+        print(f"[Main] Command sync failed for {guild.id}: {exc}", flush=True)
 
 @main_bot.event
 async def on_guild_join(guild: discord.Guild):
     if await _enforce_whitelist(guild):
         print(f"[Main] Joined whitelisted guild {guild.id} ({guild.name})", flush=True)
+        await _sync_guild(guild)
 
 
 # ── dev prefix commands (``restart``, ``shutdown``, ``get-env``) ─────────────

@@ -327,16 +327,19 @@ Turns a short worker reply (`stopped`, `paused`, `skipped`, `autoplay_on`, `mode
 The controller's Discord client with the slash-command tree.
 
 - **`__init__(self)`** — Default intents plus `message_content` (for the ``prefix`` commands).
-- **`setup_hook(self)`** — Runs once at start-up. Syncs the slash commands **globally** (every server), then logs in briefly with every worker token to clear any slash commands registered on the worker applications.
+- **`setup_hook(self)`** — Runs once at start-up. Logs in briefly with every worker token to clear any slash commands registered on the worker applications. (The main bot's commands are registered per server in `on_ready`.)
 
 **`async def _enforce_whitelist(guild)`**
 Returns True for a whitelisted server. Otherwise it posts `leave_message` with the server owner pinged in the system channel (or the first text channel it can write in, so it never spams every channel), leaves the server and returns False.
 
 **`async def on_ready()`**
-Logs the login, enforces the whitelist for every server the bot is in, and on the first ready removes leftover per-server slash commands from the old single-server version (so commands don't show twice).
+Logs the login and enforces the whitelist for every server the bot is in. On the first ready it registers the slash commands on each whitelisted server (`_sync_guild`) and removes any global copies, so nothing shows twice. Per-server commands appear in Discord immediately; global ones can take a while to reach Discord apps.
+
+**`async def _sync_guild(guild)`**
+Registers all slash commands on one server.
 
 **`async def on_guild_join(guild)`**
-Enforces the whitelist when the bot is added to a new server.
+Enforces the whitelist when the bot is added to a new server and registers the commands there right away.
 
 ### Dev ``prefix`` commands
 
@@ -1016,6 +1019,6 @@ journalctl -u SERVER_musicbots -f
 Notes:
 
 - Don't run a second copy (for testing) while the service is running: they share the same bot tokens.
-- Slash commands are registered globally; new or changed commands can take a minute to appear (Ctrl+R in Discord shows them immediately).
+- Slash commands are registered per server on every start, so new or changed commands show up right away (Ctrl+R in Discord if an open client still shows the old list).
 - Spotify's Web API requires the owner of the Spotify developer app (configured in Lavalink's `application.yml`) to have an active Premium subscription. Without it, Spotify searches and `open.spotify.com` links fail; searches then fall back to YouTube Music only.
 - The Message Content Intent is a privileged intent; beyond 100 servers Discord requires the bot to be verified for it.
