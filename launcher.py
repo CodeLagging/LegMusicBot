@@ -56,9 +56,14 @@ def _previous_bot() -> int | None:
         return None
     try:
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        cwd     = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
     except OSError:
         return None
-    return pid if b"main.py" in cmdline else None
+    # A stale .bot.pid (bot killed with -9) can point at a reused PID. Only treat it as our bot if
+    # it's main.py running from this folder, so an unrelated program is never waited on or killed.
+    if b"main.py" in cmdline and cwd == SCRIPT_DIR.resolve():
+        return pid
+    return None
 
 
 def _ask_bot_to_stop(pid: int) -> None:

@@ -228,8 +228,11 @@ async def _ai_pick_cached(query: str, cands: list[wavelink.Playable],
                           notes: dict[int, str] | None) -> dict | None:
     """_ai_pick, remembered for AI_CACHE_TTL per search text. Stored by song id, not position, so
     it still applies when the result list shifts a little (Spotify/YouTube answers vary)."""
-    key  = (_query_norm(query) or query).lower()
     ids  = [t.identifier or t.uri or t.title for t in cands]
+    key  = (_query_norm(query) or query).lower()
+    if notes:
+        # A decision shaped by one user's history must not be reused for another user.
+        key += "|" + "|".join(f"{ids[i]}={n}" for i, n in sorted(notes.items()) if i < len(ids))
     hit  = _ai_cache.get(key)
     if hit and time.time() - hit[0] < AI_CACHE_TTL and hit[1]["pick_id"] in ids:
         d = hit[1]
@@ -1686,13 +1689,15 @@ async def _connect_vc(sess: Session) -> wavelink.Player:
     if not isinstance(vc, discord.VoiceChannel):
         raise RuntimeError(f"Channel {sess.channel_id} not found or not a voice channel")
     player: wavelink.Player = guild.voice_client
-    if player and getattr(player, "channel", None) is None:
-        await _leave_voice(sess.guild_id)   # half-disconnected leftover: start clean
-        player = None
-    if player and player.channel.id == vc.id:
+    if player and getattr(player, "channel", None) is not None and player.channel.id == vc.id:
         return player
+    # Mark the session as connecting BEFORE any leave/move: the bot's own "left voice" event
+    # would otherwise look like a kick and end the session that is connecting.
     sess.connecting = True
     try:
+        if player and getattr(player, "channel", None) is None:
+            await _leave_voice(sess.guild_id)   # half-disconnected leftover: start clean
+            player = None
         if player:
             for i in range(1, VC_RETRIES + 1):
                 try:
