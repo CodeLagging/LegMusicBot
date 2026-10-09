@@ -12,6 +12,7 @@ __pycache__/
 *.pyc
 settings.json.migrated
 .main.sock
+.bot.pid
 
 # per-server config and per-user algo
 database/
