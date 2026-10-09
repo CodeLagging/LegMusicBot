@@ -1,0 +1,13 @@
+# secrets / local config
+.env
+config.json
+
+# runtime state written by the bots
+settings.json
+.worker*.sock
+.worker*_status_msg
+
+# python
+venv/
+__pycache__/
+*.pyc

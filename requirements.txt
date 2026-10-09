@@ -1,0 +1,4 @@
+discord.py[voice]>=2.3.0
+wavelink>=3.4.0
+groq>=0.9.0
+python-dotenv>=1.0.0

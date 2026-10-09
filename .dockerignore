@@ -1,0 +1,4 @@
+config.json
+dockerfile
+__pycache__/
+venv/
