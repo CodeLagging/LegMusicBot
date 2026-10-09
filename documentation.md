@@ -111,7 +111,7 @@ When playback is started with a private command (`P_EPH`, `PL_EPH` or `AP_EPH` o
 | `/control [worker]` | Controller (or anyone in "All" mode), devs | Opens the playback control panel. |
 | `/hctest` | Anyone | Health check of the controller and every worker. |
 | `/settings` | Manage Server or dev | Opens the per-server settings panel (only you can use it). |
-| `/reset-algo` | Anyone (only themselves) | Deletes your own saved songs and search memory on this server, after a confirm button. There is no way to reset someone else's. Works in any channel; always private. |
+| `/reset-algo` | Anyone (only themselves) | Opens your algo menu: all your saved songs on this server (25 per page, best first). Select songs to remove (🟠 Remove selected) or 🗑️ Reset all; both ask for confirmation, and the remove confirmation lists the exact songs. Selections are by song, not position. There is no way to see or change someone else's. Works in any channel; always private. |
 | `/purge [limit]` | Manage Messages or dev | Deletes bot messages among the last `limit` (1–100, default 20) messages in the channel. |
 
 The `worker` option forces a specific worker (0 = automatic). It is needed to use a worker fixed to a channel you are not in.
@@ -122,6 +122,8 @@ The `worker` option forces a specific worker (0 = automatic). It is needed to us
 |---|---|
 | 0 | ⏪ 10s, ⏪ 5s, ⏩ 5s, ⏩ 10s, 🔁 Loop |
 | 1 | ⏮ Backward (restart track), ⏸/▶ Pause/Play, ⏹ Stop, ⏭ Skip, 🔇 Mute (hides now-playing messages) |
+
+The panel **updates itself** every 8 s when the song, queue or a setting changes (keeping your page and selection), and shows "Playback ended" when the session stops.
 | 2 | Queue dropdown (25 per page; 🎲 marks autoplay picks) |
 | 3 | ⏭ Jump To, 🗑 Remove, ✖ Clear selection, 🎲 Autoplay, 🔒 Control: Me / 🔓 Control: All |
 | 4 | 🎚️ Normalize (evens out loud and quiet songs; default off; also applies to the shutdown message), then page buttons for queues longer than one page |
@@ -461,6 +463,12 @@ The panel (15 minute timeout). Rows as in section 3.
 
 **`async def _build_control_view(worker, guild_id, page=0, selected_idx=None)`**
 Fetches `get_queue`, stores the session snapshot, clamps the page, drops a selection that no longer exists, builds the view, colours the Mute/Loop buttons and builds the "Playback Controls — Worker N" embed (current track, flags, queue range, and who controls it).
+
+**`class AlgoMenuView`**, **`class AlgoConfirmView`**, **`async def slash_reset_algo(interaction)`**
+`/reset-algo`: the algo menu (dropdown of saved songs by `track_key`, page buttons, 🗑️ Reset all, 🟠 Remove selected, Cancel) and its confirm step (Yes / Back). Only the person who opened it can use it. After removing, the menu reopens with the updated list; workers drop their cached copy of the user's history (`forget_user`).
+
+**`class PanelState`**, **`async def _panel_autorefresh(state)`**
+An open panel's message and newest view; every `PANEL_REFRESH` (8 s) the panel is rebuilt and edited only if what it shows changed (`view.sig`). Stops after 14 minutes (Discord's edit limit for interaction messages) or when the session ends.
 
 **`async def _refresh_control_panel(interaction, ctrl, page=0, selected_idx=None)`**
 Rebuilds the panel and edits the message in place. Errors are only logged.
@@ -858,6 +866,9 @@ Search memory: +1 listen or +1 skip for (user, search text, song). Capped at a q
 **`def user_queries(guild_id, user_id)`**, **`def user_query_count(guild_id, user_id)`**
 A user's search memory / its size.
 
+**`def remove_user_tracks(guild_id, user_id, keys)`**
+Algo menu "Remove selected": deletes those songs (and the user's search memory for them) for one user only.
+
 **`def reset_user(guild_id, user_id)`**
 `/reset-algo`: deletes one user's saved songs and search memory on one server; returns the counts.
 
@@ -943,7 +954,8 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `URL_CACHE_TTL` | worker.py | 3600 s | How long a resolved stream URL is reused. |
 | `MAX_RESOLVE_ATTEMPTS` | worker.py | 2 | Candidates tried per play before handing the original to Lavalink. |
 | `MAX_FAIL_STREAK` | worker.py | 3 | Failed tracks in a row before the worker stops and reports. |
-| `POP_CHECK` | worker.py | 4 | Candidates whose YouTube views/likes are looked up per search. |
+| `POP_CHECK` | worker.py | 3 | Candidates whose YouTube views/likes are looked up per search (each is a YouTube request). |
+| `META_CACHE_TTL` | worker.py | 24 h | How long views/likes are reused (fewer requests, less bot-checking by YouTube). |
 | `POP_VIEW_W`, `POP_LIKE_W` | worker.py | 8, 4 | Popularity points per 10× views / likes. |
 | `SP_MIN_COVERAGE` | worker.py | 0.5 | Share of the query's words a Spotify match must contain to be used. |
 | `PLAY_COUNT_MS` | worker.py | 30 s | Listening time for a song to count as a listen. |
@@ -970,6 +982,7 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `.worker<N>.sock` | worker | Socket the controller uses to talk to worker N. |
 | `.main.sock` | controller | Socket the workers send state events to. |
 | `shutdown.mp3` | you | Message played before a restart (optional). |
+| `youtube_cookies.txt` | you | Optional YouTube cookies (Netscape format) for yt-dlp, for when YouTube answers "Sign in to confirm you're not a bot". Git-ignored. |
 | `launcher.py` | repo | systemd entry point that makes restart/stop return immediately (section 11). |
 | `.bot.pid` | controller | PID of the running bot, so a new launcher can wait for an old one still finishing. |
 | `settings.json.migrated` | controller | The old single-server settings after their one-time import. |

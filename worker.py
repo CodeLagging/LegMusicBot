@@ -52,7 +52,9 @@ URL_CACHE_TTL        = 3600
 MAX_RESOLVE_ATTEMPTS = 2
 MAX_FAIL_STREAK      = 3
 
-POP_CHECK       = 4      # top candidates whose YouTube views/likes are looked up
+POP_CHECK       = 3      # top candidates whose YouTube views/likes are looked up (each is a YouTube request)
+META_CACHE_TTL  = 24 * 3600   # views/likes barely change; fewer requests = less bot-checking by YouTube
+YTDLP_COOKIES   = SCRIPT_DIR / "youtube_cookies.txt"   # optional; helps when YouTube asks "confirm you're not a bot"
 POP_VIEW_W      = 8      # popularity points per 10x views
 POP_LIKE_W      = 4      # popularity points per 10x likes
 SP_MIN_COVERAGE = 0.5    # share of the query's words a Spotify match must contain
@@ -687,10 +689,15 @@ def _bg(fn, *args) -> None:
 _url_cache: dict[str, tuple[float, str]] = {}
 _inflight: dict[str, asyncio.Future] = {}
 
+def _ytdlp_auth() -> list[str]:
+    """--cookies when youtube_cookies.txt exists (export from a logged-in browser, ideally a spare
+    account). YouTube's bot check ("Sign in to confirm you're not a bot") targets the server's IP."""
+    return ["--cookies", str(YTDLP_COOKIES)] if YTDLP_COOKIES.exists() else []
+
 async def _ytdlp_run(video_url: str) -> str | None:
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "yt_dlp",
+            sys.executable, "-m", "yt_dlp", *_ytdlp_auth(),
             "-g", "-f", "bestaudio/best",
             "--no-playlist", "--no-warnings", "--socket-timeout", "10",
             video_url,
@@ -745,7 +752,7 @@ _meta_inflight: dict[str, asyncio.Future] = {}
 async def _ytdlp_meta_run(video_url: str) -> dict | None:
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "yt_dlp",
+            sys.executable, "-m", "yt_dlp", *_ytdlp_auth(),
             "-j", "-f", "bestaudio/best",
             "--no-playlist", "--no-warnings", "--socket-timeout", "10",
             video_url,
@@ -775,7 +782,7 @@ async def _yt_meta(video_url: str) -> dict | None:
     """Views, likes and the direct stream URL of a YouTube video in one yt-dlp call.
     The stream URL goes into the resolver cache, so the winning track starts without a second lookup."""
     hit = _meta_cache.get(video_url)
-    if hit and time.time() - hit[0] < URL_CACHE_TTL:
+    if hit and time.time() - hit[0] < META_CACHE_TTL:
         return hit[1]
     fut = _meta_inflight.get(video_url)
     if fut is None:
@@ -786,9 +793,10 @@ async def _yt_meta(video_url: str) -> dict | None:
     finally:
         if _meta_inflight.get(video_url) is fut:
             _meta_inflight.pop(video_url, None)
-    _meta_cache[video_url] = (time.time(), meta)
-    if len(_meta_cache) > 300:
-        for k, _ in sorted(_meta_cache.items(), key=lambda kv: kv[1][0])[:100]:
+    if meta:   # a failed lookup (e.g. YouTube's bot check) is retried next time, not cached
+        _meta_cache[video_url] = (time.time(), meta)
+    if len(_meta_cache) > 2000:
+        for k, _ in sorted(_meta_cache.items(), key=lambda kv: kv[1][0])[:500]:
             _meta_cache.pop(k, None)
     if meta and meta.get("url"):
         _url_cache[video_url] = (time.time(), meta["url"])

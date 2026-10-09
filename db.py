@@ -214,6 +214,19 @@ def reset_user(guild_id: int, user_id: int) -> tuple[int, int]:
         queries = con.execute("DELETE FROM user_queries WHERE user_id = ?", (user_id,)).rowcount
     return songs, queries
 
+def remove_user_tracks(guild_id: int, user_id: int, keys: list[str]) -> int:
+    """Remove chosen songs from one user's algo (and their search memory for those songs)."""
+    if not keys or not (ALGO_DIR / f"{int(guild_id)}.db").exists():
+        return 0
+    with _algo_con(guild_id) as con:
+        removed = 0
+        for k in keys:
+            removed += con.execute("DELETE FROM user_tracks WHERE user_id = ? AND track_key = ?",
+                                   (user_id, k)).rowcount
+            con.execute("DELETE FROM user_queries WHERE user_id = ? AND (track_key = ? OR yt_id = ?)",
+                        (user_id, k, k))
+    return removed
+
 def user_query_count(guild_id: int, user_id: int) -> int:
     if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
         return 0

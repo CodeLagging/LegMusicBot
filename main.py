@@ -1116,6 +1116,8 @@ class ControlView(discord.ui.View):
         self._mode           = mode
         self._selected_qid   = selected_qid
         self._normalize      = normalize
+        self.state: PanelState | None = None
+        self.sig = None
 
         total_pages = max(1, -(-len(queue) // PAGE_SIZE))
 
@@ -1215,9 +1217,27 @@ class ControlView(discord.ui.View):
     async def btn_mute(self, i, _): await self._dispatch(i, "toggle_mute")
 
 
+PANEL_REFRESH = 8.0   # seconds between automatic /control panel updates
+
+class PanelState:
+    """One open /control panel: the message, its newest view and what it last showed, so it can
+    redraw itself when the song or queue changes (not only when a button is pressed)."""
+    def __init__(self, worker: "WorkerProcess", guild_id: int):
+        self.worker   = worker
+        self.guild_id = guild_id
+        self.message  = None
+        self.view: "ControlView | None" = None
+        self.sig      = None
+
+    def show(self, view: "ControlView") -> None:
+        if self.view is not None and self.view is not view:
+            self.view.stop()
+        self.view, self.sig = view, view.sig
+
 async def _build_control_view(worker: WorkerProcess, guild_id: int,
                                page: int = 0,
-                               selected_qid: int | None = None) -> tuple[discord.Embed, ControlView]:
+                               selected_qid: int | None = None,
+                               state: PanelState | None = None) -> tuple[discord.Embed, ControlView]:
     resp = await worker.send({"op": "get_queue", "guild_id": guild_id}, timeout=10.0)
     ok             = resp.get("status") == "ok"
     queue: list[dict] = resp.get("queue", []) if ok else []
@@ -1243,6 +1263,9 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
 
     view  = ControlView(worker, guild_id, queue, current_title,
                         page, muted, loop, autoplay, mode, selected_qid, normalize)
+    view.state = state
+    view.sig   = (current_title, tuple(q["qid"] for q in queue), muted, loop, autoplay, normalize,
+                  mode, controller)
 
 
     for child in view.children:
@@ -1280,10 +1303,40 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
 async def _refresh_control_panel(interaction: discord.Interaction, ctrl: ControlView,
                                  page: int = 0, selected_qid: int | None = None):
     try:
-        embed, view = await _build_control_view(ctrl.worker, ctrl.guild_id, page, selected_qid)
+        embed, view = await _build_control_view(ctrl.worker, ctrl.guild_id, page, selected_qid, ctrl.state)
         await interaction.edit_original_response(embed=embed, view=view)
+        if ctrl.state:
+            ctrl.state.show(view)
     except Exception as exc:
         print(f"[Main] Control panel refresh failed: {exc}", flush=True)
+
+async def _panel_autorefresh(state: PanelState) -> None:
+    """Keep an open panel in sync with playback. Interaction messages can only be edited for
+    15 minutes, which is also how long the panel's buttons work."""
+    deadline = time.monotonic() + 14 * 60
+    while time.monotonic() < deadline:
+        await asyncio.sleep(PANEL_REFRESH)
+        view = state.view
+        if view is None or view._stopped or view.is_finished():
+            return
+        try:
+            if not state.worker.session(state.guild_id):
+                for child in view.children:
+                    child.disabled = True
+                await state.message.edit(embed=_simple_embed("⏹️  Playback ended — use /play or /control again",
+                                                            discord.Colour.dark_grey()), view=view)
+                view.stop()
+                return
+            embed, new = await _build_control_view(state.worker, state.guild_id, view._queue_page,
+                                                   view._selected_qid, state)
+            if new.sig == state.sig:
+                new.stop()
+                continue
+            await state.message.edit(embed=embed, view=new)
+            state.show(new)
+        except Exception as exc:
+            print(f"[Main] Control panel auto-refresh stopped: {exc}", flush=True)
+            return
 
 
 @main_bot.tree.command(name="control", description="Open playback control panel")
@@ -1295,8 +1348,11 @@ async def slash_control(interaction: discord.Interaction, worker: int = 0):
     pick = await _pick_for_control(interaction, worker)
     if pick is None: return
     w, _s = pick
-    embed, view = await _build_control_view(w, interaction.guild_id, page=0)
-    await interaction.followup.send(embed=embed, view=view, ephemeral=eph)
+    state = PanelState(w, interaction.guild_id)
+    embed, view = await _build_control_view(w, interaction.guild_id, page=0, state=state)
+    state.message = await interaction.followup.send(embed=embed, view=view, ephemeral=eph, wait=True)
+    state.show(view)
+    asyncio.create_task(_panel_autorefresh(state))
 
 
 @main_bot.tree.command(name="hctest", description="Health check — tests all systems")
@@ -1533,40 +1589,173 @@ async def slash_settings(interaction: discord.Interaction):
         ephemeral=True)
 
 
-class ResetAlgoView(discord.ui.View):
-    """Confirm step for /reset-algo. Only the person who ran it can press the buttons,
-    and it only ever deletes that person's own data on this server."""
-    def __init__(self, user_id: int, guild_id: int):
-        super().__init__(timeout=120)
-        self.user_id  = user_id
-        self.guild_id = guild_id
+ALGO_PAGE = 25
+
+async def _forget_on_workers(guild_id: int, user_id: int) -> None:
+    await asyncio.gather(*[w.send({"op": "forget_user", "guild_id": guild_id, "user_id": user_id}, timeout=5.0)
+                           for w in _workers.values()], return_exceptions=True)
+
+def _algo_embed(rows: list[dict], page: int, selected: dict[str, str], queries: int,
+                note: str | None = None) -> discord.Embed:
+    pages = max(1, -(-len(rows) // ALGO_PAGE))
+    start = page * ALGO_PAGE
+    lines = [note, ""] if note else []
+    lines.append(f"**{len(rows)}** saved song(s) and **{queries}** search memor{'y' if queries == 1 else 'ies'} "
+                 "on this server. Only you can see and change this.")
+    lines.append("Pick songs in the menu to remove them, or reset everything.\n")
+    for i, r in enumerate(rows[start:start + ALGO_PAGE], start=start + 1):
+        mark = "🟠 " if r["track_key"] in selected else ""
+        skips = f", {r['skips']} skip(s)" if r["skips"] else ""
+        lines.append(f"{mark}`#{i}` **{_truncate(r['title'] or '?', 50)}** — {_truncate(r['author'] or '?', 30)}"
+                     f" · {r['plays']} play(s){skips}")
+    if selected:
+        lines.append(f"\n🟠 **{len(selected)}** selected")
+    embed = discord.Embed(title="🎵  Your algo", description="\n".join(lines)[:4000], colour=COLOUR)
+    if pages > 1:
+        embed.set_footer(text=f"Page {page + 1} / {pages}")
+    return embed
+
+
+class AlgoMenuView(discord.ui.View):
+    """/reset-algo: your saved songs, like /control's queue list. Select songs to remove them
+    (by song key, never by position), or reset everything. Every delete asks for confirmation."""
+
+    def __init__(self, user_id: int, guild_id: int, rows: list[dict], queries: int,
+                 page: int = 0, selected: dict[str, str] | None = None):
+        super().__init__(timeout=600)
+        self.user_id, self.guild_id = user_id, guild_id
+        self.rows, self.queries     = rows, queries
+        self.pages    = max(1, -(-len(rows) // ALGO_PAGE))
+        self.page     = max(0, min(page, self.pages - 1))
+        self.selected = dict(selected or {})   # track_key -> "title — artist"
+
+        page_rows = rows[self.page * ALGO_PAGE:(self.page + 1) * ALGO_PAGE]
+        if page_rows:
+            pick = discord.ui.Select(
+                placeholder="Select songs to remove…", min_values=0, max_values=len(page_rows), row=0,
+                options=[discord.SelectOption(
+                    label=_truncate(f"#{self.page * ALGO_PAGE + i + 1}  {r['title'] or '?'}", 100),
+                    description=_truncate(f"{r['author'] or '?'} · {r['plays']} play(s)", 100),
+                    value=r["track_key"], default=r["track_key"] in self.selected)
+                    for i, r in enumerate(page_rows)])
+            pick.callback = self._on_pick
+            self.pick = pick
+            self.add_item(pick)
+        if self.pages > 1:
+            prev = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=1,
+                                     disabled=self.page == 0)
+            nxt  = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=1,
+                                     disabled=self.page >= self.pages - 1)
+            prev.callback = lambda i: self._goto(i, self.page - 1)
+            nxt.callback  = lambda i: self._goto(i, self.page + 1)
+            self.add_item(prev)
+            self.add_item(discord.ui.Button(label=f"Page {self.page + 1} / {self.pages}", disabled=True,
+                                            style=discord.ButtonStyle.secondary, row=1))
+            self.add_item(nxt)
+        # Discord buttons can't be orange: "remove" is blurple with an orange marker.
+        reset  = discord.ui.Button(label="Reset all", emoji="🗑️", style=discord.ButtonStyle.danger, row=2)
+        remove = discord.ui.Button(label=f"Remove selected ({len(self.selected)})", emoji="🟠",
+                                   style=discord.ButtonStyle.primary, row=2, disabled=not self.selected)
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, row=2)
+        reset.callback, remove.callback, cancel.callback = self._on_reset, self._on_remove, self._on_cancel
+        for b in (reset, remove, cancel):
+            self.add_item(b)
+
+    def embed(self, note: str | None = None) -> discord.Embed:
+        return _algo_embed(self.rows, self.page, self.selected, self.queries, note)
+
+    def again(self, page: int | None = None) -> "AlgoMenuView":
+        return AlgoMenuView(self.user_id, self.guild_id, self.rows, self.queries,
+                            self.page if page is None else page, self.selected)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.user_id:
             return True
-        await interaction.response.send_message(embed=_err_embed("This isn't your reset"), ephemeral=True)
+        await interaction.response.send_message(embed=_err_embed("This isn't your algo"), ephemeral=True)
         return False
 
-    @discord.ui.button(label="Delete my algo", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, _):
-        songs, queries = await asyncio.to_thread(db.reset_user, self.guild_id, self.user_id)
-        await asyncio.gather(*[w.send({"op": "forget_user", "guild_id": self.guild_id, "user_id": self.user_id},
-                                      timeout=5.0) for w in _workers.values()], return_exceptions=True)
+    async def _goto(self, interaction: discord.Interaction, page: int):
+        view = self.again(page)
+        self.stop()
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        on_page = {r["track_key"]: r for r in self.rows[self.page * ALGO_PAGE:(self.page + 1) * ALGO_PAGE]}
+        for k in on_page:
+            self.selected.pop(k, None)
+        for k in self.pick.values:
+            r = on_page[k]
+            self.selected[k] = f"{r['title'] or '?'} — {r['author'] or '?'}"
+        await self._goto(interaction, self.page)
+
+    async def _on_reset(self, interaction: discord.Interaction):
+        confirm = AlgoConfirmView(self, "all")
         self.stop()
         await interaction.response.edit_message(embed=discord.Embed(
-            title="🗑️  Your algo was reset",
-            description=f"Deleted {songs} saved song(s) and {queries} search memor{'y' if queries == 1 else 'ies'} "
-                        "on this server. Searches and autoplay start fresh from your next listens.",
-            colour=discord.Colour.orange()), view=None)
+            title="Reset your whole algo?",
+            description=f"This deletes **all {len(self.rows)}** of your saved songs and your search memory on "
+                        "this server. Searches and autoplay stop being personalised until you listen again. "
+                        "This can't be undone.", colour=discord.Colour.red()), view=confirm)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, _):
+    async def _on_remove(self, interaction: discord.Interaction):
+        names = list(self.selected.values())
+        shown = "\n".join(f"• {_truncate(n, 80)}" for n in names[:20])
+        more  = f"\n…and {len(names) - 20} more" if len(names) > 20 else ""
+        confirm = AlgoConfirmView(self, "remove")
         self.stop()
-        await interaction.response.edit_message(
-            embed=_simple_embed("Nothing was deleted", COLOUR), view=None)
+        await interaction.response.edit_message(embed=discord.Embed(
+            title=f"Remove {len(names)} song(s) from your algo?",
+            description=f"{shown}{more}\n\nOnly these songs are removed. This can't be undone.",
+            colour=discord.Colour.orange()), view=confirm)
+
+    async def _on_cancel(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(embed=_simple_embed("No changes made", COLOUR), view=None)
 
 
-@main_bot.tree.command(name="reset-algo", description="Delete your own saved songs and search memory on this server")
+class AlgoConfirmView(discord.ui.View):
+    """Second step for every delete in the algo menu."""
+
+    def __init__(self, menu: AlgoMenuView, action: str):
+        super().__init__(timeout=120)
+        self.menu, self.action = menu, action
+        label = "Yes, delete everything" if action == "all" else f"Yes, remove {len(menu.selected)}"
+        yes  = discord.ui.Button(label=label, style=discord.ButtonStyle.danger)
+        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary)
+        yes.callback, back.callback = self._on_yes, self._on_back
+        self.add_item(yes)
+        self.add_item(back)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.menu.interaction_check(interaction)
+
+    async def _on_back(self, interaction: discord.Interaction):
+        view = self.menu.again()
+        self.stop()
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    async def _on_yes(self, interaction: discord.Interaction):
+        m = self.menu
+        self.stop()
+        if self.action == "all":
+            songs, queries = await asyncio.to_thread(db.reset_user, m.guild_id, m.user_id)
+            await _forget_on_workers(m.guild_id, m.user_id)
+            await interaction.response.edit_message(embed=discord.Embed(
+                title="🗑️  Your algo was reset",
+                description=f"Deleted {songs} saved song(s) and {queries} search memor{'y' if queries == 1 else 'ies'} "
+                            "on this server. Searches and autoplay start fresh from your next listens.",
+                colour=discord.Colour.red()), view=None)
+            return
+        removed = await asyncio.to_thread(db.remove_user_tracks, m.guild_id, m.user_id, list(m.selected))
+        await _forget_on_workers(m.guild_id, m.user_id)
+        rows    = await asyncio.to_thread(db.user_tracks, m.guild_id, m.user_id)
+        queries = await asyncio.to_thread(db.user_query_count, m.guild_id, m.user_id)
+        view = AlgoMenuView(m.user_id, m.guild_id, rows, queries, m.page)
+        await interaction.response.edit_message(embed=view.embed(f"🟠 Removed {removed} song(s) from your algo."),
+                                                view=view)
+
+
+@main_bot.tree.command(name="reset-algo", description="See your saved songs (algo) and remove some or all of them")
 async def slash_reset_algo(interaction: discord.Interaction):
     # Personal and private: works in any channel, and there is deliberately no option to target someone else.
     if not interaction.guild_id:
@@ -1576,19 +1765,14 @@ async def slash_reset_algo(interaction: discord.Interaction):
         await interaction.response.send_message(embed=_err_embed("This server is not whitelisted"), ephemeral=True)
         return
     gid, uid = interaction.guild_id, interaction.user.id
-    songs, size = await asyncio.to_thread(db.user_stats, gid, uid)
+    rows    = await asyncio.to_thread(db.user_tracks, gid, uid)
     queries = await asyncio.to_thread(db.user_query_count, gid, uid)
-    if not songs and not queries:
+    if not rows and not queries:
         await interaction.response.send_message(
             embed=_simple_embed("You have no saved algo on this server", COLOUR), ephemeral=True)
         return
-    await interaction.response.send_message(embed=discord.Embed(
-        title="Reset your algo?",
-        description=(f"This deletes **your** {songs} saved song(s) and {queries} search memor{'y' if queries == 1 else 'ies'} "
-                     f"(about {max(1, size // 1024)} KB) on this server. Other people's data isn't affected.\n"
-                     "Your searches and autoplay will stop being personalised until you listen again. "
-                     "This can't be undone."),
-        colour=discord.Colour.orange()), view=ResetAlgoView(uid, gid), ephemeral=True)
+    view = AlgoMenuView(uid, gid, rows, queries)
+    await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
 
 @main_bot.tree.command(name="purge", description="Delete the last N bot messages in this channel (default: 20)")
