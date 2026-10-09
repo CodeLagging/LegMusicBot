@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import discord
+from aiohttp import web
 from discord import app_commands
 
 import appsettings
@@ -90,6 +91,13 @@ def _migrate_legacy_settings() -> None:
 # ── worker processes ────────────────────────────────────────────────────────
 
 PENDING_TTL = 90.0   # how long a reservation made by /play survives without the worker confirming it
+
+# Graceful restart (systemctl restart/stop): finish current songs, play shutdown.mp3, then exit.
+SHUTDOWN_MP3     = SCRIPT_DIR / "shutdown.mp3"
+DRAIN_TIMEOUT    = 300.0   # after this, songs are cut and the message plays right away
+DRAIN_MESSAGE_MAX = 130.0  # extra time allowed for the message itself to play out
+_draining = False
+_force_drain: asyncio.Event | None = None
 
 class WorkerProcess:
     def __init__(self, index: int):
@@ -535,7 +543,7 @@ async def _dev_power(message: discord.Message, cmd: str, arg: str) -> None:
         embed = discord.Embed(
             title="🔄  Restarting entire service…" if restart else "🔴  Shutting down entire service…",
             description=(f"Running `systemctl {action} {SERVICE_NAME}`.\n"
-                         + ("All workers and the main controller will restart. Music will stop in every server."
+                         + ("Current songs finish (max 5 min), the shutdown message plays, then everything restarts."
                             if restart else
                             f"Everything stops until `systemctl start {SERVICE_NAME}` is run on the server.")),
             colour=COLOUR if restart else discord.Colour.red(),
@@ -606,6 +614,10 @@ async def _dev_power(message: discord.Message, cmd: str, arg: str) -> None:
 async def _guard(interaction: discord.Interaction) -> bool:
     if not interaction.guild_id:
         await interaction.response.send_message(embed=_err_embed("Server only"), ephemeral=True)
+        return False
+    if _draining:
+        await interaction.response.send_message(
+            embed=_err_embed("The music bots are restarting — try again in a few minutes"), ephemeral=True)
         return False
     if not appsettings.is_whitelisted(interaction.guild_id):
         await interaction.response.send_message(embed=_err_embed("This server is not whitelisted"), ephemeral=True)
@@ -788,7 +800,9 @@ async def _start_playback(interaction: discord.Interaction, op: str, eph_key: st
         resp = await _dispatch(interaction, {
             "op": op, "guild_id": guild_id, "channel_id": channel_id,
             "text_channel_id": _text_channel_id(interaction),
-            "user_id": interaction.user.id, **extra,
+            "user_id": interaction.user.id,
+            # Private command -> the worker won't post public "Now Playing" messages either.
+            "announce": not eph, **extra,
         }, w, eph, timeout=timeout)
     finally:
         w.pending.pop(guild_id, None)
@@ -1525,9 +1539,64 @@ async def _watch_worker(w: WorkerProcess):
             await _resync_worker(w)   # backstop in case a state event was lost
 
 
-async def _run(stop_event: asyncio.Event | None = None):
-    global _shutting_down
+async def _serve_shutdown_message():
+    """Serve shutdown.mp3 on a private localhost port so Lavalink (same machine) can stream it.
+    Returns (url, runner), or (None, None) when the file doesn't exist."""
+    if not SHUTDOWN_MP3.exists():
+        print("[Main] shutdown.mp3 not found — workers will leave without a message", flush=True)
+        return None, None
+    app = web.Application()
+    app.router.add_get("/shutdown.mp3", lambda request: web.FileResponse(SHUTDOWN_MP3))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    return f"http://127.0.0.1:{port}/shutdown.mp3", runner
 
+async def _drain_workers() -> None:
+    """Scheduled restart: every worker finishes its current song (the rest of the queue/playlist is
+    dropped), plays shutdown.mp3 and leaves. Finished workers stay blocked. Waits until all are done,
+    or DRAIN_TIMEOUT, after which remaining songs are cut and the message plays immediately."""
+    global _draining
+    _draining = True
+    live = [w for w in _ordered_workers() if not w._shutdown_requested]
+    await _resync_all()
+    if not any(w.sessions for w in live):
+        print("[Main] Nothing playing — restarting right away", flush=True)
+        return
+    url, runner = await _serve_shutdown_message()
+    try:
+        await asyncio.gather(*[w.send({"op": "drain", "message_url": url}, timeout=30.0) for w in live],
+                             return_exceptions=True)
+        print(f"[Main] Restart scheduled — waiting up to {int(DRAIN_TIMEOUT)}s for current songs to finish", flush=True)
+
+        async def still_busy() -> list[WorkerProcess]:
+            await _resync_all()
+            return [w for w in live if w.sessions]
+
+        deadline = time.monotonic() + DRAIN_TIMEOUT
+        busy = await still_busy()
+        while busy and time.monotonic() < deadline and not _force_drain.is_set():
+            await asyncio.sleep(2)
+            busy = await still_busy()
+        if busy:
+            print(f"[Main] Restart timeout — cutting songs on worker(s) {[w.index for w in busy]}", flush=True)
+            await asyncio.gather(*[w.send({"op": "drain_force"}, timeout=30.0) for w in busy],
+                                 return_exceptions=True)
+            end = time.monotonic() + DRAIN_MESSAGE_MAX
+            while busy and time.monotonic() < end:
+                await asyncio.sleep(2)
+                busy = await still_busy()
+        print("[Main] All workers finished — restarting", flush=True)
+    finally:
+        if runner:
+            await runner.cleanup()
+
+async def _run(stop_event: asyncio.Event | None = None):
+    global _shutting_down, _force_drain
+
+    _force_drain = asyncio.Event()
     _migrate_legacy_settings()
     asyncio.create_task(_event_server(), name="event_server")
 
@@ -1555,6 +1624,10 @@ async def _run(stop_event: asyncio.Event | None = None):
 
     if stop_event:
         await stop_event.wait()
+        try:
+            await _drain_workers()
+        except Exception as exc:
+            print(f"[Main] Graceful restart failed: {exc} — stopping now", flush=True)
     else:
         try:
             await main_task
@@ -1576,7 +1649,13 @@ if __name__ == "__main__":
         stop_evt = asyncio.Event()
 
         def _sig():
-            print("[Main] Signal — stopping ...", flush=True)
+            if stop_evt.is_set():
+                # A second stop signal skips the wait: songs are cut and the message plays now.
+                print("[Main] Second signal — forcing restart now", flush=True)
+                if _force_drain:
+                    loop.call_soon_threadsafe(_force_drain.set)
+                return
+            print("[Main] Signal — finishing current songs before stopping ...", flush=True)
             loop.call_soon_threadsafe(stop_evt.set)
 
         for sig in (signal.SIGINT, signal.SIGTERM):

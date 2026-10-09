@@ -93,9 +93,9 @@ def _algo_con(guild_id: int) -> sqlite3.Connection:
     return con
 
 
-def record_play(guild_id: int, user_id: int, meta: dict,
-                max_songs: int, max_kb: int) -> None:
-    """Count a listen; evict the user's most-unused songs if over the caps."""
+def record_play(guild_id: int, user_id: int, meta: dict, max_kb: int) -> None:
+    """Count a listen; if the user's saved songs go over max_kb, evict their most-unused songs.
+    There is no song-count limit: storage is the only cap."""
     key = meta.get("key")
     if not key:
         return
@@ -113,19 +113,13 @@ def record_play(guild_id: int, user_id: int, meta: dict,
             (user_id, key, meta.get("title") or "", meta.get("author") or "",
              meta.get("uri") or "", meta.get("yt_id") or "", now, now),
         )
-        _evict(con, user_id, key, max_songs, max_kb)
+        _evict(con, user_id, key, max_kb)
 
 
-def _evict(con: sqlite3.Connection, user_id: int, keep_key: str,
-           max_songs: int, max_kb: int) -> None:
+def _evict(con: sqlite3.Connection, user_id: int, keep_key: str, max_kb: int) -> None:
     # The song just played is never the one evicted, otherwise a full list could never take new songs.
     victims_sql = (f"SELECT track_key FROM user_tracks WHERE user_id = ? AND track_key != ? "
                    f"ORDER BY {_SCORE_SQL} ASC, last_played ASC LIMIT ?")
-    count = con.execute("SELECT COUNT(*) FROM user_tracks WHERE user_id = ?", (user_id,)).fetchone()[0]
-    if count > max_songs:
-        victims = [r[0] for r in con.execute(victims_sql, (user_id, keep_key, count - max_songs))]
-        con.executemany("DELETE FROM user_tracks WHERE user_id = ? AND track_key = ?",
-                        [(user_id, k) for k in victims])
     limit = max_kb * 1024
     while con.execute(f"SELECT {_SIZE_SQL} FROM user_tracks WHERE user_id = ?",
                       (user_id,)).fetchone()[0] > limit:
@@ -144,7 +138,7 @@ def record_skip(guild_id: int, user_id: int, key: str) -> None:
                     (user_id, key))
 
 
-def user_tracks(guild_id: int, user_id: int, limit: int = 200) -> list[dict]:
+def user_tracks(guild_id: int, user_id: int, limit: int = 100_000) -> list[dict]:
     """The user's saved songs, best first."""
     if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
         return []

@@ -16,7 +16,8 @@ This document explains every function, class and method of the source files, the
 8. [db.py and appsettings.py reference](#8-dbpy-and-appsettingspy-reference)
 9. [IPC operations and state events](#9-ipc-operations-and-state-events)
 10. [Tunable constants and files](#10-tunable-constants-and-files)
-11. [Deployment and service](#11-deployment-and-service)
+11. [Graceful restart](#11-graceful-restart)
+12. [Deployment and service](#12-deployment-and-service)
 
 ---
 
@@ -36,7 +37,7 @@ The system has four parts that run together on the server:
 1. A user runs `/play` in Discord. The controller checks the server is whitelisted and the control channel (`_guard`).
 2. The controller takes the pick lock, asks every worker for its real state (`sync`), and chooses a worker and voice channel (`_pick_for_play`). A new worker is *reserved* for that user before the lock is released, so two simultaneous `/play`s never get the same worker.
 3. The controller sends `search_and_play` to that worker over its Unix socket `.worker<N>.sock`, including the user id.
-4. The worker creates a session for that server (the user becomes its **controller**), searches (Spotify for clean metadata, YouTube Music for candidates), scores the candidates, connects to the voice channel and plays the best one. YouTube tracks are resolved to a direct stream URL with yt-dlp. The worker sets the voice channel status to "🎵Playing - <title>".
+4. The worker creates a session for that server (the user becomes its **controller**), searches (Spotify for clean metadata, YouTube Music for candidates), scores the candidates, connects to the voice channel and plays the best one. YouTube tracks are resolved to a direct stream URL with yt-dlp. The worker sets the voice channel status to `🎵Playing - <title>`.
 5. The worker replies with the track details and a session snapshot; the controller turns them into an embed. Later track changes are announced by the worker itself in the text channel.
 6. Whenever a session starts, changes or ends, the worker sends a `state` event to the controller over `.main.sock`, so the controller's view of who is busy stays correct even when a worker leaves on its own (idle timeout, kicked, failures).
 
@@ -67,8 +68,7 @@ Copy `server_settings.json.example` and fill it in. Behaviour keys are re-read a
 | `whitelist_enabled` | `true` | When true, the bot only works in servers listed in `whitelist`. |
 | `whitelist` | `[]` | Server ids the bot may be in. |
 | `leave_message` | "This server is not currently whitelisted, bot will not function" | Posted (with the server owner pinged) before the bot leaves a non-whitelisted server. |
-| `algo_max_songs` | `100` | Maximum saved songs per user per server. |
-| `algo_max_kb` | `256` | Maximum storage per user per server, in KB. 100 songs are about 10 KB, so normally the song limit is reached first. |
+| `algo_max_kb` | `1024` | Storage cap for one user's saved songs on one server, in KB. There is no song-count limit; a saved song takes about 100 bytes, so 1 MB is roughly 10,000 songs. |
 | `autoplay_seed_count` | `5` | How many songs autoplay looks at when choosing what to play next. |
 
 ### Per-server settings (/settings)
@@ -86,6 +86,8 @@ Stored in `database/server/servers.db`, one row per server. Change them with the
 | `HC_EPH` | false | `/hctest` replies private. |
 | `CC_EPH` | false | `/control` panel and its button feedback private. |
 | `S_EPH` | false | `/stop` replies private. |
+
+When playback is started with a private command (`P_EPH`, `PL_EPH` or `AP_EPH` on), the worker also stops posting "Now Playing" messages on track changes, and the "Playback failed" notice. Those are normal channel messages, which Discord can't make private. The current song still shows in the voice channel status and in `/control`. The setting follows the most recent play command on that worker.
 
 ### Discord permissions the bots need
 
@@ -171,9 +173,19 @@ Typed as a message wrapped in two backticks on each side. Only users in `dev_ids
 - A song counts as a **listen** once it finished or was played for at least 30 seconds (`PLAY_COUNT_MS`). The first listen adds it; later listens increase its play count.
 - A **skip in under 30 seconds** adds a skip to a song that is already saved. Unsaved songs are not added by skips.
 - Score = `plays − 0.5 × skips`.
-- When a user goes over `algo_max_songs` or `algo_max_kb`, the songs with the **lowest score** are removed first, oldest last-play breaking ties ("most unused", not "oldest"). The song that was just played is never the one removed.
+- There is no limit on the number of saved songs; only storage is capped (`algo_max_kb`). When a user goes over it, the songs with the **lowest score** are removed first, oldest last-play breaking ties ("most unused", not "oldest"). The song that was just played is never the one removed.
 - Each server has its own file `database/algo/<server id>.db`, holding every user's saved songs for that server.
 - Songs are keyed by their YouTube video id when known (stable across Spotify/YouTube lookups), else their URL.
+
+### Saved songs influence search
+
+When you `/play` something, your saved songs on that server nudge which result is picked:
+
+- A result that is an upload you have already listened to gets +25 (+2 per play, up to +10 more).
+- A result by an artist you play a lot gets up to +20 (grows with how often you play them).
+- Both stay below one matching query word (+40), so they break ties between equally good matches but never override what you searched for.
+- The AI pick is told which results you've played or whose artist you often play.
+- If you have a saved upload of the exact song that was picked, that upload is played (the one you know).
 
 ### Autoplay from /control (🎲 button)
 
@@ -472,7 +484,7 @@ One server's playback on this worker.
 |---|---|
 | `guild_id`, `channel_id` | Server and voice channel. |
 | `controller_id`, `mode` | Who started playback; `"me"` or `"all"`. |
-| `text_channel` | Where now-playing messages go. |
+| `text_channel`, `announce` | Where now-playing messages go; False when playback was started privately (no channel posts). |
 | `queue` | List of `QueueItem`s: `(track, source label, found-via, requester id)` plus a stable `qid`. |
 | `fallbacks`, `origin` | Alternate candidates per track; resolved track → original track. |
 | `skipping`, `muted`, `loop` | Skip guard, hidden now-playing messages, repeat current track. |
@@ -501,6 +513,11 @@ Asks whether the search text explicitly asks for an altered version, so a search
 
 Altered versions are only played when you ask for them: the main search checks every candidate with `_is_altered`; matching a Spotify/Apple Music song to YouTube skips uploads whose title looks altered (unless the original's does); autoplay skips them by title. Only if *every* candidate is altered does the search fall back to the best one.
 
+**`async def _ai_pick(query, cands)`**
+One AI call per search. It gets the search text and the top `AI_PICK_CANDIDATES` (8) results (title, channel, length, views) and returns JSON: `wants_altered` (did the search explicitly ask for a sped up / slowed / remix / cover … version; genre, artist, language or mood words don't count), `altered` (which results are non-original versions, including mashups, montagems and medleys) and `pick` (the result that is the song the user means). Returns None when Groq fails or times out (8 s); the search then uses the title rules.
+
+The model is a reasoning model: its thinking counts toward `max_tokens`. All Groq calls use `_GROQ_ARGS` (400 tokens, low reasoning effort). Earlier versions allowed 3 tokens, so every answer came back empty and was read as "not altered", which is why altered versions used to slip through.
+
 **`async def _groq_similar(seeds, count=5)`**
 Autoplay fallback: asks the model for `count` real songs similar to the seeds, one "Title - Artist" per line, and returns them as search queries. Errors return an empty list.
 
@@ -516,7 +533,13 @@ True for Spotify local files and other non-streamable URIs; they are skipped in 
 Lower-case and strip accents ("Tântrico" → "tantrico"); split into words of 2+ characters. All matching is accent-insensitive.
 
 **`def _track_score(track, query="", ref=None)`**
-Relevance of a search candidate. Each query word in the title +40, in the author +20. With a reference track (the Spotify match) each of its words +15 in the title or +5 in the author, and the length difference +60 (≤ 3 s), +25 (≤ 8 s) or −40 (> 20 s). "Official" +10; altered-version words −20 (`_ALTERED_QUICK`). Medleys (titles with two or more "/") −60; tracks over 10 minutes −30 unless the query asks for a mix/full/album/hour/live.
+Relevance of a search candidate. Each query word in the title +40, in the author +20. With a reference track (the Spotify match) each of its words +15 in the title or +5 in the author, and the length difference +60 (≤ 3 s), +25 (≤ 8 s) or −40 (> 20 s). "Official" +10; altered-version words −20 (`_ALTERED_QUICK`). Medleys (titles with two or more "/") −60; tracks over 10 minutes −30 unless the query asks for a mix/full/album/hour/live; mashups ("Song A x Song B") −50 and snippets ("best part") −30 unless the query has them.
+
+**`async def _taste(guild_id, user_id)`**
+The requester's saved songs summarised for searching: plays per YouTube id and per artist (cached 60 s).
+
+**`def _taste_bonus(track, taste)`**, **`def _taste_note(track, taste)`**
+The personal score boost for a result, and the note shown to the AI (section 5).
 
 **`def _popularity(meta)`**
 Popularity points from YouTube stats: `8 × log10(views + 1) + 4 × log10(likes + 1)`. About 99 for a billion-view hit, 48 for 50k views, 0 for an unwatched upload. Relevance still dominates: a song matching one fewer query word (−40) needs roughly 100× more views to win.
@@ -536,7 +559,7 @@ Sends an embed and deletes it after 10 s (`_STATUS_DELETE_DELAY`).
 Deletes a message after a delay, ignoring errors.
 
 **`async def _set_vc_status(guild_id, channel_id, title)`**
-Sets the voice channel status to "🎵Playing - <title>" (max 500 characters), or clears it with None. Needs the Set Voice Channel Status permission; failures are only logged.
+Sets the voice channel status to `🎵Playing - <title>` (max 500 characters), or clears it with None. Needs the Set Voice Channel Status permission; failures are only logged.
 
 ### Track bookkeeping
 
@@ -575,7 +598,7 @@ One `yt-dlp -j` call that returns a video's views, likes and direct stream URL. 
 Looks up `_yt_meta` for the `POP_CHECK` (4) most relevant candidates at once (skipping obviously altered titles unless you asked for one) (about 2 s on the Pi), adds `_popularity` to their relevance, logs each line (relevance + popularity = total, views, likes) and returns all candidates re-sorted.
 
 **`async def _resolve(track)`**
-Turns a track into something Lavalink can play. Spotify/Apple Music tracks are matched to the best YouTube Music result first (never to an altered upload unless the original is one); non-YouTube sources play as they are; YouTube tracks are resolved with yt-dlp. Returns `(playable, original track, YouTube track or None)` or None.
+Turns a track into something Lavalink can play. A YouTube video is tried three ways before giving up on it: the cached yt-dlp stream URL, a freshly fetched one (YouTube sometimes refuses a cached URL), then Lavalink's own YouTube plugin. Spotify/Apple Music tracks are matched to the best YouTube Music result first (never to an altered upload unless the original is one); non-YouTube sources play as they are; YouTube tracks are resolved with yt-dlp. Returns `(playable, original track, YouTube track or None)` or None.
 
 **`def _prefetch_next(sess)`**
 Resolves the next queued YouTube track in the background.
@@ -587,7 +610,7 @@ Records the playing track's real title, its algo record and requester, and adds 
 After a track starts: sets the voice channel status, cancels the idle timer, prefetches the next track, and starts an autoplay refill when autoplay is on and the queue is empty.
 
 **`async def _play(sess, player, track, requester)`**
-Plays a track, trying it and then its alternates (at most `MAX_RESOLVE_ATTEMPTS`, 2). When nothing resolves it hands the original to Lavalink anyway. Returns True when a resolved track played.
+Plays a track, trying it and then its alternates (at most `MAX_RESOLVE_ATTEMPTS`, 2). Alternates are only other uploads of the same song (`_same_song`). When nothing resolves it hands the original to Lavalink anyway. Returns the track actually playing, which is what the reply, the Now Playing message and the channel status show.
 
 **`def _account(sess, played_ms=None, finished=False, skipped=False)`**
 Feeds the outgoing track into its requester's saved songs: a listen when finished or played ≥ 30 s, a skip when skipped earlier, nothing otherwise. Writes happen in the background.
@@ -599,6 +622,9 @@ Adds a user's track ahead of any autoplay picks and returns its 1-based position
 Plays the next queued track, refilling from autoplay first when the queue is empty and autoplay is on. With nothing left it clears the voice channel status and starts the idle timer.
 
 ### Autoplay
+
+**`def _same_song(a, b)`**
+True when two results are uploads of the same song: same normalised title and either the same artist or a length within 8 s. Used to limit fallbacks, so a same-named song by someone else is never played in place of the one picked.
 
 **`def _norm_title(title)`**
 Lower-cases a title and strips brackets and words like "official", "lyrics", "video", so different uploads of the same song compare equal.
@@ -708,7 +734,7 @@ YouTube Music / SoundCloud search through Lavalink.
 First candidate the Groq filter doesn't consider altered.
 
 **`async def _search(query, source, sess)`**
-Finds the track for a query and returns `(track, source label, found-via)`. Apple Music and other URLs load directly. `sc` searches SoundCloud and prefers a non-altered result. `sp` (default) runs the Spotify lookup, the altered-version check and a YouTube Music search for the exact query at the same time; if Spotify gave a matching song, YouTube Music is also searched with its clean title/artist and both result lists are merged. `yt` skips Spotify. Candidates are ranked by relevance plus popularity (`_rank_by_popularity`) and the best non-altered one is returned (then preferred lyric channels, then the best-ranked as a fallback). An explicitly requested altered version skips the filter. Alternates are stored on the session.
+Finds the track for a query and returns `(track, source label, found-via)`. Apple Music and other URLs load directly. `sc` searches SoundCloud and prefers a non-altered result. `sp` (default) runs the Spotify lookup, the altered-version check and a YouTube Music search for the exact query at the same time; if Spotify gave a matching song, YouTube Music is also searched with its clean title/artist and both result lists are merged. `yt` skips Spotify. Candidates are ranked by relevance plus popularity (`_rank_by_popularity`), then `_ai_pick` decides. Its answer is checked: unless an altered version was asked for, results the AI or obvious title words mark as altered are never picked; and the pick must match the search about as well as the best result (relevance within 40), so a slowed version of a *different* song can't win. If the AI fails, obvious title words decide instead. Remaining allowed results become the fallbacks. Only if every result is altered does it try preferred lyric channels, then the best-ranked result. An explicitly requested altered version skips the filter. Alternates are stored on the session.
 
 **`async def _search_playlist(query, source)`**
 Loads a playlist (Apple Music, URL, SoundCloud search or Spotify search) and returns `(playable tracks, name, source label, skipped local files)`.
@@ -756,16 +782,16 @@ True when the server has stored settings.
 **`def _algo_con(guild_id)`**
 Opens `database/algo/<guild_id>.db` and creates the `user_tracks` table (`user_id`, `track_key`, `title`, `author`, `uri`, `yt_id`, `plays`, `skips`, `last_played`, `added_at`; one row per user and song).
 
-**`def record_play(guild_id, user_id, meta, max_songs, max_kb)`**
+**`def record_play(guild_id, user_id, meta, max_kb)`**
 Adds a listen (inserting the song with 1 play, or +1 play and refreshing its details), then evicts.
 
-**`def _evict(con, user_id, keep_key, max_songs, max_kb)`**
-Removes the user's lowest-score songs (oldest play breaks ties) until they are within the song count and size limits, never removing `keep_key`.
+**`def _evict(con, user_id, keep_key, max_kb)`**
+Removes the user's lowest-score songs (oldest play breaks ties) until they are within the storage cap, never removing `keep_key`. There is no song-count limit.
 
 **`def record_skip(guild_id, user_id, key)`**
 +1 skip on a saved song; does nothing for unsaved songs.
 
-**`def user_tracks(guild_id, user_id, limit=200)`**
+**`def user_tracks(guild_id, user_id, limit=100000)`**
 The user's saved songs, best score first, with a `score` field.
 
 **`def user_stats(guild_id, user_id)`**
@@ -813,6 +839,8 @@ The controller sends one JSON object per connection to `.worker<N>.sock`, with `
 | `set_mode` | Sets `mode` to `me` or `all`. | `mode_me` or `mode_all`, `session` |
 | `jump_to` | Records a listen or quick skip for the current track, drops the queue up to the song with `qid` and plays it. Error if it already played or was removed. | `jumped` with `title`, `author`, `queue_remaining` |
 | `shutdown_graceful` | Ends every session, replies, then exits. | `shutdown_graceful` |
+| `drain` | Graceful restart: blocks new playback; each session finishes its song, plays the message at `message_url` and leaves. | `draining` with `remaining` |
+| `drain_force` | Restart timeout: cuts songs still playing and plays the message now. | `forced` with `remaining` |
 
 Session operations on a server where the worker has no session reply "Nothing playing.". Any other op returns "Unknown op".
 
@@ -833,6 +861,9 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | Name | File | Value | Meaning |
 |---|---|---|---|
 | `SERVICE_NAME` | main.py | `SERVER_musicbots` | systemd unit used by ``restart full`` / ``shutdown full``. |
+| `DRAIN_TIMEOUT` | main.py | 300 s | Graceful restart: longest wait for current songs before they are cut. |
+| `DRAIN_MESSAGE_MAX` | main.py | 130 s | Graceful restart: extra wait for the shutdown messages after the timeout. |
+| `SHUTDOWN_MESSAGE_MAX` | worker.py | 120 s | A worker leaves this long after starting the message, even if it never reports finishing. |
 | `PENDING_TTL` | main.py | 90 s | How long a `/play` reservation holds a worker without confirmation. |
 | `PAGE_SIZE` | main.py | 25 | Queue entries per dropdown page (Discord limit). |
 | ControlView timeout | main.py | 900 s | Control panel buttons stop working after 15 minutes. |
@@ -851,6 +882,8 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `AUTOPLAY_BATCH` | worker.py | 2 | Autoplay picks queued per refill. |
 | `ALGO_DIRECT_CHANCE` | worker.py | 0.3 | `/autoplay`: chance of replaying a saved song instead of a related one. |
 | `_STATUS_DELETE_DELAY` | worker.py | 10 s | Lifetime of the now-playing messages. |
+| `AI_PICK_CANDIDATES` | worker.py | 8 | Search results shown to the AI per search. |
+| `_GROQ_ARGS` | worker.py | 400 tokens, low reasoning | Settings for every Groq call (the AI pick allows 1200 tokens). |
 
 | File | Created by | Purpose |
 |---|---|---|
@@ -861,13 +894,41 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `database/algo/<server id>.db` | workers | Every user's saved songs for that server. |
 | `.worker<N>.sock` | worker | Socket the controller uses to talk to worker N. |
 | `.main.sock` | controller | Socket the workers send state events to. |
+| `shutdown.mp3` | you | Message played before a restart (optional). |
 | `settings.json.migrated` | controller | The old single-server settings after their one-time import. |
 
 To reset a server's settings, delete its row from `servers.db` (or the whole file to reset every server). To forget everyone's saved songs on a server, delete `database/algo/<server id>.db`.
 
 ---
 
-## 11. Deployment and service
+## 11. Graceful restart
+
+`systemctl restart SERVER_musicbots` (and ``restart full``) or `systemctl stop` (``shutdown full``) no longer cut the music:
+
+1. systemd sends the stop signal to the **main bot only** (`KillMode=mixed`).
+2. The main bot blocks new commands ("restarting — try again in a few minutes") and sends `drain` to every worker. A worker that is draining refuses new playback ("hard block"), even after its own song finished.
+3. Each worker, per server:
+   - a song is playing → it finishes **that song**; the rest of the queue/playlist and autoplay are dropped;
+   - paused or between songs → the message plays right away;
+   - nobody in the voice channel → it leaves without a message.
+4. After the song, the worker plays **`shutdown.mp3`** (next to `main.py`) and leaves when it ends (at most 2 minutes). Without the file, it just leaves.
+5. The main bot waits until **every** worker is done, or `DRAIN_TIMEOUT` (5 minutes). At the timeout, songs still playing are cut and the message plays immediately (`drain_force`); then it waits for those messages.
+6. Everything exits and systemd starts it again (restart) or leaves it stopped (stop).
+
+A second stop signal (e.g. running `systemctl kill SERVER_musicbots` while it waits) skips the wait and goes straight to step 5. If nothing is playing, it restarts immediately.
+
+The message is served to Lavalink over a private `http://127.0.0.1:<random port>/shutdown.mp3` by the main bot, so Lavalink must run on the same machine (its `http` source is enabled; its `local` file source is not needed).
+
+Required service settings (in `/etc/systemd/system/SERVER_musicbots.service`):
+
+```ini
+KillMode=mixed
+TimeoutStopSec=480
+```
+
+`TimeoutStopSec` must be longer than the 5-minute wait plus the message, otherwise systemd kills everything before it's done.
+
+## 12. Deployment and service
 
 The service file is `/etc/systemd/system/SERVER_musicbots.service`. It runs `venv/bin/python main.py --server` from `/home/jared/servers/musicbot_updated`, after `SERVER_lavalink`. A backup of the version that pointed at the old folder is at `~/servers/SERVER_musicbots.service.bak`.
 

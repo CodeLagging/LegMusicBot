@@ -17,7 +17,6 @@
     123456789012345678
   ],
   "leave_message": "This server is not currently whitelisted, bot will not function",
-  "algo_max_songs": 100,
-  "algo_max_kb": 256,
+  "algo_max_kb": 1024,
   "autoplay_seed_count": 5
 }

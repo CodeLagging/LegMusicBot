@@ -17,8 +17,7 @@ DEFAULTS: dict = {
     "whitelist_enabled": True,
     "whitelist": [],
     "leave_message": "This server is not currently whitelisted, bot will not function",
-    "algo_max_songs": 100,
-    "algo_max_kb": 256,
+    "algo_max_kb": 1024,       # per user per server; about 100 bytes per saved song
     "autoplay_seed_count": 5,
 }
 

@@ -65,7 +65,11 @@ ALGO_DIRECT_CHANCE = 0.3   # /autoplay: chance to replay a saved song instead of
 
 _groq         = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
 _GROQ_MODEL   = "openai/gpt-oss-20b"
-_GROQ_TIMEOUT = 4.0
+_GROQ_TIMEOUT = 6.0
+# gpt-oss is a reasoning model: it thinks before answering, and the thinking counts toward
+# max_tokens. With a tiny limit the answer comes back empty, so leave room and keep thinking short.
+_GROQ_ARGS = {"max_tokens": 400, "temperature": 0, "extra_body": {"reasoning_effort": "low"}}
+AI_PICK_CANDIDATES = 8   # candidates shown to the AI per search
 
 
 _OFFICIAL_RE = re.compile(
@@ -76,7 +80,7 @@ _OFFICIAL_RE = re.compile(
 _ALTERED_QUICK = re.compile(
     r"\b(sped[\s_-]*up|slowed|reverb|nightcore|daycore|lofi|lo[\s_-]*fi|"
     r"bass[\s_-]*boost|8d|cover|acoustic|piano|karaoke|instrumental|remix|"
-    r"mashup|bootleg|extended|phonk|trap|tiktok)\b",
+    r"mashup|bootleg|extended|phonk|trap|tiktok|ultra[\s_-]*speed|speed[\s_-]*up)\b",
     re.IGNORECASE,
 )
 
@@ -84,7 +88,7 @@ _ALTERED_QUICK = re.compile(
 # so a Groq timeout can't filter out a version the user asked for by name.
 _ALTERED_ASK = re.compile(
     r"\b(sped[\s_-]*up|slowed|reverb|nightcore|daycore|8d|bass[\s_-]*boost(?:ed)?|"
-    r"lo[\s_-]*fi|remix|cover|karaoke|instrumental|mashup|tiktok)\b",
+    r"lo[\s_-]*fi|remix|cover|karaoke|instrumental|mashup|tiktok|ultra[\s_-]*speed|speed[\s_-]*up)\b",
     re.IGNORECASE,
 )
 
@@ -121,14 +125,18 @@ async def _is_altered(title: str) -> bool:
                     {"role": "system", "content": _ALTERED_SYSTEM},
                     {"role": "user",   "content": f'Song title: "{title}"'},
                 ],
-                max_tokens=3, temperature=0,
+                **_GROQ_ARGS,
             ),
             timeout=_GROQ_TIMEOUT,
         )
-        return r.choices[0].message.content.strip().lower().startswith("yes")
+        answer = (r.choices[0].message.content or "").strip().lower()
+        if not answer:
+            raise RuntimeError("empty answer")
+        return answer.startswith("yes")
     except Exception as exc:
-        print(f"[Worker {BOT_INDEX}] Groq error ({title!r}): {exc} — assuming clean", flush=True)
-        return False
+        # Fall back to the title rules instead of assuming every title is clean.
+        print(f"[Worker {BOT_INDEX}] Groq error ({title!r}): {exc} — using title rules", flush=True)
+        return bool(_ALTERED_QUICK.search(title or ""))
 
 async def _user_wants_altered(query: str) -> bool:
     try:
@@ -143,14 +151,69 @@ async def _user_wants_altered(query: str) -> bool:
                         "Respond with EXACTLY one word: yes or no."},
                     {"role": "user", "content": f'Search query: "{query}"'},
                 ],
-                max_tokens=3, temperature=0,
+                **_GROQ_ARGS,
             ),
             timeout=_GROQ_TIMEOUT,
         )
-        return r.choices[0].message.content.strip().lower().startswith("yes")
+        answer = (r.choices[0].message.content or "").strip().lower()
+        if not answer:
+            raise RuntimeError("empty answer")
+        return answer.startswith("yes")
     except Exception as exc:
-        print(f"[Worker {BOT_INDEX}] Groq query-check error: {exc} — assuming not altered", flush=True)
-        return False
+        print(f"[Worker {BOT_INDEX}] Groq query-check error: {exc} — using title rules", flush=True)
+        return bool(_ALTERED_ASK.search(query or ""))
+
+_PICK_SYSTEM = """You pick which search result to play for a music bot.
+
+You get the user's search and numbered YouTube Music results (title, channel, length, views if known).
+Answer with JSON only: {"wants_altered": true/false, "altered": [numbers], "pick": number}
+
+- wants_altered: true ONLY if the search explicitly asks for a non-original version: sped up, slowed,
+  reverb, nightcore, daycore, 8D, bass boosted, lofi, remix, cover, karaoke, instrumental, acoustic,
+  live, mashup, edit/montagem of the song, etc. Genre words (phonk, funk, trap, pop, rock), artist
+  names, language or mood words are NOT a request for an altered version.
+- altered: every result that is a non-original version (any of the above, also "ultra speed",
+  "super slowed", AI covers, fan edits, montagem/mashups of the song, compilations, medleys).
+  Official remixes by the original artist, remasters, radio edits and official lyric/audio videos
+  are NOT altered.
+- pick: the result that is the song the user most likely means. It MUST be the same song as searched
+  (same song title) — never a different song that merely shares a word like "slowed" or "remix".
+  If wants_altered is false, never pick an altered result; prefer the original studio recording by the original artist, and among equal
+  matches the official upload with more views. If wants_altered is true, pick the version they asked for.
+  When results match the search equally well, prefer ones noted as played by the user / by an artist
+  they often play — but never let that override what the search clearly asks for.
+  Use -1 only if no result is the requested song."""
+
+async def _ai_pick(query: str, cands: list[wavelink.Playable],
+                   notes: dict[int, str] | None = None) -> dict | None:
+    """One AI call per search: did the user ask for an altered version, which results are altered,
+    and which result is the song they mean. None when Groq fails (title rules are used instead)."""
+    lines = []
+    for i, t in enumerate(cands):
+        views = (_meta_cache.get(t.uri or "", (0, None))[1] or {}).get("view_count")
+        length = f"{(t.length or 0) // 60000}:{(t.length or 0) // 1000 % 60:02d}"
+        lines.append(f"{i}. {t.title} — {t.author} ({length}"
+                     + (f", {views:,} views" if views is not None else "")
+                     + (f"; {notes[i]}" if notes and i in notes else "") + ")")
+    try:
+        r = await asyncio.wait_for(
+            _groq.chat.completions.create(
+                model=_GROQ_MODEL,
+                messages=[{"role": "system", "content": _PICK_SYSTEM},
+                          {"role": "user", "content": f'Search: "{query}"\nResults:\n' + "\n".join(lines)}],
+                response_format={"type": "json_object"},
+                **{**_GROQ_ARGS, "max_tokens": 1200},
+            ),
+            timeout=8.0,
+        )
+        data = json.loads(r.choices[0].message.content or "")
+        pick = int(data.get("pick", -1))
+        altered = {int(i) for i in data.get("altered", []) if 0 <= int(i) < len(cands)}
+        return {"wants_altered": bool(data.get("wants_altered")), "altered": altered,
+                "pick": pick if 0 <= pick < len(cands) else -1}
+    except Exception as exc:
+        print(f"[Worker {BOT_INDEX}] AI pick failed: {str(exc)[:120]} — using title rules", flush=True)
+        return None
 
 async def _groq_similar(seeds: list[dict], count: int = 5) -> list[str]:
     """Autoplay fallback: ask the LLM for songs similar to the seeds, as search queries."""
@@ -236,8 +299,63 @@ def _track_score(track: wavelink.Playable, query: str = "",
         score -= 60
     if (track.length or 0) > 10 * 60_000 and not re.search(r"\b(mix|full|album|hour|live)\b", q_fold):
         score -= 30
+    # Mashups ("Song A x Song B") and snippets ("best part") are a different thing than the song.
+    if re.search(r"\s[x×]\s", title) and not re.search(r"\s[x×]\s", q_fold):
+        score -= 50
+    if re.search(r"\bbest[\s_-]*part\b", title) and "best part" not in q_fold:
+        score -= 30
 
     return score
+
+_taste_cache: dict[tuple[int, int], tuple[float, dict]] = {}
+
+async def _taste(guild_id: int, user_id: int) -> dict | None:
+    """The requester's saved songs, summarised for search ranking: plays per YouTube id and per artist."""
+    key = (guild_id, user_id)
+    hit = _taste_cache.get(key)
+    if hit and time.monotonic() - hit[0] < 60:
+        return hit[1]
+    try:
+        rows = await asyncio.to_thread(db.user_tracks, guild_id, user_id)
+    except Exception as exc:
+        print(f"[Worker {BOT_INDEX}] Could not read saved songs: {exc}", flush=True)
+        return None
+    ids: dict[str, int] = {}
+    artists: dict[str, int] = {}
+    for r in rows:
+        if r["yt_id"]:
+            ids[r["yt_id"]] = r["plays"]
+        a = _fold(r["author"]).strip()
+        if a:
+            artists[a] = artists.get(a, 0) + r["plays"]
+    taste = {"ids": ids, "artists": artists} if rows else None
+    _taste_cache[key] = (time.monotonic(), taste)
+    return taste
+
+def _taste_bonus(track: wavelink.Playable, taste: dict | None) -> float:
+    """Personal boost: an upload the user already listened to, or an artist they play a lot.
+    Kept below one query word (40) so taste breaks ties instead of overriding the search."""
+    if not taste:
+        return 0.0
+    bonus = 0.0
+    plays = taste["ids"].get(track.identifier or "")
+    if plays:
+        bonus += 25 + min(10, 2 * plays)
+    artist_plays = taste["artists"].get(_fold(track.author or "").strip(), 0)
+    if artist_plays:
+        bonus += min(20, 6 * math.log2(1 + artist_plays))
+    return bonus
+
+def _taste_note(track: wavelink.Playable, taste: dict | None) -> str:
+    if not taste:
+        return ""
+    plays = taste["ids"].get(track.identifier or "")
+    if plays:
+        return f"the user has played this exact upload {plays}x"
+    artist_plays = taste["artists"].get(_fold(track.author or "").strip(), 0)
+    if artist_plays >= 2:
+        return f"the user often plays this artist ({artist_plays} plays)"
+    return ""
 
 def _popularity(meta: dict | None) -> float:
     if not meta:
@@ -328,6 +446,9 @@ class Session:
         self.origin: dict[str, wavelink.Playable] = {}
         self.skipping     = False
         self.muted        = False
+        # False when playback was started with a private (ephemeral) command: track-change
+        # messages are normal channel posts and can't be private, so they're not posted at all.
+        self.announce     = True
         self.loop         = False
         self.autoplay     = False
         self.autoplay_source = "session"    # "session" = seeds from what was played, "algo" = saved songs
@@ -341,6 +462,7 @@ class Session:
         self.auto_paused  = False
         self.connecting   = False
         self.closing      = False
+        self.drain_state: str | None = None   # None, "finishing" (current song) or "message" (shutdown.mp3)
         self.history: deque[dict] = deque(maxlen=HISTORY_LEN)
 
     def snapshot(self) -> dict:
@@ -353,6 +475,11 @@ class Session:
         }
 
 sessions: dict[int, Session] = {}
+
+# Graceful restart: set by the controller's "drain" op. While draining no new playback can start.
+_draining = False
+_shutdown_url: str | None = None
+SHUTDOWN_MESSAGE_MAX = 120   # seconds; a session ends even if the message never reports finishing
 
 
 def _track_key(track: wavelink.Playable) -> str:
@@ -566,18 +693,27 @@ async def _resolve(track: wavelink.Playable
     if not _YT_RE.search(uri):
         return src, track, None
 
-    direct = await _ytdlp_url(uri)
-    if not direct:
-        return None
-    try:
-        res = await wavelink.Pool.fetch_tracks(direct)
-        tracks = res.tracks if isinstance(res, wavelink.Playlist) else list(res)
-    except Exception as exc:
-        print(f"[Worker {BOT_INDEX}] Lavalink could not load resolved URL: {exc}", flush=True)
-        return None
-    if not tracks:
-        return None
-    return tracks[0], track, src
+    # 1) cached/fresh yt-dlp stream URL, 2) a forced-fresh URL (cached ones can be refused by
+    #    YouTube), 3) Lavalink's own YouTube plugin. Only then give up on this video.
+    for attempt in ("cached", "fresh", "plugin"):
+        if attempt == "fresh":
+            _url_cache.pop(uri, None)
+            _meta_cache.pop(uri, None)
+        target = uri if attempt == "plugin" else await _ytdlp_url(uri)
+        if not target:
+            continue
+        try:
+            res = await wavelink.Pool.fetch_tracks(target)
+            tracks = res.tracks if isinstance(res, wavelink.Playlist) else list(res)
+        except Exception as exc:
+            print(f"[Worker {BOT_INDEX}] Lavalink could not load {attempt} stream for {src.title!r}: "
+                  f"{str(exc).splitlines()[0][:100]}", flush=True)
+            continue
+        if tracks:
+            if attempt != "cached":
+                print(f"[Worker {BOT_INDEX}] Loaded {src.title!r} via {attempt} stream", flush=True)
+            return tracks[0], track, src
+    return None
 
 def _track_meta(origin: wavelink.Playable, yt_src: wavelink.Playable | None) -> dict:
     """What the algo stores for a song. The YouTube id is the stable key when we have one."""
@@ -627,7 +763,9 @@ def _after_start(sess: Session) -> None:
         _kick_autoplay(sess)
 
 async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable,
-                requester: int | None) -> bool:
+                requester: int | None) -> wavelink.Playable:
+    """Plays a track (or, if it can't be loaded, one of its same-song alternates).
+    Returns the track that is actually playing, so messages never show a different song."""
     alternates = [t for t, _, _ in sess.fallbacks.get(_track_key(track), [])]
     candidates = [track] + alternates
 
@@ -646,7 +784,10 @@ async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable
                 sess.fallbacks[_track_key(origin)] = rest
         await player.play(playable)
         _after_start(sess)
-        return True
+        if i > 0:
+            print(f"[Worker {BOT_INDEX}] Playing alternate {origin.title!r} by {origin.author!r} "
+                  f"instead of {track.title!r}", flush=True)
+        return origin
 
 
     print(f"[Worker {BOT_INDEX}] Resolve failed for {track.title!r} — passing to Lavalink as-is", flush=True)
@@ -654,7 +795,7 @@ async def _play(sess: Session, player: wavelink.Player, track: wavelink.Playable
     _set_current(sess, track, None, requester)
     await player.play(track)
     _after_start(sess)
-    return False
+    return track
 
 def _account(sess: Session, played_ms: int | None = None,
              finished: bool = False, skipped: bool = False) -> None:
@@ -665,9 +806,12 @@ def _account(sess: Session, played_ms: int | None = None,
         return
     if finished or (played_ms or 0) >= PLAY_COUNT_MS:
         s = appsettings.get()
-        _bg(db.record_play, sess.guild_id, uid, meta, int(s["algo_max_songs"]), int(s["algo_max_kb"]))
+        _bg(db.record_play, sess.guild_id, uid, meta, int(s["algo_max_kb"]))
     elif skipped:
         _bg(db.record_skip, sess.guild_id, uid, meta["key"])
+
+def _can_post(sess: Session) -> bool:
+    return bool(sess.text_channel) and sess.announce and not sess.muted
 
 def _enqueue(sess: Session, item: QueueItem) -> int:
     """User songs go ahead of autoplay picks. Returns the 1-based queue position."""
@@ -680,22 +824,76 @@ def _enqueue(sess: Session, item: QueueItem) -> int:
 
 async def _advance(sess: Session, player: wavelink.Player, announce: bool = True) -> None:
     """Play the next queued track (refilling from autoplay if needed), or go idle."""
+    if sess.drain_state == "finishing":
+        await _play_shutdown_message(sess, player)   # the last song is done; nothing else plays
+        return
     if not sess.queue and sess.autoplay:
         await _autoplay_fill(sess)
     if sessions.get(sess.guild_id) is not sess:
         return
     if sess.queue:
         nxt, nxt_label, nxt_path, req = sess.queue.pop(0)
-        await _play(sess, player, nxt, req)
-        if announce and sess.text_channel and not sess.muted:
-            await _send_status(sess.text_channel, _now_playing_embed(nxt, nxt_label, nxt_path))
+        played = await _play(sess, player, nxt, req)
+        if announce and _can_post(sess):
+            await _send_status(sess.text_channel, _now_playing_embed(played, nxt_label, nxt_path))
     else:
         sess.current_info = None
         asyncio.ensure_future(_set_vc_status(sess.guild_id, sess.channel_id, None))
         _start_idle_timer(sess)
 
 
+# ── graceful restart ─────────────────────────────────────────────────────────
+
+async def _play_shutdown_message(sess: Session, player: wavelink.Player | None) -> None:
+    """Play shutdown.mp3 (served by the controller) and leave when it ends.
+    Without the file, or if it can't load, the session just ends."""
+    if sess.drain_state == "message":
+        return
+    sess.drain_state = "message"
+    sess.queue.clear()
+    sess.autoplay = sess.loop = False
+    _cancel_idle_timer(sess)
+    if sess.autoplay_task and not sess.autoplay_task.done():
+        sess.autoplay_task.cancel()
+    if player and player.current:
+        _account(sess, player.position)
+    track = None
+    if _shutdown_url and player:
+        try:
+            res = await wavelink.Pool.fetch_tracks(_shutdown_url)
+            tracks = res.tracks if isinstance(res, wavelink.Playlist) else list(res or [])
+            track = tracks[0] if tracks else None
+        except Exception as exc:
+            print(f"[Worker {BOT_INDEX}] Could not load shutdown message: {str(exc).splitlines()[0][:100]}", flush=True)
+    if track is None:
+        await _end_session(sess.guild_id)
+        return
+    try:
+        if player.paused:
+            await player.pause(False)
+        await player.play(track)
+        sess.current_info = {"title": "Restarting", "author": ""}
+        asyncio.ensure_future(_set_vc_status(sess.guild_id, sess.channel_id, None))
+        print(f"[Worker {BOT_INDEX}] Playing shutdown message in guild {sess.guild_id}", flush=True)
+        asyncio.ensure_future(_end_later(sess, SHUTDOWN_MESSAGE_MAX))
+    except Exception as exc:
+        print(f"[Worker {BOT_INDEX}] Shutdown message failed: {exc}", flush=True)
+        await _end_session(sess.guild_id)
+
+async def _end_later(sess: Session, delay: float) -> None:
+    await asyncio.sleep(delay)
+    if sessions.get(sess.guild_id) is sess:
+        await _end_session(sess.guild_id)
+
+
 # ── autoplay ─────────────────────────────────────────────────────────────────
+
+def _same_song(a: wavelink.Playable, b: wavelink.Playable) -> bool:
+    ta, tb = _norm_title(_fold(a.title or "")), _norm_title(_fold(b.title or ""))
+    if not ta or not tb or (ta not in tb and tb not in ta):
+        return False
+    same_artist = _fold(a.author or "").strip() == _fold(b.author or "").strip()
+    return same_artist or abs((a.length or 0) - (b.length or 0)) <= 8000
 
 def _norm_title(title: str) -> str:
     t = re.sub(r"[\(\[].*?[\)\]]", " ", (title or "").lower())
@@ -963,6 +1161,11 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     ended  = payload.track
     orig   = sess.origin.pop(_track_key(ended), ended) if ended else None
 
+    if sess.drain_state == "message":
+        if reason != "replaced":   # "replaced" is the song the message just took over from
+            await _end_session(sess.guild_id)
+        return
+
     if reason == "finished":
         sess.fail_streak = 0
         _account(sess, finished=True)
@@ -991,6 +1194,12 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
         return
     sess.skipping = False
     sess.current_meta = None   # never played, so nothing to learn from
+    if sess.drain_state == "message":
+        await _end_session(sess.guild_id)
+        return
+    if sess.drain_state == "finishing":
+        await _play_shutdown_message(sess, player)
+        return
     failed_track = payload.track
 
     origin = sess.origin.get(_track_key(failed_track), failed_track) if failed_track else None
@@ -1004,7 +1213,7 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
     sess.fail_streak += 1
     if sess.fail_streak >= MAX_FAIL_STREAK:
         print(f"[Worker {BOT_INDEX}] {sess.fail_streak} tracks failed in a row — stopping", flush=True)
-        if sess.text_channel:
+        if sess.text_channel and sess.announce:
             await _send_status(sess.text_channel, discord.Embed(
                 title="❌  Playback failed",
                 description=f"{sess.fail_streak} tracks in a row could not be played, so I stopped.\n"
@@ -1055,6 +1264,9 @@ async def on_voice_state_update(member: discord.Member, before, after):
         return
 
     player = _get_player(sess.guild_id)
+    if not _humans_in_vc(sess) and sess.drain_state:
+        await _end_session(sess.guild_id)   # restarting and nobody is listening
+        return
     if not _humans_in_vc(sess):
         print(f"[Worker {BOT_INDEX}] VC empty in guild {sess.guild_id} — pausing, idle timer started", flush=True)
         if player and player.current and not player.paused:
@@ -1135,12 +1347,17 @@ async def _sp_lookup(query: str) -> wavelink.Playable | None:
     q_words = set(_words(query))
     if not items or not q_words:
         return None
-    best, best_cov = None, 0.0
+    asked = bool(_ALTERED_ASK.search(query))
+    best, best_key = None, (-1.0, False)
     for t in items[:5]:
         t_text = _fold(f"{t.title} {t.author}")
         cov = sum(1 for w in q_words if w in t_text) / len(q_words)
-        if cov > best_cov:
-            best, best_cov = t, cov
+        # e.g. "noite quente phonk" should not lock onto "Noite Quente (Slowed)" by "Adiel phonk"
+        clean = asked or not _ALTERED_QUICK.search(t.title or "")
+        key = (cov if cov >= SP_MIN_COVERAGE else 0.0, clean)
+        if key > best_key:
+            best, best_key = t, key
+    best_cov = best_key[0]
     if best_cov < SP_MIN_COVERAGE:
         print(f"[Worker {BOT_INDEX}] Spotify results don't match the query — ignoring "
               f"(best: {items[0].title!r} by {items[0].author!r})", flush=True)
@@ -1183,8 +1400,8 @@ async def _first_clean(candidates: list) -> wavelink.Playable | None:
             return t
     return None
 
-async def _search(query: str, source: str,
-                  sess: Session | None) -> tuple[wavelink.Playable | None, str, str]:
+async def _search(query: str, source: str, sess: Session | None,
+                  user_id: int | None = None) -> tuple[wavelink.Playable | None, str, str]:
     query = _SEARCH_PREFIX_RE.sub("", query).strip()
     label  = _source_label(source, query)
     is_url = query.startswith(("http://", "https://"))
@@ -1228,11 +1445,10 @@ async def _search(query: str, source: str,
             _remember_alternates(sess, selected, results, label, "SoundCloud")
         return selected, label, "SoundCloud"
 
-    # The altered-version check, Spotify and the plain YouTube Music search run at the same time.
+    # Spotify and the plain YouTube Music search run at the same time.
     sp_task = _sp_lookup(query) if source != "yt" else asyncio.sleep(0, result=None)
     asked = bool(_ALTERED_ASK.search(query))
-    alt_task = asyncio.sleep(0, result=True) if asked else _user_wants_altered(query)
-    user_alt, sp, raw = await asyncio.gather(alt_task, sp_task, _ytm(query))
+    sp, raw = await asyncio.gather(sp_task, _ytm(query))
     if sp:
         yt_q  = f"{sp.title} {sp.author}".strip()
         path  = "Spotify → YouTube Music"
@@ -1246,20 +1462,56 @@ async def _search(query: str, source: str,
     else:
         yt_q, path, candidates = query, "YouTube Music", raw
 
-    scored = [(t, _track_score(t, query, sp)) for t in candidates]
-    ranked = await _rank_by_popularity(scored, skip_altered=not user_alt) if scored else []
+    taste  = await _taste(sess.guild_id, user_id) if sess and user_id else None
+    scored = [(t, _track_score(t, query, sp) + _taste_bonus(t, taste)) for t in candidates]
+    ranked = await _rank_by_popularity(scored, skip_altered=not asked) if scored else []
+    top    = [t for t, _ in ranked[:AI_PICK_CANDIDATES]]
 
-    if user_alt:
-        selected = ranked[0][0] if ranked else None
-        if selected:
-            _remember_alternates(sess, selected, [t for t, _ in ranked], label, path)
-        return selected, label, path
+    notes    = {i: n for i, t in enumerate(top) if (n := _taste_note(t, taste))}
+    decision = await _ai_pick(query, top, notes) if top else None
+    if decision:
+        wants_altered = decision["wants_altered"] or asked
+        altered = set(decision["altered"])
+        if not wants_altered:
+            # Belt and braces: obvious title words override the AI calling something "original".
+            altered |= {i for i, t in enumerate(top) if _ALTERED_ASK.search(t.title or "")}
+        print(f"[Worker {BOT_INDEX}] AI: wants_altered={wants_altered} altered={sorted(altered)} "
+              f"pick={decision['pick']}", flush=True)
+    else:
+        wants_altered = asked
+        altered = set() if asked else {i for i, t in enumerate(top) if _ALTERED_QUICK.search(t.title or "")}
 
-    for t, sc in ranked:
-        if not await _is_altered(t.title or ""):
-            print(f"[Worker {BOT_INDEX}] ✓ {t.title!r} by {t.author!r} (score {sc:.1f})", flush=True)
-            _remember_alternates(sess, t, [candidate for candidate, _ in ranked], label, path)
-            return t, label, path
+    allowed = [i for i in range(len(top)) if wants_altered or i not in altered]
+    if allowed:
+        # Relevance guard: the pick must match the search about as well as the best allowed result,
+        # so "noite quente slowed" can't land on a slowed version of a different song.
+        rel = {_track_key(t): r for t, r in scored}
+        best_rel = max(rel[_track_key(top[i])] for i in allowed)
+        relevant = [i for i in allowed if rel[_track_key(top[i])] >= best_rel - 40]
+        if wants_altered:
+            # Asked for an altered version: prefer relevant results that are altered.
+            relevant = [i for i in relevant if i in altered or _ALTERED_QUICK.search(top[i].title or "")] or relevant
+        if decision and decision["pick"] in relevant:
+            choice = decision["pick"]
+        else:
+            if decision and decision["pick"] >= 0:
+                print(f"[Worker {BOT_INDEX}] AI pick {decision['pick']} doesn't match the search well enough — overriding", flush=True)
+            choice = relevant[0]
+        # If the user has a saved upload of this same song, play the one they already know.
+        if taste:
+            saved = [i for i in relevant if (top[i].identifier or "") in taste["ids"]
+                     and _same_song(top[i], top[choice])]
+            if saved and choice not in saved:
+                choice = max(saved, key=lambda i: taste["ids"][top[i].identifier])
+                print(f"[Worker {BOT_INDEX}] Using the upload from your saved songs", flush=True)
+        t = top[choice]
+        print(f"[Worker {BOT_INDEX}] ✓ {t.title!r} by {t.author!r}", flush=True)
+        # Fallbacks (if this upload can't be played) must be another upload of the SAME song:
+        # same title and either the same artist or the same length. A same-named song by
+        # someone else (e.g. the "just drums" one) is not a fallback.
+        alternates = [t] + [top[i] for i in relevant if i != choice and _same_song(top[i], t)]
+        _remember_alternates(sess, t, alternates, label, path)
+        return t, label, path
 
     if sp:
         for ch_name in _PREFERRED_CHANNELS:
@@ -1330,6 +1582,7 @@ def _track_reply(track: wavelink.Playable, embed_type: str, lbl: str, path: str,
 
 
 async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    global _draining, _shutdown_url
     try:
         data = await reader.readline()
         if not data:
@@ -1374,8 +1627,40 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             asyncio.ensure_future(_do_shutdown())
             return
 
+        if op == "drain":
+            # Restart scheduled: finish the current song (dropping the rest of the queue/playlist),
+            # then play the shutdown message and leave. Nothing new can start from now on.
+            _draining = True
+            _shutdown_url = cmd.get("message_url")
+            for g, sess in list(sessions.items()):
+                player = _get_player(g)
+                sess.queue.clear()
+                sess.autoplay = sess.loop = False
+                if not player or sess.auto_paused or not _humans_in_vc(sess):
+                    await _end_session(g)
+                elif player.current and not player.paused:
+                    sess.drain_state = "finishing"
+                else:
+                    await _play_shutdown_message(sess, player)   # paused or between songs
+            print(f"[Worker {BOT_INDEX}] Draining — {len(sessions)} session(s) finishing", flush=True)
+            await reply(True, "draining", remaining=len(sessions))
+            return
+
+        if op == "drain_force":
+            # Timeout reached: cut the song and play the message now.
+            for g, sess in list(sessions.items()):
+                if sess.drain_state != "message":
+                    await _play_shutdown_message(sess, _get_player(g))
+            await reply(True, "forced", remaining=len(sessions))
+            return
+
         if gid is None:
             await reply(False, "guild_id required")
+            return
+
+        if _draining and op in ("search_and_play", "queue_track", "search_and_playlist", "autoplay_start",
+                                "toggle_autoplay", "toggle_loop", "jump_to"):
+            await reply(False, "The music bots are restarting — try again in a few minutes.")
             return
 
         if op in ("search_and_play", "queue_track", "search_and_playlist", "autoplay_start"):
@@ -1389,6 +1674,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                 ch = g.get_channel(int(tcid)) if g else None
                 if isinstance(ch, discord.TextChannel):
                     sess.text_channel = ch
+            sess.announce = bool(cmd.get("announce", True))   # follows the latest play command
             try:
                 await _start_op(sess, op, cmd, uid, reply)
             except Exception:
@@ -1542,8 +1828,8 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             try:
                 await player.stop()
                 sess.fail_streak = 0
-                await _play(sess, player, target_track, target_req)
-                if sess.text_channel and not sess.muted:
+                target_track = await _play(sess, player, target_track, target_req)
+                if _can_post(sess):
                     await _send_status(sess.text_channel, _now_playing_embed(target_track, target_lbl, target_path))
             finally:
                 sess.skipping = False
@@ -1571,7 +1857,7 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
     gid = sess.guild_id
 
     if op in ("search_and_play", "queue_track"):
-        track, lbl, path = await _search(cmd["query"], cmd["source"], sess)
+        track, lbl, path = await _search(cmd["query"], cmd["source"], sess, uid)
         if not track:
             await reply(False, "Nothing found.")
             return
@@ -1582,9 +1868,9 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
                         **_track_reply(track, "queued", lbl, path, queue_pos=pos))
         else:
             sess.fail_streak = 0
-            await _play(sess, player, track, uid)
+            played = await _play(sess, player, track, uid)
             await reply(True, "playing", session=sess.snapshot(),
-                        **_track_reply(track, "playing", lbl, path))
+                        **_track_reply(played, "playing", lbl, path))
         return
 
     if op == "search_and_playlist":
@@ -1635,9 +1921,9 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply) -
             return
         nxt, lbl, path, req = sess.queue.pop(0)
         sess.fail_streak = 0
-        await _play(sess, player, nxt, req)
+        played = await _play(sess, player, nxt, req)
         await reply(True, "playing", session=sess.snapshot(),
-                    **_track_reply(nxt, "playing", "Autoplay", path or "Your saved songs"))
+                    **_track_reply(played, "playing", "Autoplay", path or "Your saved songs"))
         return
 
 
