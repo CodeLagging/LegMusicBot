@@ -497,7 +497,7 @@ The `/settings` panel (10 minute timeout). Every change saves immediately and re
 ### Supervision and start-up
 
 **`async def _watch_worker(w)`**
-Per-worker loop every 5 s: a dead worker (or one that doesn't answer a ping when the controller has no process handle) has its state cleared and is restarted after 3 s, unless it was shut down on purpose. Every 30 s it also resyncs the worker, as a backstop in case a state event was lost.
+Per-worker loop every 5 s: a dead worker (or one that doesn't answer a ping when the controller has no process handle) has its state cleared and is restarted after 3 s, unless it was shut down on purpose. Every 30 s it also resyncs the worker (backstop for lost state events) and health-checks it: a worker whose process is alive but that hasn't answered for `HUNG_AFTER` checks (2 minutes) is killed and restarted. Starts and restarts share `w.lock`, so the watchdog and a dev ``restart`` can never both start a process; a worker that doesn't answer is marked unavailable and skipped when picking a worker for `/play`.
 
 **`async def _run(stop_event=None)`**
 Main coroutine. Migrates the old settings, starts the event server and the main bot, waits 5 s, creates one `WorkerProcess` per worker token, and for each either adopts an already-running worker (if its socket answers `sync`) or starts it, plus its watcher. Then waits for the stop signal and shuts everything down.
@@ -736,8 +736,20 @@ Really leaves the voice channel: stop, disconnect, and if Discord still shows th
 **`async def _fresh_vc(sess, new)`**
 Connects for a play command. A new session never reuses a player left over from an earlier one (a dead leftover holding an old paused track used to make new songs queue behind it and never start).
 
+**`async def on_wavelink_track_stuck(payload)`**
+Lavalink reports a stream that stopped delivering audio: the song is skipped (not counted as the user's skip) and playback moves on.
+
+**`async def _advance_safely(sess, player, announce=True)`**
+`_advance` for event handlers: on an error the session goes idle (and leaves after the idle timeout) instead of hanging. `_advance` itself skips songs Lavalink refuses to play and stops after `MAX_FAIL_STREAK` failures in a row.
+
+**`async def _abandoned(sess, reply)`**
+After searching/connecting: if the session was stopped meanwhile (`/stop`, or a restart began), it doesn't play and leaves voice instead of leaving music running with no session.
+
+**`def _not_found_msg(query, default)`**
+Spotify links that fail get an explanation (Spotify refusing lookups) instead of "Nothing found".
+
 **`async def _session_watchdog()`** / **`async def _watchdog_pass()`**
-Every 30 s (and 10 s after start): leaves any voice channel the worker is in without a session (a "ghost" connection Discord kept after a restart), ends sessions whose voice connection is gone, and starts the idle timer for sessions with nothing to play, so a worker can't stay "busy" or sit in a channel forever.
+Every 30 s (and 10 s after start): resumes a **stalled queue** (songs waiting but nothing playing for two checks in a row, e.g. after a Lavalink restart), leaves any voice channel the worker is in without a session (a "ghost" connection Discord kept after a restart), ends sessions whose voice connection is gone, and starts the idle timer for sessions with nothing to play, so a worker can't stay "busy" or sit in a channel forever.
 
 **`def _claim(guild_id, channel_id, user_id)`**
 Returns the server's session (creating it with `user_id` as controller when there is none). Raises when the worker already plays in a different channel of that server.
@@ -945,6 +957,9 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `DRAIN_MESSAGE_MAX` | main.py | 130 s | Graceful restart: extra wait for the shutdown messages after the timeout. |
 | `SHUTDOWN_MESSAGE_MAX` | worker.py | 120 s | A worker leaves this long after starting the message, even if it never reports finishing. |
 | `PENDING_TTL` | main.py | 90 s | How long a `/play` reservation holds a worker without confirmation. |
+| `PLAY_TIMEOUT` | main.py | 90 s | How long `/play`, `/playlist` and `/autoplay` wait for the worker (search + voice connect + stream). |
+| `IPC_LINE_LIMIT` | main.py | 8 MB | Longest worker reply accepted (big playlist queues). |
+| `HUNG_AFTER` | main.py | 4 | Failed 30-second health checks in a row before a running-but-frozen worker is killed and restarted. |
 | `PAGE_SIZE` | main.py | 25 | Queue entries per dropdown page (Discord limit). |
 | ControlView timeout | main.py | 900 s | Control panel buttons stop working after 15 minutes. |
 | SettingsView timeout | main.py | 600 s | Settings panel stops working after 10 minutes. |
