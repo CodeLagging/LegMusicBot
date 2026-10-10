@@ -18,6 +18,7 @@ This document explains every function, class and method of the source files, the
 10. [Tunable constants and files](#10-tunable-constants-and-files)
 11. [Graceful restart](#11-graceful-restart)
 12. [Deployment and service](#12-deployment-and-service)
+13. [Lyrics](#13-lyrics)
 
 ---
 
@@ -93,7 +94,7 @@ When playback is started with a private command (`P_EPH`, `PL_EPH` or `AP_EPH` o
 
 - **Main bot:** Message Content Intent enabled in the Developer Portal (for the ``prefix`` commands). Send Messages in the server's first channel (for the whitelist notice).
 - **Lavalink:** the **LavaDSPX** plugin for the Normalize button (`com.github.Devoxin:LavaDSPX-Plugin:0.0.5`, repository `https://jitpack.io`, tested with Lavalink 4.2.2). Without it, Normalize replies with an error and everything else works.
-- **Workers:** Connect and Speak in voice channels, Send Messages in the control channel, and **Set Voice Channel Status** (to show the song title on the channel; without it playback still works and a log line notes the missing permission).
+- **Workers:** Connect and Speak in voice channels, Send Messages and Embed Links in the control channel (now-playing and lyrics messages; they also delete their own lyrics messages), and **Set Voice Channel Status** (to show the song title on the channel; without it playback still works and a log line notes the missing permission).
 - Every server needs the main bot **and** all worker bots invited.
 
 ---
@@ -126,7 +127,7 @@ The `worker` option forces a specific worker (0 = automatic). It is needed to us
 The panel **updates itself** every 8 s when the song, queue or a setting changes (keeping your page and selection), and shows "Playback ended" when the session stops. The header shows ⏸️ paused, 🔇 muted, 🔁 loop, 🎲 autoplay and 🎚️ normalized when they're on. After ⏹ Stop the panel says "Stopped" and its buttons are disabled. Discord only allows editing it for 15 minutes, so at 14 minutes it turns into "Panel expired — run /control again".
 | 2 | Queue dropdown (25 per page; 🎲 marks autoplay picks) |
 | 3 | ⏭ Jump To, 🗑 Remove, ✖ Clear selection, 🎲 Autoplay, 🔒 Control: Me / 🔓 Control: All |
-| 4 | 🎚️ Normalize (evens out loud and quiet songs; default off; also applies to the shutdown message), then page buttons for queues longer than one page |
+| 4 | 🎚️ Normalize (evens out loud and quiet songs; default off; also applies to the shutdown message), 🎤 Lyrics (live synced lyrics, see section 13), then page buttons for queues longer than one page |
 
 The panel stops working after 15 minutes; run `/control` again.
 
@@ -452,9 +453,9 @@ The queue dropdown, one page of up to 25 tracks. Choosing a track only selects i
 
 **`class ControlView(discord.ui.View)`**
 The panel (15 minute timeout). Rows as in section 3.
-- **`__init__(self, worker, guild_id, queue, current_title, page=0, muted=False, loop=False, autoplay=False, mode="me", selected_qid=None, normalize=False)`** — Stores the state and adds the dropdown and dynamic buttons. Every version of the panel gets its own button ids (`tag`): each refresh puts a new view on the same message and retires the old one, and discord.py forgets a retired view's buttons by id for that message — with ids shared between versions (Stop, Autoplay, Control used to have fixed ones) that also unhooked the new view's buttons, so they did nothing after the first refresh.
+- **`__init__(self, worker, guild_id, queue, current_title, page=0, muted=False, loop=False, autoplay=False, mode="me", selected_qid=None, normalize=False, lyrics=False)`** — Stores the state and adds the dropdown and dynamic buttons. Every version of the panel gets its own button ids (`tag`): each refresh puts a new view on the same message and retires the old one, and discord.py forgets a retired view's buttons by id for that message — with ids shared between versions (Stop, Autoplay, Control used to have fixed ones) that also unhooked the new view's buttons, so they did nothing after the first refresh.
 - **`interaction_check(self, interaction)`** — Runs before every button/dropdown. Refuses (privately) when the session has ended or the user isn't allowed (section 4). The mode button is controller/dev only; the Stop button is also allowed for Manage Server.
-- **`_dispatch(self, interaction, op, timeout=15.0, **extra)`** — Shared handler: sends the operation, stores any session snapshot, shows feedback, and refreshes the panel after skip, restart, pause/resume, mute, loop, autoplay, normalize and mode changes. Returns the reply.
+- **`_dispatch(self, interaction, op, timeout=15.0, **extra)`** — Shared handler: sends the operation, stores any session snapshot, shows feedback, and refreshes the panel after skip, restart, pause/resume, mute, loop, autoplay, normalize, lyrics and mode changes. Returns the reply.
 - **`rw10`, `rw5`, `ff5`, `ff10`** — Seek −10/−5/+5/+10 s.
 - **`btn_loop`** — `toggle_loop`.
 - **`btn_backward`** — `backward` (restart the track).
@@ -462,6 +463,12 @@ The panel (15 minute timeout). Rows as in section 3.
 - **`btn_stop`** — `stop`; only when it succeeds does it mark the session gone and disable the panel.
 - **`btn_skip`** — `skip` (45 s timeout, since it may need to fetch autoplay picks).
 - **`btn_mute`** — `toggle_mute` (hides now-playing messages; audio keeps playing).
+
+**`class LyricsButton`**
+🎤 Lyrics: sends `toggle_lyrics` with `on` set to the opposite of what the button shows. When turning on, it first registers a `PrivateLyrics` for this worker and server, so updates for private playback can't arrive before there is somewhere to show them.
+
+**`class PrivateLyrics`**
+Lyrics for privately started playback. The worker sends each update as a `lyrics` event; this shows it as an ephemeral follow-up to the 🎤 click (one per song, deleted when the song ends). Updates carry a sequence number, so a late older update never overwrites a newer one. Discord allows follow-ups for 15 minutes after a click, so at `PANEL_LIFETIME` (14 min) it shows "Private lyrics expired — press 🎤 Lyrics again" and turns lyrics off on the worker. A newer 🎤 click retires the previous one.
 
 **`async def _build_control_view(worker, guild_id, page=0, selected_idx=None)`**
 Fetches `get_queue`, stores the session snapshot, clamps the page, drops a selection that no longer exists, builds the view, colours the Mute/Loop buttons and builds the "Playback Controls — Worker N" embed (current track, flags, queue range, and who controls it).
@@ -742,6 +749,9 @@ Really leaves the voice channel: stop, disconnect, and if Discord still shows th
 **`async def _fresh_vc(sess, new)`**
 Connects for a play command. A new session never reuses a player left over from an earlier one (a dead leftover holding an old paused track used to make new songs queue behind it and never start).
 
+**`async def on_wavelink_track_start(payload)`**
+Lavalink says the audio really started (loading takes a moment after `play()`): restarts the session's playback clock (`_mark_position`) so lyrics line up with what people hear.
+
 **`async def on_wavelink_track_stuck(payload)`**
 Lavalink reports a stream that stopped delivering audio: the song is skipped (not counted as the user's skip) and playback moves on.
 
@@ -893,6 +903,9 @@ Algo menu "Remove selected": deletes those songs (and the user's search memory f
 **`def user_stats(guild_id, user_id)`**
 `(song count, approximate bytes)` for a user.
 
+**`def lyrics_get(cache_key)`** / **`def lyrics_put(cache_key, provider, duration_ms, lines)`**
+The lyrics cache in `database/lyrics.db`: the chosen synced lines (JSON) with their provider and the source's duration, or `lines` NULL for "no synced lyrics anywhere".
+
 ### appsettings.py
 
 **`def get()`**
@@ -931,12 +944,13 @@ The controller sends one JSON object per connection to `.worker<N>.sock`, with `
 | `backward` | Seeks to the start. | `restarted` |
 | `seek` | Moves by `delta_ms`, clamped to the track. | `seeked` with `delta_ms` |
 | `remove_from_queue` | Deletes the song with `qid`. Error if it already played or was removed. | `removed` with `title`, `queue_remaining` |
-| `get_queue` | Returns the current track and the queue: each entry has `title`, `author`, `index` (position), `qid` and an `autoplay` flag. | `queue` with `current`, `queue`, `muted`, `loop`, `autoplay`, `normalize`, `paused`, `session` |
+| `get_queue` | Returns the current track and the queue: each entry has `title`, `author`, `index` (position), `qid` and an `autoplay` flag. | `queue` with `current`, `queue`, `muted`, `loop`, `autoplay`, `normalize`, `paused`, `lyrics`, `session` |
 | `toggle_mute` | Hides or shows now-playing messages. | `muted` or `unmuted` |
 | `toggle_loop` | Repeats the current track or not. | `loop_on` or `loop_off` |
 | `toggle_autoplay` | Turns autoplay on (needs played history unless in algo mode; starts playing if idle) or off (drops queued picks). | `autoplay_on` or `autoplay_off`, `session` |
 | `set_mode` | Sets `mode` to `me` or `all`. | `mode_me` or `mode_all`, `session` |
 | `toggle_normalize` | Turns the normalization filter on or off. | `normalize_on` or `normalize_off` |
+| `toggle_lyrics` | Turns lyrics on or off for the session (`on` sets it, without `on` it toggles). Lyrics are private when the playback was started privately. | `lyrics_on` or `lyrics_off` with `lyrics`, `private` |
 | `forget_user` | After `/reset-algo`: drops the user's cached history and doesn't re-save the song playing now. | `forgotten` |
 | `jump_to` | Records a listen or quick skip for the current track, drops the queue up to the song with `qid` and plays it. Error if it already played or was removed. | `jumped` with `title`, `author`, `queue_remaining` |
 | `shutdown_graceful` | Ends every session, replies, then exits. | `shutdown_graceful` |
@@ -954,6 +968,14 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 ```
 
 `session` is `null` when the session ended. Sent when a session is created or ends, and on autoplay, mode and channel changes.
+
+For private lyrics the worker also sends:
+
+```json
+{"op": "lyrics", "index": 2, "guild_id": 123, "song": 7, "seq": 41, "embed": {"title": "Lyrics - Song", "description": "..."}, "delete": false}
+```
+
+`song` numbers the song's message, `seq` orders updates, and `delete: true` (with `embed` null) means the song ended and its message goes away.
 
 ---
 
@@ -996,6 +1018,13 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `PERSONAL_STRONG` | worker.py | 40 | Personal score at which your history overrides the AI pick. |
 | `PERSONAL_HALF_LIFE_DAYS` | worker.py | 30 | How fast personal boosts fade without listening. |
 | `NORMALIZE_SETTINGS` | worker.py | maxAmplitude 0.75, adaptive | Normalize filter settings. |
+| `LYRICS_TICK` | worker.py | 0.25 s | How often the lyrics loop checks the playback position. |
+| `LYRICS_LEAD_MS` | worker.py | 400 ms | Lines are sent this early, to cover the time a message edit takes. |
+| `LYRICS_MIN_GAP` | worker.py | 1.2 s | At most one lyrics edit this often; faster lines skip to the latest. |
+| `PROVIDER_TIMEOUT` | lyrics.py | 8 s | Per lyrics provider; one that's slower is skipped. |
+| `MAX_LENGTH_DIFF_MS` | lyrics.py | 3 s | Lyrics whose source duration is further off are another version and aren't used. |
+| `NONE_CACHE_TTL`, `FOUND_CACHE_TTL` | lyrics.py | 3 days, 30 days | How long "no synced lyrics" and found lyrics are cached. |
+| `GAP_MS` | lyrics.py | 8 s | This far into a line, with the next one still well away, the current line shows ♪. |
 | `_GROQ_ARGS` | worker.py | 400 tokens, low reasoning | Settings for every Groq call (the AI pick allows 1200 tokens). |
 
 | File | Created by | Purpose |
@@ -1005,6 +1034,7 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `.env` | you | `GROQ_API_KEY`. Secret, git-ignored. |
 | `database/server/servers.db` | controller | Per-server settings from `/settings`. |
 | `database/algo/<server id>.db` | workers | Every user's saved songs for that server. |
+| `database/lyrics.db` | workers | Lyrics cache (see section 13). |
 | `.worker<N>.sock` | worker | Socket the controller uses to talk to worker N. |
 | `.main.sock` | controller | Socket the workers send state events to. |
 | `shutdown.mp3` | you | Message played before a restart (optional). |
@@ -1092,3 +1122,69 @@ Notes:
 - Slash commands are registered per server on every start, so new or changed commands show up right away (Ctrl+R in Discord if an open client still shows the old list).
 - Spotify's Web API requires the owner of the Spotify developer app (configured in Lavalink's `application.yml`) to have an active Premium subscription. Without it, Spotify searches and `open.spotify.com` links fail; searches then fall back to YouTube Music only.
 - The Message Content Intent is a privileged intent; beyond 100 servers Discord requires the bot to be verified for it.
+
+---
+
+## 13. Lyrics
+
+Live **synced** lyrics for the song that's playing, turned on per session with **🎤 Lyrics** in `/control` (there's no server default). Bots can't stream video, so lyrics are a message that's edited as the song plays:
+
+- An embed titled **`Lyrics - <song title>`**. Its description is a code block with three lines: previous, **current** (marked `▶`) and next. Instrumental breaks show ♪.
+- **One message per song**, deleted when the song ends (or is skipped or stopped, or lyrics are turned off). The next song gets a new one.
+- **Privacy follows the playback.** If playback was started with a private command, lyrics are an ephemeral message only the person who pressed 🎤 sees. Discord allows that for 15 minutes after the click, so it then says to press 🎤 again. Otherwise it's a normal message in the session's text channel, posted by the worker.
+- **Only synced lyrics.** If no provider has synced lyrics for the song, the message just says "Synced lyrics not available". Plain unsynced text is never shown. If the lookup takes more than a second, the message first says "Looking up synced lyrics…".
+- **Rate limits:** a message is edited only when the line changes, at most every 1.2 s (`LYRICS_MIN_GAP`). When lines change faster, it skips to the latest instead of queueing edits. Nothing is edited while paused.
+
+### Where lyrics come from
+
+`lyrics.py` asks three providers at the same time. One that fails or takes longer than `PROVIDER_TIMEOUT` (8 s) is skipped:
+
+| Provider | How it matches |
+|---|---|
+| **YouTube Music** (`ytmusicapi`) | The lyrics of the exact video being played, when it's a song upload. For a re-upload or lyric video, the song upload of the same recording (same title and artist, within 3 s of the same length). |
+| **LRCLib** | Title, artist and duration (`/api/get`, then `/api/search`). |
+| **NetEase** | Search by title and artist, then the song with matching title and duration. Its credit lines (作词/作曲…) are removed. |
+
+Re-uploads often put the real artist in the title ("Nakama, Mc Staff - MENTE MÁ" uploaded by "void"), so that split is searched too.
+
+**Choosing:** a source whose duration is more than 3 s off the playing upload is a different version (slowed, sped up, a music-video intro) and is rejected, as is one that isn't really synced or runs past the end of the song. When two or more remain, the score favours, in order: the exact video (YT Music), the closest duration, then more timed lines.
+
+Musixmatch isn't used: its synced lyrics are only available through its desktop app's internal API, which its terms forbid (YT Music's lyrics largely come from Musixmatch anyway). Genius isn't used because it has no synced lyrics.
+
+**Cache:** results are kept in `database/lyrics.db`. Found lyrics last 30 days, and "no synced lyrics" lasts 3 days (only when every provider answered). When lyrics are on, the next song in the queue is looked up while the current one plays, so its lyrics usually appear at once.
+
+**Timing:** wavelink only learns the playback position from Lavalink's updates (every 5 s), so right after a song starts, a seek, or a resume, its position is stale. The worker keeps its own clock (`_mark_position` / `_play_position`), restarted when Lavalink reports that the track really started, and uses Lavalink's position again once a newer update arrives. Lines are sent 0.4 s early (`LYRICS_LEAD_MS`) to cover the edit delay.
+
+Coverage at launch, checked against the saved songs on the main server: 51 of 69 had synced lyrics (48 from YouTube Music, 3 from LRCLib). Most of the rest are instrumental.
+
+### lyrics.py reference
+
+**`async def find(title, artist, length_ms, yt_id=None)`**
+Synced lyrics for the playing upload (`Lyrics`, or None), plus a short report for the log (provider names and counts only, never lyric text). Uses the cache, otherwise asks the providers. Concurrent lookups of the same song share one request.
+
+**`def parse_lrc(text)`**
+LRC to `[(start ms, text)]`. Handles several timestamps on one line, `[offset:]`, `[mm:ss.xx]` and `[mm:ss:xx]`, and word timestamps. Metadata and credit lines are dropped, and empty lines become ♪.
+
+**`def clean_title(title, artist)`** / **`def clean_artist(author)`**
+The names lyrics sites use: no "(Official Video)", "feat." or "Artist - " prefix, and only the first artist. Version words like "(Slowed)" are kept.
+
+**`def state_at(lyrics, pos_ms)`** / **`def render(state)`**
+The (previous, current, next) lines at a position, and their code-block text.
+
+### worker.py: lyrics
+
+**`async def _lyrics_song(sess, player, track)`**
+One song's lyrics. It looks them up, then every `LYRICS_TICK` finds the line at `_play_position + LYRICS_LEAD_MS`, and edits only when the line changed. It ends when the song ends, the session ends or lyrics are turned off, and its `finally` deletes the message.
+
+**`class _LyricsOut`**
+Where one song's lyrics go: a message in the session's text channel (public playback), or `lyrics` events to the controller (private playback).
+
+**`def _start_lyrics(sess)`** / **`def _stop_lyrics(sess)`**
+Start lyrics for the song playing now (called when a song starts and when 🎤 is turned on) and prefetch the next song's lyrics. Stopping cancels the task, which deletes the message.
+
+**`def _mark_position(sess, pos_ms)`** / **`def _play_position(sess, player)`** / **`async def _set_paused(sess, player, paused)`**
+The playback clock described above. Pause, resume, seek and the start of each song set a mark.
+
+### textnorm.py
+
+`fold`, `words`, `artist_key` and `norm_title`: the text normalisation shared by search, autoplay and lyrics (accents removed, "- Topic"/"VEVO" dropped from artist names, bracketed parts and "official video" dropped from titles).

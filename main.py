@@ -372,6 +372,10 @@ async def _handle_event(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             w = _workers.get(int(msg["index"]))
             if w:
                 w.apply(int(msg["guild_id"]), msg.get("session"))
+        elif msg.get("op") == "lyrics":
+            st = _private_lyrics.get((int(msg["index"]), int(msg["guild_id"])))
+            if st:
+                _spawn(st.apply(msg))
     except Exception:
         pass
     finally:
@@ -855,6 +859,8 @@ _MESSAGE_EMBEDS = {
     "mode_all":     ("🔓  Control: everyone in the voice channel", COLOUR),
     "mode_me":      ("🔒  Control: only the person who started playback", COLOUR),
     "normalize_on":  ("🎚️  Normalize ON — loud and quiet songs are evened out", COLOUR),
+    "lyrics_on":     ("🎤  Lyrics ON — synced lyrics show while songs play", COLOUR),
+    "lyrics_off":    ("🎤  Lyrics OFF", COLOUR),
     "normalize_off": ("🎚️  Normalize OFF", COLOUR),
 }
 
@@ -1123,6 +1129,26 @@ class NormalizeButton(discord.ui.Button):
         await self._ctrl._dispatch(interaction, "toggle_normalize")
 
 
+class LyricsButton(discord.ui.Button):
+    def __init__(self, view: "ControlView"):
+        self._ctrl = view
+        on = view._lyrics
+        super().__init__(label="🎤 Lyrics ON" if on else "🎤 Lyrics",
+                         style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        ctrl = self._ctrl
+        turn_on = not ctrl._lyrics
+        if turn_on:
+            # Ready before the worker is asked, so no update of private lyrics can arrive first.
+            key = (ctrl.worker.index, ctrl.guild_id)
+            old = _private_lyrics.get(key)
+            _private_lyrics[key] = PrivateLyrics(interaction, ctrl.worker, ctrl.guild_id)
+            if old:
+                _spawn(old.retire())
+        await ctrl._dispatch(interaction, "toggle_lyrics", on=turn_on)
+
+
 class PrevPageButton(discord.ui.Button):
     def __init__(self, view: "ControlView"):
         self._ctrl = view
@@ -1161,7 +1187,8 @@ class ControlView(discord.ui.View):
     def __init__(self, worker: WorkerProcess, guild_id: int,
                  queue: list[dict], current_title: str, page: int = 0,
                  muted: bool = False, loop: bool = False, autoplay: bool = False,
-                 mode: str = "me", selected_qid: int | None = None, normalize: bool = False):
+                 mode: str = "me", selected_qid: int | None = None, normalize: bool = False,
+                 lyrics: bool = False):
         super().__init__(timeout=900)
         # Every refresh puts a new view on the same message and retires the old one. discord.py
         # forgets the old view's buttons by custom_id for that message, so buttons with the same
@@ -1182,6 +1209,7 @@ class ControlView(discord.ui.View):
         self._mode           = mode
         self._selected_qid   = selected_qid
         self._normalize      = normalize
+        self._lyrics         = lyrics
         self.state: PanelState | None = None
         self.sig = None
 
@@ -1199,6 +1227,7 @@ class ControlView(discord.ui.View):
 
 
         self.add_item(NormalizeButton(self))
+        self.add_item(LyricsButton(self))
         if total_pages > 1:
             self.add_item(PrevPageButton(self))
             self.add_item(PageLabelButton(page, total_pages))
@@ -1241,7 +1270,8 @@ class ControlView(discord.ui.View):
             await interaction.followup.send(embed=embed, ephemeral=self.eph)
         if resp.get("message") in ("skipped", "restarted", "muted", "unmuted", "loop_on", "loop_off",
                                    "autoplay_on", "autoplay_off", "mode_all", "mode_me",
-                                   "normalize_on", "normalize_off", "paused", "resumed"):
+                                   "normalize_on", "normalize_off", "paused", "resumed",
+                                   "lyrics_on", "lyrics_off"):
             await _refresh_control_panel(interaction, self, page=self._queue_page, selected_qid=None)
         return resp
 
@@ -1306,6 +1336,76 @@ class PanelState:
             self.view.stop()
         self.view, self.sig = view, view.sig
 
+class PrivateLyrics:
+    """Lyrics for privately started playback. The worker sends each update as an event; they're shown
+    as an ephemeral follow-up to the 🎤 click (one per song, deleted when the song ends). Discord
+    only allows follow-ups for 15 minutes after a click, so private lyrics end at 14 with a notice."""
+
+    def __init__(self, interaction: discord.Interaction, worker: "WorkerProcess", guild_id: int):
+        self.interaction, self.worker, self.guild_id = interaction, worker, guild_id
+        self.started = time.monotonic()
+        self.msg = None
+        self.song = None
+        self.seq = 0
+        self.lock = asyncio.Lock()
+        self.expired = False
+
+    async def apply(self, ev: dict) -> None:
+        async with self.lock:
+            if ev.get("seq", 0) <= self.seq:
+                return   # an older update that arrived late
+            self.seq = ev["seq"]
+            try:
+                if ev.get("delete"):
+                    if self.song == ev.get("song"):
+                        await self._drop()
+                    return
+                if self.expired:
+                    return
+                if time.monotonic() - self.started > PANEL_LIFETIME:
+                    await self._expire()
+                    return
+                embed = discord.Embed.from_dict(ev["embed"])
+                if self.msg is not None and self.song == ev.get("song"):
+                    await self.msg.edit(embed=embed)
+                else:
+                    await self._drop()
+                    self.msg = await self.interaction.followup.send(embed=embed, ephemeral=True, wait=True)
+                    self.song = ev.get("song")
+            except Exception as exc:
+                print(f"[Main] Private lyrics update failed: {exc}", flush=True)
+
+    async def _drop(self) -> None:
+        if self.msg is not None:
+            try:
+                await self.msg.delete()
+            except Exception:
+                pass
+            self.msg = None
+
+    async def _expire(self) -> None:
+        self.expired = True
+        notice = discord.Embed(title="🎤  Private lyrics expired",
+                               description="Press 🎤 Lyrics in /control again.", colour=discord.Colour.dark_grey())
+        try:
+            if self.msg is not None:
+                await self.msg.edit(embed=notice)
+            else:
+                await self.interaction.followup.send(embed=notice, ephemeral=True)
+        except Exception:
+            pass
+        self.msg = None   # the notice stays; it isn't deleted with the song
+        _spawn(self.worker.send({"op": "toggle_lyrics", "guild_id": self.guild_id, "on": False}))
+
+    async def retire(self) -> None:
+        """Replaced by a newer 🎤 click."""
+        async with self.lock:
+            self.expired = True
+            await self._drop()
+
+_private_lyrics: dict[tuple[int, int], PrivateLyrics] = {}
+
+
 async def _build_control_view(worker: WorkerProcess, guild_id: int,
                                page: int = 0,
                                selected_qid: int | None = None,
@@ -1319,6 +1419,7 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
     autoplay: bool = resp.get("autoplay", False) if ok else False
     normalize: bool = resp.get("normalize", False) if ok else False
     paused: bool   = resp.get("paused", False) if ok else False
+    lyrics_on: bool = resp.get("lyrics", False) if ok else False
     session        = (resp.get("session") if ok else None) or worker.session(guild_id) or {}
     if ok:
         worker.apply(guild_id, resp.get("session"))
@@ -1335,10 +1436,10 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
         selected_qid = None
 
     view  = ControlView(worker, guild_id, queue, current_title,
-                        page, muted, loop, autoplay, mode, selected_qid, normalize)
+                        page, muted, loop, autoplay, mode, selected_qid, normalize, lyrics_on)
     view.state = state
     view.sig   = (current_title, tuple(q["qid"] for q in queue), muted, loop, autoplay, normalize,
-                  mode, controller, paused)
+                  mode, controller, paused, lyrics_on)
 
 
     for child in view.children:
@@ -1358,7 +1459,7 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
     end       = min(start + PAGE_SIZE, len(queue))
     page_info = f"  (page {page + 1}/{total_pages})" if total_pages > 1 else ""
     flags     = (("  ⏸️ paused" if paused else "") + ("  🔇 muted" if muted else "") + ("  🔁 loop" if loop else "") + ("  🎲 autoplay" if autoplay else "")
-                 + ("  🎚️ normalized" if normalize else ""))
+                 + ("  🎚️ normalized" if normalize else "") + ("  🎤 lyrics" if lyrics_on else ""))
     sel_info  = (f"\n✅ **Selected:** #{sel_item['index'] + 1} {_truncate(sel_item['title'], 50)}"
                  if sel_item else "")
     who       = (f"🔒 Controlled by <@{controller}>" if mode == "me" else

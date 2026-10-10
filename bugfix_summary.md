@@ -78,6 +78,8 @@ Status: pushed to GitHub and deployed (passes 1–8).
 | 41 | `/control`'s Stop, Autoplay and Control buttons had the same id in every version of the panel. Each refresh (song change, most button presses) retires the old version, and discord.py then forgot those ids for the message — including the new version's buttons. | **Stop, Autoplay and Control did nothing** after the panel had refreshed once ("This interaction failed"), with nothing in the logs. | Ids are unique per panel version. Every control was tested through discord.py's real dispatch with refreshes in between. Pause now shows ⏸/▶ and the panel shows "paused"; after Stop it says "Stopped". |
 | 42 | A search word that's part of one result's artist name ("morena" vs the artist "Illest Morena") was treated as naming the artist, which switched off the user's history. | "morena" played "Thobela Morena" instead of LeoTHM's "MORENA" that you played 3 times. | A word is an artist name only when more results have it in the artist than in the title. "noite quente m22" still picks M22. |
 
+Also fixed while adding lyrics: `requirements.txt` had `python-dotenv>=1.0.0yt-dlp` on one line (a missing line break), so `pip install -r requirements.txt` failed on a fresh install.
+
 Also two cleanups with no behaviour change: the watchdog's leftover indentation, and skipping status/idle calls for a session that already ended.
 
 ---

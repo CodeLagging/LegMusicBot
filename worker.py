@@ -6,7 +6,6 @@ import random
 import re
 import sys
 import time
-import unicodedata
 import logging
 from collections import deque
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +35,8 @@ from groq import AsyncGroq
 
 import appsettings
 import db
+import lyrics
+from textnorm import artist_key as _artist_key, fold as _fold, norm_title as _norm_title, words as _words
 
 # Fire-and-forget tasks are kept here until they finish: asyncio only holds weak references to
 # tasks, so an unreferenced task can be garbage-collected mid-run (Python docs, create_task).
@@ -79,6 +80,10 @@ AUTOPLAY_MIX_DEPTH = 30    # songs used from each seed's YouTube Mix (deeper = m
 # For new songs the only history signal is the artist. At full weight, new songs by artists the
 # user already plays won every slot; at this weight about half are (the rest are new artists).
 AUTOPLAY_NEW_TASTE_W = 0.15
+
+LYRICS_TICK    = 0.25    # seconds between position checks while lyrics show
+LYRICS_LEAD_MS = 400     # lines are sent this early, to cover the time a message edit takes
+LYRICS_MIN_GAP = 1.2     # seconds between lyric edits at most (fast lines skip straight to the latest)
 
 _groq         = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
 _GROQ_MODEL   = "openai/gpt-oss-20b"
@@ -335,13 +340,6 @@ def _is_local(track: wavelink.Playable) -> bool:
         bool(uri) and not uri.startswith("http") and not _SPOTIFY_RE.search(uri)
     )
 
-def _fold(text: str) -> str:
-    """Lower-case and strip accents, so 'Tântrico' matches 'tantrico'."""
-    nfkd = unicodedata.normalize("NFKD", text or "")
-    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
-
-def _words(text: str) -> list[str]:
-    return [w for w in re.split(r"\W+", _fold(text)) if len(w) > 1]
 
 def _track_score(track: wavelink.Playable, query: str = "",
                  ref: wavelink.Playable | None = None) -> int:
@@ -392,14 +390,6 @@ _taste_cache: dict[tuple[int, int], tuple[float, dict]] = {}
 PERSONAL_HALF_LIFE_DAYS = 30   # personal boosts fade with time since the last listen
 PERSONAL_STRONG = 40           # personal score that overrides the AI's generic pick
 
-_CHANNEL_SUFFIX_RE = re.compile(r"(\s*-\s*topic|\s*vevo|\s+official|\s+music|\s+oficial)$")
-
-def _artist_key(author: str) -> str:
-    """'Sxilwix - Topic', 'SxilwixVEVO' and 'Sxilwix' are the same artist."""
-    a = _fold(author or "").strip()
-    for _ in range(2):
-        a = _CHANNEL_SUFFIX_RE.sub("", a).strip()
-    return a
 
 def _song_id(title: str, author: str) -> tuple[str, str]:
     return _norm_title(_fold(title or "")), _artist_key(author)
@@ -640,6 +630,14 @@ class Session:
         # Lavalink, so a /play landing while another song was still resolving or connecting
         # started too, and one replaced the other (that song was lost).
         self.play_lock = asyncio.Lock()
+        # Synced lyrics (🎤 in /control): one message per song, edited as it plays. Private when
+        # playback was started privately (then the controller shows it as an ephemeral message).
+        self.lyrics_on      = False
+        self.lyrics_private = False
+        self.lyrics_task: asyncio.Task | None = None
+        self.current_length = 0       # length of the upload actually playing (lyrics timing check)
+        self.pos_base_ms    = 0       # our own playback clock, see _play_position
+        self.pos_mark_ns    = 0
 
     def snapshot(self) -> dict:
         return {
@@ -927,6 +925,7 @@ def _set_current(sess: Session, origin: wavelink.Playable,
                  yt_src: wavelink.Playable | None, requester: int | None,
                  query: str | None = None) -> None:
     meta = _track_meta(origin, yt_src)
+    sess.current_length    = int((yt_src or origin).length or 0)
     sess.current_info      = {"title": origin.title or "Unknown", "author": origin.author or ""}
     sess.current_meta      = meta
     sess.current_requester = requester
@@ -947,6 +946,7 @@ async def _set_vc_status(guild_id: int, channel_id: int, title: str | None) -> N
         print(f"[Worker {BOT_INDEX}] Voice status update failed: {exc}", flush=True)
 
 def _after_start(sess: Session) -> None:
+    _mark_position(sess, 0)
     if sess.current_info:
         _spawn(_set_vc_status(sess.guild_id, sess.channel_id, sess.current_info["title"]))
     if _humans_in_vc(sess):
@@ -956,6 +956,8 @@ def _after_start(sess: Session) -> None:
         # nobody is in): keep the idle timer, or the bot plays to an empty channel forever.
         _start_idle_timer(sess)
     _prefetch_next(sess)
+    if sess.lyrics_on:
+        _start_lyrics(sess)
     if sess.autoplay and not sess.queue:
         _kick_autoplay(sess)
 
@@ -1094,6 +1096,159 @@ async def _apply_normalize(player: wavelink.Player, on: bool) -> None:
     await player.set_filters(filters)
 
 
+# ── playback position ────────────────────────────────────────────────────────
+
+def _mark_position(sess: Session, pos_ms: int) -> None:
+    """Remember where playback is right now (song start, seek, pause, resume)."""
+    sess.pos_base_ms = int(pos_ms)
+    sess.pos_mark_ns = time.monotonic_ns()
+
+def _play_position(sess: Session, player: wavelink.Player) -> int:
+    """Playback position in ms. wavelink only learns it from Lavalink's updates (every 5 s), so right
+    after a song starts, a seek or a resume its value is stale (it kept counting from the previous
+    song). Until a newer update arrives, count from our own mark instead."""
+    last_ns = getattr(player, "_last_update", None)
+    if last_ns is not None and last_ns > sess.pos_mark_ns:
+        base, since = int(getattr(player, "_last_position", 0)), last_ns
+    else:
+        base, since = sess.pos_base_ms, sess.pos_mark_ns
+    if player.paused:
+        return base
+    return base + (time.monotonic_ns() - since) // 1_000_000
+
+async def _set_paused(sess: Session, player: wavelink.Player, paused: bool) -> None:
+    pos = _play_position(sess, player)
+    await player.pause(paused)
+    _mark_position(sess, pos)
+
+
+# ── lyrics ───────────────────────────────────────────────────────────────────
+
+_lyrics_seq = 0
+
+def _lyrics_embed(title: str, body: str) -> discord.Embed:
+    return discord.Embed(title=f"Lyrics - {title}"[:256], description=body, colour=COLOUR)
+
+class _LyricsOut:
+    """Where one song's lyrics go: a message in the session's text channel (public playback), or
+    the controller's ephemeral follow-up to the 🎤 click (private playback)."""
+    _songs = 0
+
+    def __init__(self, sess: Session):
+        _LyricsOut._songs += 1
+        self.sess, self.song, self.private = sess, _LyricsOut._songs, sess.lyrics_private
+        self.msg: discord.Message | None = None
+        self.sent = self.failed = False
+
+    def _event(self, embed: discord.Embed | None) -> None:
+        global _lyrics_seq
+        if _events is None:
+            return
+        _lyrics_seq += 1
+        _events.put_nowait({"op": "lyrics", "index": BOT_INDEX, "guild_id": self.sess.guild_id,
+                            "song": self.song, "seq": _lyrics_seq,
+                            "embed": embed.to_dict() if embed else None, "delete": embed is None})
+
+    async def show(self, embed: discord.Embed) -> None:
+        if self.failed:
+            return
+        if self.private:
+            self._event(embed)
+            self.sent = True
+            return
+        try:
+            if self.msg is None:
+                if not self.sess.text_channel:
+                    self.failed = True
+                    return
+                self.msg = await self.sess.text_channel.send(embed=embed)
+            else:
+                await self.msg.edit(embed=embed)
+        except discord.NotFound:
+            self.msg = None   # someone deleted it: the next line posts a new one
+        except Exception as exc:
+            self.failed = True
+            print(f"[Worker {BOT_INDEX}] Lyrics message failed in guild {self.sess.guild_id}: {exc}", flush=True)
+
+    async def close(self) -> None:
+        """The song is over: its lyrics message goes away."""
+        if self.private:
+            if self.sent:
+                self._event(None)
+        elif self.msg is not None:
+            try:
+                await self.msg.delete()
+            except Exception:
+                pass
+            self.msg = None
+
+async def _lyrics_song(sess: Session, player: wavelink.Player, track: wavelink.Playable) -> None:
+    """One song's synced lyrics: previous / current / next line, edited as it plays. Edits happen
+    only when the line changes and at most every LYRICS_MIN_GAP; each edit is awaited, so fast lines
+    skip to the latest instead of queueing up (no rate-limit backlog). Deleted when the song ends."""
+    info   = dict(sess.current_info or {})
+    title  = info.get("title") or getattr(track, "title", None) or "Unknown"
+    artist = info.get("author") or getattr(track, "author", None) or ""
+    yt_id  = (sess.current_meta or {}).get("yt_id") or None
+    length = sess.current_length or int(getattr(track, "length", 0) or 0)
+    out    = _LyricsOut(sess)
+
+    def playing() -> bool:
+        return sessions.get(sess.guild_id) is sess and sess.lyrics_on and player.current is track
+
+    try:
+        lookup = asyncio.ensure_future(lyrics.find(title, artist, length, yt_id))
+        done, _ = await asyncio.wait([lookup], timeout=1.0)
+        if not done and playing():
+            # Not cached yet (the providers take a few seconds): show that something is happening.
+            await out.show(_lyrics_embed(title, "Looking up synced lyrics…"))
+        found, report = await lookup
+        print(f"[Worker {BOT_INDEX}] Lyrics for {title!r}: {report}", flush=True)
+        if not playing():
+            return
+        if found is None:
+            await out.show(_lyrics_embed(title, "Synced lyrics not available"))
+            while playing():
+                await asyncio.sleep(1)
+            return
+        shown, last = None, 0.0
+        while playing():
+            if not player.paused:
+                state = lyrics.state_at(found, _play_position(sess, player) + LYRICS_LEAD_MS)
+                if state != shown and time.monotonic() - last >= LYRICS_MIN_GAP:
+                    await out.show(_lyrics_embed(title, lyrics.render(state)))
+                    shown, last = state, time.monotonic()
+            await asyncio.sleep(LYRICS_TICK)
+    except Exception as exc:
+        print(f"[Worker {BOT_INDEX}] Lyrics stopped for {title!r}: {exc}", flush=True)
+    finally:
+        await out.close()
+
+def _start_lyrics(sess: Session) -> None:
+    """Lyrics for the song that's playing now (called when a song starts and when 🎤 is turned on)."""
+    _stop_lyrics(sess)
+    player = _get_player(sess.guild_id)
+    if player is None or player.current is None or not sess.current_info:
+        return
+    sess.lyrics_task = asyncio.ensure_future(_lyrics_song(sess, player, player.current))
+    if sess.queue:
+        # Look up the next song now, so its lyrics are ready (cached) the moment it starts.
+        nxt = sess.queue[0][0]
+        nxt_yt = nxt.identifier if _YT_RE.search(nxt.uri or "") else None
+        _spawn(_prefetch_lyrics(nxt.title or "", nxt.author or "", int(nxt.length or 0), nxt_yt))
+
+async def _prefetch_lyrics(title: str, artist: str, length: int, yt_id: str | None) -> None:
+    try:
+        await lyrics.find(title, artist, length, yt_id)
+    except Exception:
+        pass
+
+def _stop_lyrics(sess: Session) -> None:
+    if sess.lyrics_task and not sess.lyrics_task.done():
+        sess.lyrics_task.cancel()   # its finally deletes the song's lyrics message
+    sess.lyrics_task = None
+
+
 # ── graceful restart ─────────────────────────────────────────────────────────
 
 async def _play_shutdown_message(sess: Session, player: wavelink.Player | None) -> None:
@@ -1102,6 +1257,8 @@ async def _play_shutdown_message(sess: Session, player: wavelink.Player | None) 
     if sess.drain_state == "message":
         return
     sess.drain_state = "message"
+    sess.lyrics_on = False
+    _stop_lyrics(sess)
     sess.queue.clear()
     sess.autoplay = sess.loop = False
     _cancel_idle_timer(sess)
@@ -1147,10 +1304,6 @@ def _same_song(a: wavelink.Playable, b: wavelink.Playable) -> bool:
     same_artist = _artist_key(a.author) == _artist_key(b.author)
     return same_artist or abs((a.length or 0) - (b.length or 0)) <= 8000
 
-def _norm_title(title: str) -> str:
-    t = re.sub(r"[\(\[].*?[\)\]]", " ", (title or "").lower())
-    t = re.sub(r"\b(official|audio|video|lyrics?|music|hd|hq|4k|mv)\b", " ", t)
-    return " ".join(re.findall(r"\w+", t))
 
 def _excluded_sets(sess: Session) -> tuple[set[str], set[str]]:
     ids, titles = set(), set()
@@ -1411,6 +1564,7 @@ async def _end_session(guild_id: int, disconnect: bool = True) -> None:
     if not sess:
         return
     sess.closing = True
+    _stop_lyrics(sess)
     _cancel_idle_timer(sess)
     if sess.autoplay_task and not sess.autoplay_task.done():
         sess.autoplay_task.cancel()
@@ -1610,6 +1764,14 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     await _advance_safely(sess, player)
 
 @bot.event
+async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
+    """Lavalink says the audio really started (loading takes a moment after play()): restart our
+    playback clock here so lyrics line up with what people hear."""
+    sess = _session_for_player(payload.player)
+    if sess and payload.player.current is not None:
+        _mark_position(sess, 0)
+
+@bot.event
 async def on_wavelink_track_stuck(payload: wavelink.TrackStuckEventPayload):
     """Lavalink says the stream stopped delivering audio. Without this the song just sat silent."""
     player: wavelink.Player = payload.player
@@ -1723,7 +1885,7 @@ async def on_voice_state_update(member: discord.Member, before, after):
         print(f"[Worker {BOT_INDEX}] VC empty in guild {sess.guild_id} — pausing, idle timer started", flush=True)
         if player and player.current and not player.paused:
             try:
-                await player.pause(True)
+                await _set_paused(sess, player, True)
                 sess.auto_paused = True
             except Exception:
                 pass
@@ -1731,7 +1893,7 @@ async def on_voice_state_update(member: discord.Member, before, after):
     else:
         if sess.auto_paused and player and player.paused:
             try:
-                await player.pause(False)
+                await _set_paused(sess, player, False)
             except Exception:
                 pass
         sess.auto_paused = False
@@ -2234,6 +2396,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                         autoplay=sess.autoplay if sess else False,
                         normalize=sess.normalize if sess else False,
                         paused=bool(sess and player and player.paused),
+                        lyrics=bool(sess and sess.lyrics_on),
                         session=sess.snapshot() if sess else None)
             return
 
@@ -2246,12 +2409,12 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                 await reply(False, "Nothing playing.")
                 return
             if player.paused:
-                await player.pause(False)
+                await _set_paused(sess, player, False)
                 sess.auto_paused = False
                 _cancel_idle_timer(sess)
                 await reply(True, "resumed")
             else:
-                await player.pause(True)
+                await _set_paused(sess, player, True)
                 await reply(True, "paused")
             return
 
@@ -2274,6 +2437,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                 await reply(False, "Nothing playing.")
                 return
             await player.seek(0)
+            _mark_position(sess, 0)
             await reply(True, "restarted")
             return
 
@@ -2287,6 +2451,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             if length and pos > length:   # streams have no length: don't clamp them to 0
                 pos = max(0, length - 1000)
             await player.seek(int(pos))
+            _mark_position(sess, int(pos))
             await reply(True, "seeked", delta_ms=delta)
             return
 
@@ -2327,6 +2492,19 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             _notify(gid)
             await reply(True, "autoplay_on" if sess.autoplay else "autoplay_off",
                         autoplay=sess.autoplay, session=sess.snapshot())
+            return
+
+        if op == "toggle_lyrics":
+            # "on" sets it explicitly (the panel sends what its button shows); without it, toggles.
+            want = cmd.get("on")
+            sess.lyrics_on = (not sess.lyrics_on) if want is None else bool(want)
+            if sess.lyrics_on:
+                sess.lyrics_private = not sess.announce   # private playback -> private lyrics
+                _start_lyrics(sess)
+            else:
+                _stop_lyrics(sess)
+            await reply(True, "lyrics_on" if sess.lyrics_on else "lyrics_off",
+                        lyrics=sess.lyrics_on, private=sess.lyrics_private)
             return
 
         if op == "toggle_normalize":
@@ -2532,6 +2710,7 @@ async def _ipc_server():
 
 
 async def _shutdown():
+    await lyrics.close()
     await bot.close()
     if SOCKET_PATH.exists():
         SOCKET_PATH.unlink()

@@ -245,6 +245,37 @@ def user_query_count(guild_id: int, user_id: int) -> int:
     with _tx(_algo_con(guild_id)) as con:
         return con.execute("SELECT COUNT(*) FROM user_queries WHERE user_id = ?", (user_id,)).fetchone()[0]
 
+# ── lyrics cache (database/lyrics.db) ────────────────────────────────────────
+
+LYRICS_DB = DB_ROOT / "lyrics.db"
+
+def _lyrics_con() -> sqlite3.Connection:
+    con = _connect(LYRICS_DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS lyrics_cache (
+        cache_key   TEXT PRIMARY KEY,
+        provider    TEXT,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        lines       TEXT,
+        fetched     REAL NOT NULL)""")
+    return con
+
+def lyrics_get(cache_key: str) -> dict | None:
+    """A cached lyrics lookup: lines (JSON) and the source's duration, or lines NULL for
+    "no synced lyrics anywhere". None when this song was never looked up."""
+    with _tx(_lyrics_con()) as con:
+        row = con.execute("SELECT provider, duration_ms, lines, fetched FROM lyrics_cache WHERE cache_key = ?",
+                          (cache_key,)).fetchone()
+    return dict(row) if row else None
+
+def lyrics_put(cache_key: str, provider: str | None, duration_ms: int, lines: str | None) -> None:
+    with _tx(_lyrics_con()) as con:
+        con.execute("""INSERT INTO lyrics_cache (cache_key, provider, duration_ms, lines, fetched)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(cache_key) DO UPDATE SET provider = excluded.provider,
+                         duration_ms = excluded.duration_ms, lines = excluded.lines, fetched = excluded.fetched""",
+                    (cache_key, provider, int(duration_ms or 0), lines, time.time()))
+
+
 def user_stats(guild_id: int, user_id: int) -> tuple[int, int]:
     """(song count, approx bytes) for one user."""
     if not (ALGO_DIR / f"{int(guild_id)}.db").exists():
