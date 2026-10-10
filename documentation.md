@@ -110,8 +110,8 @@ When playback is started with a private command (`P_EPH`, `PL_EPH` or `AP_EPH` o
 | `/play query [source] [worker]` | Anyone (subject to section 4) | Plays a song by name or URL, or queues it if your worker is already playing. |
 | `/playlist query [source] [worker]` | Anyone (subject to section 4) | Plays or queues a whole playlist (Spotify, YouTube, SoundCloud, Apple Music). |
 | `/autoplay [worker]` | Anyone with saved songs | Starts music picked from **your** saved songs on this server, without a query. If you already control a playing worker, it switches that worker's autoplay to your saved songs. |
-| `/stop [worker]` | Controller, devs, Manage Server | Stops the worker and makes it leave. |
-| `/control [worker]` | Controller (or anyone in "All" mode), devs | Opens the playback control panel. |
+| `/stop [worker]` | Controller (or anyone in "All" mode), devs, Manage Server | Stops the worker and makes it leave. |
+| `/control [worker] [no_eph]` | Controller (or anyone in "All" mode), devs, Manage Server | Opens the playback control panel. `no_eph:true` makes the session **public**: its panel and every reply about it (`/play`, `/playlist`, `/autoplay`, `/stop`, `/control`, panel buttons) from people in that voice channel are visible to the channel, whatever the private-reply settings say. People in other voice channels aren't affected. Control is unchanged: in Me mode others can see the panel but not use it. `no_eph:false` turns it off. |
 | `/hctest` | Anyone | Health check of the controller and every worker. |
 | `/settings` | Manage Server or dev | Opens the per-server settings panel (only you can use it). |
 | `/reset-algo` | Anyone (only themselves) | Opens your algo menu: all your saved songs on this server (25 per page, best first). Select songs to remove (🟠 Remove selected) or 🗑️ Reset all; both ask for confirmation, and the remove confirmation lists the exact songs. Selections are by song, not position. There is no way to see or change someone else's. Works in any channel; always private. |
@@ -126,7 +126,19 @@ The `worker` option forces a specific worker (0 = automatic). It is needed to us
 | 0 | ⏪ 10s, ⏪ 5s, ⏩ 5s, ⏩ 10s, 🔁 Loop |
 | 1 | ⏮ Backward (restart track), ⏸ Pause / ▶ Resume (shows which one applies), ⏹ Stop, ⏭ Skip, 🔇 Mute (hides now-playing messages) |
 
-The panel **updates itself** every 8 s when the song, queue or a setting changes (keeping your page and selection), and shows "Playback ended" when the session stops. The header shows ⏸️ paused, 🔇 muted, 🔁 loop, 🎲 autoplay and 🎚️ normalized when they're on. After ⏹ Stop the panel says "Stopped" and its buttons are disabled. Discord only allows editing it for 15 minutes, so at 14 minutes it turns into "Panel expired — run /control again".
+The panel **updates itself** (keeping your page and selection):
+- **right away** when the worker reports a change: the next song is picked (shown while it loads), a song starts, or the queue changes;
+- otherwise it checks every 4 s;
+- the header shows ⏸️ paused, 🔇 muted, 🔁 loop, 🎲 autoplay, 🎚️ normalized and 🎤 lyrics when they're on;
+- the bottom line shows **"⏳ Panel expires in: X min"**, updated every minute. Discord only allows editing the panel for 15 minutes; it counts down to 14.
+
+Panels that can't do anything any more **delete themselves**:
+- **The session ended** (⏹ Stop, idle timeout, kicked, …): the panel shows "Stopped" or "Playback ended" for 5 s, then it's deleted.
+- **A new session started on that worker:** an old panel never controls the new session (each session has an id); it's deleted.
+- **A public panel expired** (14 min): deleted. A private panel is marked "Panel expired" instead.
+- **Restart:** open panels are deleted while the bot shuts down.
+
+Before deleting for a session end, the panel confirms it with the worker, so a missed sync can't delete a working panel. 🎤 Lyrics posts no message: the button just turns green.
 | 2 | Queue dropdown (25 per page; 🎲 marks autoplay picks) |
 | 3 | ⏭ Jump To, 🗑 Remove, ✖ Clear selection, 🎲 Autoplay, 🔒 Control: Me / 🔓 Control: All |
 | 4 | 🎚️ Normalize (evens out loud and quiet songs; default off; also applies to the shutdown message), 🎤 Lyrics (live synced lyrics, see section 13), then page buttons for queues longer than one page |
@@ -165,9 +177,9 @@ Typed as a message wrapped in two backticks on each side. Only users in `dev_ids
 
 - Whoever starts playback on a free worker (with `/play`, `/playlist` or `/autoplay`) becomes that session's **controller**. The session starts in **Me** mode.
 - In **Me** mode, only the controller can play, queue, use the panel or stop. Anyone else in that voice channel is told the worker is controlled by the controller and to join another voice channel to get their own worker. They cannot even add songs to the queue.
-- The controller (or a dev) can switch the panel's 🔒/🔓 button to **All**, which lets everyone control that worker. Only the controller (or a dev) can switch it back.
-- **Devs** (`dev_ids`) can always control any session.
-- Members with **Manage Server** can always **Stop** a session (with `/stop` or the panel's Stop button), even in Me mode, so a session can't get stuck if its controller leaves.
+- The controller (or a dev or Manage Server member) can switch the panel's 🔒/🔓 button to **All**, which lets everyone control that worker, and switch it back.
+- **Devs** (`dev_ids`) and members with **Manage Server** bypass Me/All: they can always play, queue, use the panel and stop any session.
+- `/control no_eph:true` makes a session's replies public (section 3) without changing who can control it: in Me mode the channel can watch the panel but not use it.
 - When the session ends (stop, idle timeout, kicked, failures), the worker is free again and the next user to start playback on it becomes the new controller.
 
 ---
@@ -328,7 +340,10 @@ True when the user is in `dev_ids`.
 True when the member has a server permission such as `manage_guild`.
 
 **`def _allowed(session, user)`**
-The control rule: True for devs, the session's controller, or anyone when the session is in All mode.
+The control rule: True for devs, members with Manage Server, the session's controller, or anyone when the session is in All mode.
+
+**`def _session_public(interaction, worker_arg=0)`** / **`def _reply_eph(interaction, key, worker_arg=0)`**
+Whether a reply is private: the server's setting for the command, unless the session it goes to (found from the user's voice channel or the `worker` option, using the cached state so it's decided within Discord's 3 seconds) was made public with `/control no_eph:true`.
 
 **`def _locked_msg(w, session)`**
 The "🔒 Worker N is controlled by @X. Join another voice channel to get your own worker." text.
@@ -479,7 +494,12 @@ Fetches `get_queue`, stores the session snapshot, clamps the page, drops a selec
 `/reset-algo`: the algo menu (dropdown of saved songs by `track_key`, page buttons, 🗑️ Reset all, 🟠 Remove selected, Cancel) and its confirm step (Yes / Back). Only the person who opened it can use it. The Yes click is acknowledged right away (telling the workers to forget can take longer than Discord's 3-second limit), then the message is edited. After removing, the menu reopens with the updated list; workers drop their cached copy of the user's history (`forget_user`).
 
 **`class PanelState`**, **`async def _panel_autorefresh(state)`**
-An open panel's message and newest view; every `PANEL_REFRESH` (8 s) the panel is rebuilt and edited only if what it shows changed (`view.sig`). At 14 minutes (just before Discord's 15-minute edit limit) it replaces itself with "Panel expired — run /control again" and removes the buttons; it also stops when the session ends.
+An open panel: its message, newest view, session id (`sid`), whether it's public, and a `wake` event. The panel is registered in `_open_panels` per (worker, server). A worker `panel` event sets `wake`, so the panel redraws within about 0.3 s; otherwise it checks every `PANEL_REFRESH` (4 s). It's edited only if what it shows changed (`view.sig`, which includes the minutes left, so the countdown updates once a minute).
+- **`session()`** — the panel's session, or None once it ended or another session (different `sid`) replaced it.
+- **`ended()`** — confirms that with the worker before anything is deleted; a worker that doesn't answer counts as "not sure".
+- **`retire(note)`** — shows the note for `PANEL_END_NOTE` (5 s), then deletes the message.
+
+At 14 minutes a public panel is deleted, and a private one is marked "Panel expired". `ControlView.interaction_check` refuses buttons on a panel whose session ended or was replaced. On shutdown, every open panel is deleted.
 
 **`async def _refresh_control_panel(interaction, ctrl, page=0, selected_idx=None)`**
 Rebuilds the panel and edits the message in place. Errors are only logged.
@@ -952,6 +972,7 @@ The controller sends one JSON object per connection to `.worker<N>.sock`, with `
 | `toggle_autoplay` | Turns autoplay on (needs played history unless in algo mode; starts playing if idle) or off (drops queued picks). | `autoplay_on` or `autoplay_off`, `session` |
 | `set_mode` | Sets `mode` to `me` or `all`. | `mode_me` or `mode_all`, `session` |
 | `toggle_normalize` | Turns the normalization filter on or off. | `normalize_on` or `normalize_off` |
+| `set_no_eph` | `/control no_eph`: makes the session's replies public (`on: true`; also turns on now-playing posts) or not. | `no_eph_on` or `no_eph_off` with `session` |
 | `toggle_lyrics` | Turns lyrics on or off for the session (`on` sets it, without `on` it toggles). Lyrics are private when the playback was started privately. | `lyrics_on` or `lyrics_off` with `lyrics`, `private` |
 | `forget_user` | After `/reset-algo`: drops the user's cached history and doesn't re-save the song playing now. | `forgotten` |
 | `jump_to` | Records a listen or quick skip for the current track, drops the queue up to the song with `qid` and plays it. Error if it already played or was removed. | `jumped` with `title`, `author`, `queue_remaining` |
@@ -966,10 +987,12 @@ Session operations on a server where the worker has no session reply "Nothing pl
 Sent to `.main.sock`, one JSON line per connection, in order:
 
 ```json
-{"op": "state", "index": 2, "guild_id": 123, "session": {"channel_id": 456, "controller_id": 789, "mode": "me", "autoplay": false, "text_channel_id": 111}}
+{"op": "state", "index": 2, "guild_id": 123, "session": {"channel_id": 456, "controller_id": 789, "mode": "me", "autoplay": false, "text_channel_id": 111, "sid": 5, "no_eph": false}}
 ```
 
 `session` is `null` when the session ended. Sent when a session is created or ends, and on autoplay, mode and channel changes.
+
+When something a panel shows changes (next song picked or started, queue changed), the worker sends `{"op": "panel", "index": 2, "guild_id": 123}` so open panels redraw right away. A playlist being added sends one event, not one per song.
 
 For private lyrics the worker also sends:
 
@@ -993,6 +1016,9 @@ For private lyrics the worker also sends:
 | `PLAY_TIMEOUT` | main.py | 90 s | How long `/play`, `/playlist` and `/autoplay` wait for the worker (search + voice connect + stream). |
 | `IPC_LINE_LIMIT` | main.py | 8 MB | Longest worker reply accepted (big playlist queues). |
 | `HUNG_AFTER` | main.py | 4 | Failed 30-second health checks in a row before a running-but-frozen worker is killed and restarted. |
+| `PANEL_REFRESH` | main.py | 4 s | How often an open /control panel checks for changes (worker `panel` events redraw it right away). |
+| `PANEL_LIFETIME` | main.py | 14 min | A panel's life: Discord allows editing it for 15 minutes. Public panels are deleted then, private ones marked expired. |
+| `PANEL_END_NOTE` | main.py | 5 s | How long an ended panel shows "Stopped" / "Playback ended" before it's deleted. |
 | `PAGE_SIZE` | main.py | 25 | Queue entries per dropdown page (Discord limit). |
 | ControlView timeout | main.py | 900 s | Control panel buttons stop working after 15 minutes. |
 | SettingsView timeout | main.py | 600 s | Settings panel stops working after 10 minutes. |

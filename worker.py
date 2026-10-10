@@ -592,6 +592,8 @@ def _queue_pos(sess: "Session", qid: int) -> int | None:
     return next((i for i, q in enumerate(sess.queue) if q.qid == qid), None)
 
 class Session:
+    _ids = 0
+
     def __init__(self, guild_id: int, channel_id: int, controller_id: int):
         self.guild_id      = guild_id
         self.channel_id    = channel_id
@@ -623,6 +625,9 @@ class Session:
         self.closing      = False
         self.drain_state: str | None = None   # None, "finishing" (current song) or "message" (shutdown.mp3)
         self.created      = time.monotonic()
+        Session._ids     += 1
+        self.sid          = Session._ids   # panels belong to one session, not to whatever plays next
+        self.no_eph       = False          # /control no_eph: replies about this session are public
         self.stalled      = 0      # watchdog passes in a row with songs queued but nothing playing
         self.mix_cache: dict[str, list] = {}   # seed YouTube id -> its Mix, reused across refills
         self.ai_reserve: list[str] = []        # unused AI suggestions, used before asking Groq again
@@ -647,6 +652,8 @@ class Session:
             "mode":            self.mode,
             "autoplay":        self.autoplay,
             "text_channel_id": self.text_channel.id if self.text_channel else None,
+            "sid":             self.sid,
+            "no_eph":          self.no_eph,
         }
 
 sessions: dict[int, Session] = {}
@@ -948,6 +955,7 @@ async def _set_vc_status(guild_id: int, channel_id: int, title: str | None) -> N
 
 def _after_start(sess: Session) -> None:
     _mark_position(sess, 0)
+    _panel_changed(sess)
     if sess.current_info:
         _spawn(_set_vc_status(sess.guild_id, sess.channel_id, sess.current_info["title"]))
     if _humans_in_vc(sess):
@@ -1022,8 +1030,24 @@ def _account(sess: Session, played_ms: int | None = None,
 def _can_post(sess: Session) -> bool:
     return bool(sess.text_channel) and sess.announce and not sess.muted
 
+_panel_pending: set[int] = set()
+
+def _panel_changed(sess: Session) -> None:
+    """Open /control panels for this session redraw now (song picked or started, queue changed)
+    instead of at their next check. Many changes in a row (a playlist) send one event."""
+    if _events is None or sess.guild_id in _panel_pending:
+        return
+    _panel_pending.add(sess.guild_id)
+
+    def flush(gid: int = sess.guild_id) -> None:
+        _panel_pending.discard(gid)
+        if _events is not None:
+            _events.put_nowait({"op": "panel", "index": BOT_INDEX, "guild_id": gid})
+    asyncio.get_running_loop().call_soon(flush)
+
 def _enqueue(sess: Session, item: QueueItem) -> int:
     """User songs go ahead of autoplay picks. Returns the 1-based queue position."""
+    _panel_changed(sess)
     for i, q in enumerate(sess.queue):
         if q[1] == AUTOPLAY_LABEL:
             sess.queue.insert(i, item)
@@ -1047,6 +1071,9 @@ async def _next_song(sess: Session, player: wavelink.Player, announce: bool) -> 
     while sess.queue and sessions.get(sess.guild_id) is sess:
         item = sess.queue.pop(0)
         nxt, nxt_label, nxt_path, req = item
+        # Panels show the next song as soon as it's picked, not only once it has loaded.
+        sess.current_info = {"title": nxt.title or "Unknown", "author": nxt.author or ""}
+        _panel_changed(sess)
         try:
             played = await _play(sess, player, nxt, req, item.query)
         except Exception as exc:
@@ -1067,6 +1094,7 @@ async def _next_song(sess: Session, player: wavelink.Player, announce: bool) -> 
     if sessions.get(sess.guild_id) is not sess:
         return
     sess.current_info = None
+    _panel_changed(sess)
     _spawn(_set_vc_status(sess.guild_id, sess.channel_id, None))
     _start_idle_timer(sess)
 
@@ -1522,6 +1550,7 @@ async def _autoplay_refill(sess: Session) -> None:
     for t, lbl, path in recs:
         sess.queue.append(QueueItem(t, lbl, path, requester, AUTOPLAY_QUERY))
     if recs:
+        _panel_changed(sess)
         print(f"[Worker {BOT_INDEX}] Autoplay queued: {', '.join(repr(t.title) for t, _, _ in recs)}", flush=True)
         _prefetch_next(sess)
 
@@ -2391,7 +2420,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
 
         if op == "get_queue":
             current = None
-            if sess and player and player.current:
+            if sess and (sess.current_info or (player and player.current)):
                 info = sess.current_info or {"title": player.current.title or "Unknown",
                                              "author": player.current.author or ""}
                 current = {"title": info["title"], "author": info["author"], "index": -1}
@@ -2471,6 +2500,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                 return
             removed_title = sess.queue[idx][0].title or "Unknown"
             del sess.queue[idx]
+            _panel_changed(sess)
             await reply(True, "removed", title=removed_title, queue_remaining=len(sess.queue))
             return
 
@@ -2501,6 +2531,15 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
             _notify(gid)
             await reply(True, "autoplay_on" if sess.autoplay else "autoplay_off",
                         autoplay=sess.autoplay, session=sess.snapshot())
+            return
+
+        if op == "set_no_eph":
+            # /control no_eph: replies about this session are public (control itself is unchanged).
+            sess.no_eph = bool(cmd.get("on"))
+            if sess.no_eph:
+                sess.announce = True   # now-playing posts and lyrics are public too
+            _notify(gid)
+            await reply(True, "no_eph_on" if sess.no_eph else "no_eph_off", session=sess.snapshot())
             return
 
         if op == "toggle_lyrics":

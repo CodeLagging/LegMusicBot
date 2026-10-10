@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import re
 import signal
@@ -372,6 +373,9 @@ async def _handle_event(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             w = _workers.get(int(msg["index"]))
             if w:
                 w.apply(int(msg["guild_id"]), msg.get("session"))
+        elif msg.get("op") == "panel":
+            for st in _open_panels.get((int(msg["index"]), int(msg["guild_id"])), ()):
+                st.wake.set()
         elif msg.get("op") == "lyrics":
             st = _private_lyrics.get((int(msg["index"]), int(msg["guild_id"])))
             if st:
@@ -467,11 +471,27 @@ def _has_perm(user, perm: str) -> bool:
     return bool(perms and getattr(perms, perm, False))
 
 def _allowed(session: dict | None, user) -> bool:
-    """Whoever started playback controls it, unless they opened it to everyone. Devs can always control."""
+    """Whoever started playback controls it, unless they opened it to everyone. Devs and members
+    with Manage Server can always control (Me/All doesn't apply to them)."""
     if not session:
         return False
-    return (_is_dev(user) or session.get("controller_id") == user.id
+    return (_is_dev(user) or _has_perm(user, "manage_guild") or session.get("controller_id") == user.id
             or session.get("mode") == "all")
+
+def _session_public(interaction: discord.Interaction, worker_arg: int = 0) -> bool:
+    """True when the session this command goes to was made public with /control no_eph:true.
+    Decided from the cached state (no worker call), since Discord needs the reply's privacy
+    within 3 s. Only that session is affected; sessions in other channels keep their settings."""
+    w = _workers.get(worker_arg) if worker_arg else None
+    if w is None:
+        vc = _user_vc_id(interaction)
+        w = _worker_for_channel(interaction.guild_id, vc) if vc else None
+    s = w.session(interaction.guild_id) if w else None
+    return bool(s and s.get("no_eph"))
+
+def _reply_eph(interaction: discord.Interaction, key: str, worker_arg: int = 0) -> bool:
+    """Private reply? The server's setting for this command, unless the session is public."""
+    return False if _session_public(interaction, worker_arg) else _eph(interaction.guild_id, key)
 
 def _locked_msg(w: WorkerProcess, session: dict) -> str:
     return (f"🔒 Worker {w.index} is controlled by <@{session.get('controller_id')}>. "
@@ -859,8 +879,6 @@ _MESSAGE_EMBEDS = {
     "mode_all":     ("🔓  Control: everyone in the voice channel", COLOUR),
     "mode_me":      ("🔒  Control: only the person who started playback", COLOUR),
     "normalize_on":  ("🎚️  Normalize ON — loud and quiet songs are evened out", COLOUR),
-    "lyrics_on":     ("🎤  Lyrics ON — synced lyrics show while songs play", COLOUR),
-    "lyrics_off":    ("🎤  Lyrics OFF", COLOUR),
     "normalize_off": ("🎚️  Normalize OFF", COLOUR),
 }
 
@@ -890,7 +908,7 @@ async def _dispatch(interaction: discord.Interaction, cmd: dict, worker: WorkerP
 async def _start_playback(interaction: discord.Interaction, op: str, eph_key: str,
                           worker_arg: int, timeout: float = 30.0, **extra) -> None:
     """Shared body of /play, /playlist and /autoplay."""
-    eph = _eph(interaction.guild_id, eph_key)
+    eph = _reply_eph(interaction, eph_key, worker_arg)
     await interaction.response.defer(thinking=True, ephemeral=eph)
     pick = await _pick_for_play(interaction, worker_arg)
     if pick is None:
@@ -949,7 +967,7 @@ async def slash_autoplay(interaction: discord.Interaction, worker: int = 0):
 @app_commands.describe(worker="Which worker to stop (0 = the one in your channel)")
 async def slash_stop(interaction: discord.Interaction, worker: int = 0):
     if not await _guard(interaction, during_restart=True): return
-    eph = _eph(interaction.guild_id, "S_EPH")
+    eph = _reply_eph(interaction, "S_EPH", worker)
     await interaction.response.defer(thinking=True, ephemeral=eph)
     pick = await _pick_for_control(interaction, worker, for_stop=True)
     if pick is None: return
@@ -1198,7 +1216,7 @@ class ControlView(discord.ui.View):
         self.btn_stop.custom_id = f"ctl_stop:{self.tag}"
         self.worker          = worker
         self.guild_id        = guild_id
-        self.eph             = _eph(guild_id, "CC_EPH")
+        self.eph             = False if (worker.session(guild_id) or {}).get("no_eph") else _eph(guild_id, "CC_EPH")
         self._stopped        = False
         self._queue_page     = page
         self._queue          = queue
@@ -1234,7 +1252,7 @@ class ControlView(discord.ui.View):
             self.add_item(NextPageButton(self, total_pages))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        s = self.worker.session(self.guild_id)
+        s = self.state.session() if self.state else self.worker.session(self.guild_id)
         if not s:
             await interaction.response.send_message(
                 embed=_err_embed("This session has ended — use /play or /control again"), ephemeral=True)
@@ -1243,7 +1261,7 @@ class ControlView(discord.ui.View):
         user = interaction.user
         if custom_id.startswith("ctl_mode:"):
             # Only the person who started playback can hand control to everyone (or take it back).
-            if s.get("controller_id") == user.id or _is_dev(user):
+            if s.get("controller_id") == user.id or _is_dev(user) or _has_perm(user, "manage_guild"):
                 return True
             await interaction.response.send_message(
                 embed=_err_embed("Only the person who started playback can change who controls it"), ephemeral=True)
@@ -1302,6 +1320,10 @@ class ControlView(discord.ui.View):
         if resp.get("status") == "ok" and not self._stopped:
             self._stopped = True
             self.worker.apply(self.guild_id, None)
+            if self.state:
+                # Shows "Stopped" for a moment, then the panel is deleted (it can't do anything now).
+                _spawn(self.state.retire("⏹️  Stopped — use /play or /control again"))
+                return
             for child in self.children: child.disabled = True
             try:
                 await i.edit_original_response(
@@ -1318,7 +1340,8 @@ class ControlView(discord.ui.View):
     async def btn_mute(self, i, _): await self._dispatch(i, "toggle_mute")
 
 
-PANEL_REFRESH  = 8.0       # seconds between automatic /control panel updates
+PANEL_REFRESH  = 4.0       # seconds between /control panel checks (the worker also pushes changes right away)
+PANEL_END_NOTE = 5.0       # seconds an ended panel shows "Playback ended" before it's deleted
 PANEL_LIFETIME = 14 * 60   # Discord allows editing the panel for 15 min; it marks itself expired at 14
 
 class PanelState:
@@ -1330,6 +1353,48 @@ class PanelState:
         self.message  = None
         self.view: "ControlView | None" = None
         self.sig      = None
+        self.created  = time.monotonic()
+        self.wake     = asyncio.Event()   # set by the worker's "panel" event: something changed
+        self.public   = False             # not ephemeral: deleted when it expires
+        # The session this panel belongs to. A later session on the same worker gets a new id, so
+        # an old panel can't end up controlling it.
+        self.sid      = (worker.session(guild_id) or {}).get("sid")
+
+    def session(self) -> dict | None:
+        """This panel's session, or None once it ended (or another session replaced it)."""
+        s = self.worker.session(self.guild_id)
+        if not s or (self.sid is not None and s.get("sid") not in (None, self.sid)):
+            return None
+        return s
+
+    async def ended(self) -> bool:
+        """Confirmed with the worker: the cached state can be empty after a missed sync, and a
+        panel must never be deleted while its session is still playing."""
+        if self.session():
+            return False
+        resp = await self.worker.send({"op": "get_queue", "guild_id": self.guild_id}, timeout=5.0)
+        if resp.get("status") != "ok":
+            return False   # worker not answering right now: decide on a later check
+        s = resp.get("session")
+        if s:
+            self.worker.apply(self.guild_id, s)
+        return not s or (self.sid is not None and s.get("sid") != self.sid)
+
+    async def retire(self, note: str | None, delay: float | None = None) -> None:
+        """Panel is done: show the note for a moment, then delete the message."""
+        _open_panels.get((self.worker.index, self.guild_id), set()).discard(self)
+        if self.view is not None:
+            self.view.stop()
+        try:
+            if note:
+                await self.message.edit(embed=_simple_embed(note, discord.Colour.dark_grey()), view=None)
+                await asyncio.sleep(PANEL_END_NOTE if delay is None else delay)
+            await self.message.delete()
+        except Exception:
+            pass
+
+    def minutes_left(self) -> int:
+        return max(1, math.ceil((self.created + PANEL_LIFETIME - time.monotonic()) / 60))
 
     def show(self, view: "ControlView") -> None:
         if self.view is not None and self.view is not view:
@@ -1405,6 +1470,7 @@ class PrivateLyrics:
             await self._drop()
 
 _private_lyrics: dict[tuple[int, int], PrivateLyrics] = {}
+_open_panels: dict[tuple[int, int], set[PanelState]] = {}   # (worker, guild) -> open /control panels
 
 
 async def _build_control_view(worker: WorkerProcess, guild_id: int,
@@ -1440,7 +1506,7 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
                         page, muted, loop, autoplay, mode, selected_qid, normalize, lyrics_on)
     view.state = state
     view.sig   = (current_title, tuple(q["qid"] for q in queue), muted, loop, autoplay, normalize,
-                  mode, controller, paused, lyrics_on)
+                  mode, controller, paused, lyrics_on, state.minutes_left() if state else None)
 
 
     for child in view.children:
@@ -1471,7 +1537,7 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
             f"▶ **{_truncate(current_title, 80)}**{flags}\n"
             f"{'📋 **' + str(len(queue)) + '** track(s) in queue' + page_info + f' — showing #{start+1}–#{end}' if queue else '📭 No tracks queued'}"
             f"{sel_info}\n{who}\n\n"
-            "⚠️ **Panel expires in 15 minutes** — run `/control` again if buttons stop working."
+            + (f"⏳ Panel expires in: {state.minutes_left()} min" if state else "")
         ),
         colour=COLOUR,
     )
@@ -1491,22 +1557,35 @@ async def _refresh_control_panel(interaction: discord.Interaction, ctrl: Control
 async def _panel_autorefresh(state: PanelState) -> None:
     """Keep an open panel in sync with playback. Interaction messages can only be edited for
     15 minutes, which is also how long the panel's buttons work."""
-    deadline = time.monotonic() + PANEL_LIFETIME
-    while time.monotonic() < deadline:
-        await asyncio.sleep(min(PANEL_REFRESH, max(0.0, deadline - time.monotonic())))
+    key = (state.worker.index, state.guild_id)
+    _open_panels.setdefault(key, set()).add(state)
+    try:
+        await _panel_loop(state)
+    finally:
+        _open_panels.get(key, set()).discard(state)
+
+async def _panel_loop(state: PanelState) -> None:
+    while time.monotonic() < (deadline := state.created + PANEL_LIFETIME):
+        try:
+            # Wake up right away when the worker reports a change (song picked or started, queue
+            # changed), otherwise check every PANEL_REFRESH.
+            await asyncio.wait_for(state.wake.wait(), timeout=min(PANEL_REFRESH, max(0.0, deadline - time.monotonic())))
+            await asyncio.sleep(0.3)   # let a burst of changes settle into one edit
+        except asyncio.TimeoutError:
+            pass
+        state.wake.clear()
         view = state.view
         if view is None or view._stopped or view.is_finished():
             return
         if time.monotonic() >= deadline:
             break
         try:
-            if not state.worker.session(state.guild_id):
-                for child in view.children:
-                    child.disabled = True
-                await state.message.edit(embed=_simple_embed("⏹️  Playback ended — use /play or /control again",
-                                                            discord.Colour.dark_grey()), view=view)
-                view.stop()
-                return
+            if not state.session():
+                if await state.ended():
+                    # The session ended (or a new one replaced it): this panel can't do anything now.
+                    await state.retire("⏹️  Playback ended — use /play or /control again")
+                    return
+                continue
             embed, new = await _build_control_view(state.worker, state.guild_id, view._queue_page,
                                                    view._selected_qid, state)
             if new.sig == state.sig:
@@ -1517,8 +1596,11 @@ async def _panel_autorefresh(state: PanelState) -> None:
         except Exception as exc:
             print(f"[Main] Control panel auto-refresh stopped: {exc}", flush=True)
             return
-    # Last edit before Discord stops accepting them: make it obvious the panel is dead.
+    # Last moment Discord accepts edits: a public panel is deleted, a private one marked expired.
     view = state.view
+    if view is not None and not view._stopped and state.public:
+        await state.retire(None)
+        return
     if view is not None and not view._stopped:
         try:
             await state.message.edit(embed=discord.Embed(
@@ -1530,15 +1612,28 @@ async def _panel_autorefresh(state: PanelState) -> None:
 
 
 @main_bot.tree.command(name="control", description="Open playback control panel")
-@app_commands.describe(worker="Which worker to control (0 = the one in your channel)")
-async def slash_control(interaction: discord.Interaction, worker: int = 0):
+@app_commands.describe(worker="Which worker to control (0 = the one in your channel)",
+                       no_eph="Make this session public: panel and everyone's replies visible (control stays Me/All)")
+async def slash_control(interaction: discord.Interaction, worker: int = 0, no_eph: bool | None = None):
     if not await _guard(interaction, during_restart=True): return
-    eph = _eph(interaction.guild_id, "CC_EPH")
+    if no_eph is True:
+        eph = False
+    elif no_eph is False:
+        eph = _eph(interaction.guild_id, "CC_EPH")
+    else:
+        eph = _reply_eph(interaction, "CC_EPH", worker)
     await interaction.response.defer(thinking=True, ephemeral=eph)
     pick = await _pick_for_control(interaction, worker)
     if pick is None: return
     w, _s = pick
+    if no_eph is not None:
+        # Public session: its panel and everyone's replies about it (play, stop, panel buttons)
+        # are visible to the channel. Control is unchanged (Me mode still locks the buttons).
+        resp = await w.send({"op": "set_no_eph", "guild_id": interaction.guild_id, "on": no_eph})
+        if resp.get("session"):
+            w.apply(interaction.guild_id, resp["session"])
     state = PanelState(w, interaction.guild_id)
+    state.public = not eph
     embed, view = await _build_control_view(w, interaction.guild_id, page=0, state=state)
     state.message = await interaction.followup.send(embed=embed, view=view, ephemeral=eph, wait=True)
     state.show(view)
@@ -2163,6 +2258,10 @@ async def _run(stop_event: asyncio.Event | None = None):
 
     _shutting_down = True
     print("[Main] Shutting down ...", flush=True)
+    # Panels stop working once this process exits: delete them instead of leaving dead buttons.
+    open_panels = [st for group in _open_panels.values() for st in group]
+    if open_panels:
+        await asyncio.wait([asyncio.ensure_future(st.retire(None)) for st in open_panels], timeout=10)
     await main_bot.close()
     await asyncio.gather(*[w.terminate() for w in _workers.values()], return_exceptions=True)
     MAIN_SOCKET.unlink(missing_ok=True)
