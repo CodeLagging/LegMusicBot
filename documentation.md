@@ -71,7 +71,7 @@ Copy `server_settings.json.example` and fill it in. Behaviour keys are re-read a
 | `leave_message` | "This server is not currently whitelisted, bot will not function" | Posted (with the server owner pinged) before the bot leaves a non-whitelisted server. |
 | `algo_max_kb` | `1024` | Storage cap for one user's saved songs on one server, in KB. There is no song-count limit; a saved song takes about 100 bytes, so 1 MB is roughly 10,000 songs. |
 | `autoplay_seed_count` | `5` | How many songs autoplay looks at when choosing what to play next. |
-| `lyric_safe` | `true` | Lyrics layout. `true`: a plain message (no embed), with two lyric lines per display line joined by " \| ", for about half the edits and the least rate limiting. `false`: an embed with one lyric line per line. Applies from the next song. |
+| `lyric_safe` | `true` | Lyrics layout (both are an embed with the previous, current and next block divided by solid lines). `true`: two lyric lines per block, so it changes about half as often. `false`: one lyric line per block. Applies from the next song. |
 | `lyrics_delay` | `-0.2` | Lyrics timing in seconds (decimals allowed). Negative shows lines earlier, positive later. It's added to the built-in 0.4 s head start (`LYRICS_EDIT_LEAD`) that covers the time an edit takes to show in Discord. Takes effect within a second, no restart. |
 
 ### Per-server settings (/settings)
@@ -997,10 +997,10 @@ When something a panel shows changes (next song picked or started, queue changed
 For private lyrics the worker also sends:
 
 ```json
-{"op": "lyrics", "index": 2, "guild_id": 123, "song": 7, "seq": 41, "content": "**Lyrics - Song**\n...", "embed": null, "delete": false}
+{"op": "lyrics", "index": 2, "guild_id": 123, "song": 7, "seq": 41, "content": null, "embed": {"title": "Lyrics - Song", "description": "..."}, "delete": false}
 ```
 
-`song` numbers the song's message and `seq` orders updates. The update is either `content` (plain text, `lyric_safe`) or `embed`. `delete: true` means the song ended and its message goes away.
+`song` numbers the song's message and `seq` orders updates. The update is an `embed` (`content` is supported too). `delete: true` means the song ended and its message goes away.
 
 ---
 
@@ -1158,9 +1158,9 @@ Notes:
 
 Live **synced** lyrics for the song that's playing, turned on per session with **🎤 Lyrics** in `/control` (there's no server default). Bots can't stream video, so lyrics are a message that's edited as the song plays:
 
-- Titled **`Lyrics - <song title>`**, followed by a code block with three display lines: previous, **current** (marked `▶`) and next. The layout depends on `lyric_safe` in `server_settings.json`, which is read when each song's lyrics start:
-  - **`true` (default): a plain message, no embed.** Embeds wrap long text early, which would break up the merged lines. Each display line holds two lyric lines ("line 1 | line 2"), so a message shows 6 lyric lines and changes about half as often (40–49% fewer edits on real songs). The pairs are fixed: lines 1+2, 3+4 and so on. A music break (♪) stays on its own line, and two lines more than 7 s apart aren't joined, so the second never shows long before it's sung.
-  - **`false`: an embed**, with one lyric line per display line (the original layout, more edits).
+- An embed titled **`Lyrics - <song title>`**. Its description is a code block with three blocks, previous, **current** (each row marked `▶`) and next, divided by solid lines (`─`). The divider's length stays the same for the whole song: its longest line, capped at 30 characters so it doesn't wrap on a phone. The layout depends on `lyric_safe` in `server_settings.json`, which is read when each song's lyrics start:
+  - **`true` (default): two lyric lines per block**, each on its own row. A message shows 6 lyric lines and changes about half as often (40–49% fewer edits on real songs). The pairs are fixed: lines 1+2, 3+4 and so on. A music break (♪) stays on its own block, and two lines more than 7 s apart aren't paired, so the second never shows long before it's sung.
+  - **`false`: one lyric line per block** (more edits).
 - **One message per song**, deleted when the song ends (or is skipped or stopped, or lyrics are turned off). The next song gets a new one.
 - **Privacy follows the playback.** If playback was started with a private command, lyrics are an ephemeral message only the person who pressed 🎤 sees. Discord allows that for 15 minutes after the click, so it then says to press 🎤 again. Otherwise it's a normal message in the session's text channel, posted by the worker.
 - **Only synced lyrics.** If no provider has synced lyrics for the song, the message just says "Synced lyrics not available". Plain unsynced text is never shown. If the lookup takes more than a second, the message first says "Looking up synced lyrics…".
@@ -1200,7 +1200,7 @@ LRC to `[(start ms, text)]`. Handles several timestamps on one line, `[offset:]`
 The names lyrics sites use: no "(Official Video)", "feat." or "Artist - " prefix, and only the first artist. Version words like "(Slowed)" are kept.
 
 **`def state_at(lyrics, pos_ms)`** / **`def render(state)`**
-The (previous, current, next) display lines at a position (`merged=True` for `lyric_safe`: up to two lyric lines each, from `Lyrics.layouts`, built by `_group`), and their code-block text.
+The (previous, current, next) blocks at a position (`merged=True` for `lyric_safe`: up to two lyric lines each, from `Lyrics.layouts`, built by `_group`), and their code-block text with `─` dividers (`Lyrics.width` long).
 
 ### worker.py: lyrics
 
@@ -1208,7 +1208,7 @@ The (previous, current, next) display lines at a position (`merged=True` for `ly
 One song's lyrics. It looks them up, then every `LYRICS_TICK` finds the display line at `_play_position` plus the lead (`LYRICS_EDIT_LEAD - lyrics_delay`), and edits only when it changed. It ends when the song ends, the session ends or lyrics are turned off, and its `finally` deletes the message.
 
 **`class _LyricsOut`**
-Where one song's lyrics go: a message in the session's text channel (public playback), or `lyrics` events to the controller (private playback). `_lyrics_message(title, body, safe)` builds the message: plain text with a bold title when `lyric_safe`, otherwise an embed.
+Where one song's lyrics go: a message in the session's text channel (public playback), or `lyrics` events to the controller (private playback). `_lyrics_message(title, body, safe)` builds the embed.
 
 **`def _start_lyrics(sess)`** / **`def _stop_lyrics(sess)`**
 Start lyrics for the song playing now (called when a song starts and when 🎤 is turned on) and prefetch the next song's lyrics. Stopping cancels the task, which deletes the message.

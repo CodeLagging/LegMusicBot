@@ -1156,11 +1156,9 @@ async def _set_paused(sess: Session, player: wavelink.Player, paused: bool) -> N
 _lyrics_seq = 0
 
 def _lyrics_message(title: str, body: str, safe: bool) -> dict:
-    """Message fields for one lyrics update. lyric_safe: plain text (embeds wrap long merged lines
-    early); otherwise an embed."""
-    if safe:
-        return {"content": f"**Lyrics - {title}**\n{body}"[:2000]}
-    return {"embed": discord.Embed(title=f"Lyrics - {title}"[:256], description=body, colour=COLOUR)}
+    """Message fields for one lyrics update: an embed in both modes (lyric_safe only changes how
+    many lyric lines a block holds, see lyrics.render)."""
+    return {"embed": discord.Embed(title=f"Lyrics - {title}"[:256], description=body[:4000], colour=COLOUR)}
 
 class _LyricsOut:
     """Where one song's lyrics go: a message in the session's text channel (public playback), or
@@ -1253,7 +1251,7 @@ async def _lyrics_song(sess: Session, player: wavelink.Player, track: wavelink.P
                 lead_ms = int((LYRICS_EDIT_LEAD - appsettings.get_float("lyrics_delay")) * 1000)
                 state = lyrics.state_at(found, _play_position(sess, player) + lead_ms, merged=safe)
                 if state != shown and time.monotonic() - last >= LYRICS_MIN_GAP:
-                    await out.show(_lyrics_message(title, lyrics.render(state), safe))
+                    await out.show(_lyrics_message(title, lyrics.render(state, found.width), safe))
                     shown, last = state, time.monotonic()
             await asyncio.sleep(LYRICS_TICK)
     except Exception as exc:

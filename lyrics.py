@@ -26,12 +26,14 @@ GAP_MS             = 8000       # this far into a line, with the next one still 
 PAIR_MAX_GAP_MS    = 7000       # two lyric lines share a display line only if the second starts this soon
 SOURCE_BONUS       = {"YouTube Music": 30, "LRCLib": 15, "NetEase": 0}
 MUSIC_NOTE         = "♪"
+SEPARATOR          = "─"        # divider between blocks: box-drawing line, continuous in a code block
+SEPARATOR_MAX      = 30         # wider would wrap in an embed on a phone
 USER_AGENT = "LegMusicBot (https://github.com/CodeLagging/LegMusicBot)"
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 
 class Lyrics:
-    __slots__ = ("lines", "starts", "provider", "duration_ms", "layouts")
+    __slots__ = ("lines", "starts", "provider", "duration_ms", "layouts", "width")
 
     def __init__(self, lines: list[tuple[int, str]], provider: str, duration_ms: int = 0):
         self.lines       = sorted((int(t), s) for t, s in lines)
@@ -40,6 +42,8 @@ class Lyrics:
         self.duration_ms = int(duration_ms or 0)
         # What's displayed, per lyric_safe mode: (display lines, their start times).
         # Each display line is (start, text, start of its last lyric line).
+        # Divider length: the song's longest line (+ marker), so it stays the same all song.
+        self.width = min(SEPARATOR_MAX, max(12, max((len(t) + 2 for _, t in self.lines), default=12)))
         self.layouts = {}
         for merged in (False, True):
             groups = _group(self.lines, 2 if merged else 1)
@@ -62,7 +66,7 @@ def _group(lines: list[tuple[int, str]], per_line: int) -> list[tuple[int, str, 
             g[2] = t
         else:
             groups.append([t, [text], t])
-    return [(start, " | ".join(texts), last) for start, texts, last in groups]
+    return [(start, "\n".join(texts), last) for start, texts, last in groups]   # one row per lyric line
 
 
 # ── parsing ──────────────────────────────────────────────────────────────────
@@ -371,9 +375,13 @@ def state_at(lyr: Lyrics, pos_ms: int, merged: bool = True) -> tuple[str, str, s
         prev, cur = cur, MUSIC_NOTE
     return prev, cur, nxt
 
-def render(state: tuple[str, str, str]) -> str:
-    """Three lines in a code block; the current one is marked (bold doesn't work in code blocks)."""
-    def clean(s: str) -> str:
-        return (s or "").replace("```", "'''")[:180]
+def render(state: tuple[str, str, str], width: int = SEPARATOR_MAX) -> str:
+    """Previous, current and next block in a code block, divided by solid lines. A block is one or
+    (lyric_safe) two lyric lines, one row each; the current block's rows are marked with ▶ (bold
+    doesn't work in code blocks)."""
+    def rows(block: str, mark: str) -> list[str]:
+        return [mark + (line or "").replace("```", "'''")[:90] for line in (block or "").split("\n")]
     prev, cur, nxt = state
-    return f"```\n  {clean(prev)}\n▶ {clean(cur)}\n  {clean(nxt)}\n```"
+    blocks = [rows(prev, "  "), rows(cur, "▶ "), rows(nxt, "  ")]
+    divider = f"\n{SEPARATOR * width}\n"
+    return "```\n" + divider.join("\n".join(b) for b in blocks) + "\n```"
