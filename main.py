@@ -1365,12 +1365,14 @@ class PrivateLyrics:
                 if time.monotonic() - self.started > PANEL_LIFETIME:
                     await self._expire()
                     return
-                embed = discord.Embed.from_dict(ev["embed"])
+                # Plain text (lyric_safe) or an embed, as the worker built it.
+                fields = ({"embed": discord.Embed.from_dict(ev["embed"])} if ev.get("embed")
+                          else {"content": ev.get("content") or ""})
                 if self.msg is not None and self.song == ev.get("song"):
-                    await self.msg.edit(embed=embed)
+                    await self.msg.edit(**fields)
                 else:
                     await self._drop()
-                    self.msg = await self.interaction.followup.send(embed=embed, ephemeral=True, wait=True)
+                    self.msg = await self.interaction.followup.send(**fields, ephemeral=True, wait=True)
                     self.song = ev.get("song")
             except Exception as exc:
                 print(f"[Main] Private lyrics update failed: {exc}", flush=True)
@@ -1385,13 +1387,12 @@ class PrivateLyrics:
 
     async def _expire(self) -> None:
         self.expired = True
-        notice = discord.Embed(title="🎤  Private lyrics expired",
-                               description="Press 🎤 Lyrics in /control again.", colour=discord.Colour.dark_grey())
+        notice = "🎤 **Private lyrics expired** — press 🎤 Lyrics in /control again."
         try:
             if self.msg is not None:
-                await self.msg.edit(embed=notice)
+                await self.msg.edit(content=notice, embed=None)
             else:
-                await self.interaction.followup.send(embed=notice, ephemeral=True)
+                await self.interaction.followup.send(content=notice, ephemeral=True)
         except Exception:
             pass
         self.msg = None   # the notice stays; it isn't deleted with the song

@@ -31,32 +31,38 @@ BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Ge
 
 
 class Lyrics:
-    __slots__ = ("lines", "starts", "provider", "duration_ms", "groups", "group_starts")
+    __slots__ = ("lines", "starts", "provider", "duration_ms", "layouts")
 
     def __init__(self, lines: list[tuple[int, str]], provider: str, duration_ms: int = 0):
-        self.lines        = sorted((int(t), s) for t, s in lines)
-        self.starts       = [t for t, _ in self.lines]
-        self.provider     = provider
-        self.duration_ms  = int(duration_ms or 0)
-        self.groups       = _pairs(self.lines)          # what's displayed: (start, text, last line start)
-        self.group_starts = [g[0] for g in self.groups]
+        self.lines       = sorted((int(t), s) for t, s in lines)
+        self.starts      = [t for t, _ in self.lines]
+        self.provider    = provider
+        self.duration_ms = int(duration_ms or 0)
+        # What's displayed, per lyric_safe mode: (display lines, their start times).
+        # Each display line is (start, text, start of its last lyric line).
+        self.layouts = {}
+        for merged in (False, True):
+            groups = _group(self.lines, 2 if merged else 1)
+            self.layouts[merged] = (groups, [g[0] for g in groups])
 
 
-def _pairs(lines: list[tuple[int, str]]) -> list[tuple[int, str, int]]:
-    """Two lyric lines per display line, so the message changes half as often (fewer edits, less
-    rate limiting). Pairs are fixed (1+2, 3+4, ...). A music break (♪) stays on its own line, and
-    lines far apart aren't joined (the second one would show long before it's sung)."""
+def _group(lines: list[tuple[int, str]], per_line: int) -> list[tuple[int, str, int]]:
+    """Lyric lines to display lines. With per_line=2 (lyric_safe) two lines share one display line,
+    so the message changes about half as often (fewer edits, less rate limiting). Pairs are fixed
+    (1+2, 3+4, ...). A music break (♪) stays on its own line, and lines far apart aren't joined
+    (the second one would show long before it's sung)."""
     groups: list[list] = []   # [start, [texts], start of its last line]
     for t, text in lines:
         g = groups[-1] if groups else None
         if g and text == MUSIC_NOTE and g[1] == [MUSIC_NOTE]:
             continue   # one ♪ for consecutive breaks
-        if g and text != MUSIC_NOTE and g[1][0] != MUSIC_NOTE and len(g[1]) < 2 and t - g[0] <= PAIR_MAX_GAP_MS:
+        if (g and text != MUSIC_NOTE and g[1][0] != MUSIC_NOTE and len(g[1]) < per_line
+                and t - g[0] <= PAIR_MAX_GAP_MS):
             g[1].append(text)
             g[2] = t
         else:
             groups.append([t, [text], t])
-    return [(start, " / ".join(texts), last) for start, texts, last in groups]
+    return [(start, " | ".join(texts), last) for start, texts, last in groups]
 
 
 # ── parsing ──────────────────────────────────────────────────────────────────
@@ -350,11 +356,11 @@ async def find(title: str, artist: str, length_ms: int, yt_id: str | None = None
 
 # ── display ──────────────────────────────────────────────────────────────────
 
-def state_at(lyr: Lyrics, pos_ms: int) -> tuple[str, str, str]:
-    """(previous, current, next) display line at this position; each is up to two lyric lines.
-    Before the first line, during long breaks and after the last line the current line is ♪."""
-    groups = lyr.groups
-    i = bisect.bisect_right(lyr.group_starts, pos_ms) - 1
+def state_at(lyr: Lyrics, pos_ms: int, merged: bool = True) -> tuple[str, str, str]:
+    """(previous, current, next) display line at this position; with merged, each holds up to two
+    lyric lines. Before the first line, during long breaks and after the last line it's ♪."""
+    groups, starts = lyr.layouts[merged]
+    i = bisect.bisect_right(starts, pos_ms) - 1
     if i < 0:
         return "", MUSIC_NOTE, groups[0][1] if groups else ""
     nxt_start = groups[i + 1][0] if i + 1 < len(groups) else None

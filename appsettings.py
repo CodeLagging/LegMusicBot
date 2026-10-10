@@ -22,6 +22,9 @@ DEFAULTS: dict = {
     # Lyrics timing in seconds: negative shows lines earlier, positive later. Added to the built-in
     # 0.4 s head start that covers the time an edit takes to show in Discord. Re-read on change.
     "lyrics_delay": -0.2,
+    # Lyrics layout. true: plain message, two lyric lines per line joined by " | " (about half the
+    # edits, safest for rate limits). false: an embed with one lyric line per line.
+    "lyric_safe": True,
 }
 
 _cache: dict = dict(DEFAULTS)
@@ -72,6 +75,19 @@ def _id_set(values) -> set[int]:
     return out
 
 _warned: set[str] = set()
+
+
+def get_bool(name: str) -> bool:
+    """A true/false setting; also accepts "true"/"false" text. Anything else falls back to the default."""
+    value = get().get(name)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    if f"{name}={value!r}" not in _warned:
+        _warned.add(f"{name}={value!r}")
+        print(f"[Settings] Invalid {name} {value!r} in {PATH.name} — using {DEFAULTS[name]}", flush=True)
+    return bool(DEFAULTS[name])
 
 
 def get_float(name: str) -> float:

@@ -1127,8 +1127,12 @@ async def _set_paused(sess: Session, player: wavelink.Player, paused: bool) -> N
 
 _lyrics_seq = 0
 
-def _lyrics_embed(title: str, body: str) -> discord.Embed:
-    return discord.Embed(title=f"Lyrics - {title}"[:256], description=body, colour=COLOUR)
+def _lyrics_message(title: str, body: str, safe: bool) -> dict:
+    """Message fields for one lyrics update. lyric_safe: plain text (embeds wrap long merged lines
+    early); otherwise an embed."""
+    if safe:
+        return {"content": f"**Lyrics - {title}**\n{body}"[:2000]}
+    return {"embed": discord.Embed(title=f"Lyrics - {title}"[:256], description=body, colour=COLOUR)}
 
 class _LyricsOut:
     """Where one song's lyrics go: a message in the session's text channel (public playback), or
@@ -1141,20 +1145,22 @@ class _LyricsOut:
         self.msg: discord.Message | None = None
         self.sent = self.failed = False
 
-    def _event(self, embed: discord.Embed | None) -> None:
+    def _event(self, fields: dict | None) -> None:
         global _lyrics_seq
         if _events is None:
             return
         _lyrics_seq += 1
+        embed = (fields or {}).get("embed")
         _events.put_nowait({"op": "lyrics", "index": BOT_INDEX, "guild_id": self.sess.guild_id,
-                            "song": self.song, "seq": _lyrics_seq,
-                            "embed": embed.to_dict() if embed else None, "delete": embed is None})
+                            "song": self.song, "seq": _lyrics_seq, "delete": fields is None,
+                            "content": (fields or {}).get("content"),
+                            "embed": embed.to_dict() if embed else None})
 
-    async def show(self, embed: discord.Embed) -> None:
+    async def show(self, fields: dict) -> None:
         if self.failed:
             return
         if self.private:
-            self._event(embed)
+            self._event(fields)
             self.sent = True
             return
         try:
@@ -1162,9 +1168,9 @@ class _LyricsOut:
                 if not self.sess.text_channel:
                     self.failed = True
                     return
-                self.msg = await self.sess.text_channel.send(embed=embed)
+                self.msg = await self.sess.text_channel.send(**fields)
             else:
-                await self.msg.edit(embed=embed)
+                await self.msg.edit(**fields)
         except discord.NotFound:
             self.msg = None   # someone deleted it: the next line posts a new one
         except Exception as exc:
@@ -1193,6 +1199,7 @@ async def _lyrics_song(sess: Session, player: wavelink.Player, track: wavelink.P
     yt_id  = (sess.current_meta or {}).get("yt_id") or None
     length = sess.current_length or int(getattr(track, "length", 0) or 0)
     out    = _LyricsOut(sess)
+    safe   = appsettings.get_bool("lyric_safe")   # read per song: a change applies from the next song
 
     def playing() -> bool:
         return sessions.get(sess.guild_id) is sess and sess.lyrics_on and player.current is track
@@ -1202,13 +1209,13 @@ async def _lyrics_song(sess: Session, player: wavelink.Player, track: wavelink.P
         done, _ = await asyncio.wait([lookup], timeout=1.0)
         if not done and playing():
             # Not cached yet (the providers take a few seconds): show that something is happening.
-            await out.show(_lyrics_embed(title, "Looking up synced lyrics…"))
+            await out.show(_lyrics_message(title, "Looking up synced lyrics…", safe))
         found, report = await lookup
         print(f"[Worker {BOT_INDEX}] Lyrics for {title!r}: {report}", flush=True)
         if not playing():
             return
         if found is None:
-            await out.show(_lyrics_embed(title, "Synced lyrics not available"))
+            await out.show(_lyrics_message(title, "Synced lyrics not available", safe))
             while playing():
                 await asyncio.sleep(1)
             return
@@ -1216,9 +1223,9 @@ async def _lyrics_song(sess: Session, player: wavelink.Player, track: wavelink.P
         while playing():
             if not player.paused:
                 lead_ms = int((LYRICS_EDIT_LEAD - appsettings.get_float("lyrics_delay")) * 1000)
-                state = lyrics.state_at(found, _play_position(sess, player) + lead_ms)
+                state = lyrics.state_at(found, _play_position(sess, player) + lead_ms, merged=safe)
                 if state != shown and time.monotonic() - last >= LYRICS_MIN_GAP:
-                    await out.show(_lyrics_embed(title, lyrics.render(state)))
+                    await out.show(_lyrics_message(title, lyrics.render(state), safe))
                     shown, last = state, time.monotonic()
             await asyncio.sleep(LYRICS_TICK)
     except Exception as exc:
