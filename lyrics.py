@@ -22,7 +22,7 @@ PROVIDER_TIMEOUT   = 8.0      # per provider; most lookups are prefetched while 
 MAX_LENGTH_DIFF_MS = 3000       # a source further off is another version (slowed, sped up, video intro)
 NONE_CACHE_TTL     = 3 * 86400  # "no synced lyrics anywhere" is checked again after this
 FOUND_CACHE_TTL    = 30 * 86400
-GAP_MS             = 8000       # this far into a line, with the next one still a while away -> ♪
+GAP_MS             = 8000       # a ♪ break starts this long after a line when the next is 12 s+ away
 PAIR_MAX_GAP_MS    = 7000       # two lyric lines share a display line only if the second starts this soon
 SOURCE_BONUS       = {"YouTube Music": 30, "LRCLib": 15, "NetEase": 0}
 MUSIC_NOTE         = "♪"
@@ -45,10 +45,26 @@ class Lyrics:
         # Divider length: the song's longest line (+ marker), so it stays the same all song.
         self.width = min(SEPARATOR_MAX, max(12, max((len(t) + 2 for _, t in self.lines), default=12)))
         self.layouts = {}
+        timeline = _with_breaks(self.lines)
         for merged in (False, True):
-            groups = _group(self.lines, 2 if merged else 1)
+            groups = _group(timeline, 2 if merged else 1)
             self.layouts[merged] = (groups, [g[0] for g in groups])
 
+
+def _with_breaks(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Puts a ♪ into the timeline where nothing is sung for a while: an instrumental break the
+    lyrics don't mark (the next line is GAP_MS + 4 s or more away) and the outro after the last line.
+    As a real entry it shows up as the next block before the break starts, instead of suddenly
+    replacing the line being shown."""
+    out = []
+    for i, (t, text) in enumerate(lines):
+        out.append((t, text))
+        if text == MUSIC_NOTE:
+            continue
+        nxt = lines[i + 1] if i + 1 < len(lines) else None
+        if nxt is None or (nxt[1] != MUSIC_NOTE and nxt[0] - t >= GAP_MS + 4000):
+            out.append((t + GAP_MS, MUSIC_NOTE))
+    return out
 
 def _group(lines: list[tuple[int, str]], per_line: int) -> list[tuple[int, str, int]]:
     """Lyric lines to display lines. With per_line=2 (lyric_safe) two lines share one display line,
@@ -361,19 +377,16 @@ async def find(title: str, artist: str, length_ms: int, yt_id: str | None = None
 # ── display ──────────────────────────────────────────────────────────────────
 
 def state_at(lyr: Lyrics, pos_ms: int, merged: bool = True) -> tuple[str, str, str]:
-    """(previous, current, next) display line at this position; with merged, each holds up to two
-    lyric lines. Before the first line, during long breaks and after the last line it's ♪."""
+    """(previous, current, next) block at this position; with merged, each holds up to two lyric
+    lines. Music breaks are ♪ blocks in the timeline (see _with_breaks), so a break is always
+    shown as next before it becomes current. Before the first line the current block is ♪."""
     groups, starts = lyr.layouts[merged]
     i = bisect.bisect_right(starts, pos_ms) - 1
     if i < 0:
         return "", MUSIC_NOTE, groups[0][1] if groups else ""
-    nxt_start = groups[i + 1][0] if i + 1 < len(groups) else None
-    prev, cur, last = (groups[i - 1][1] if i >= 1 else ""), groups[i][1], groups[i][2]
-    nxt = groups[i + 1][1] if nxt_start is not None else ""
-    # Nothing sung for a while (an instrumental break the file doesn't mark, or the outro).
-    if cur != MUSIC_NOTE and pos_ms - last >= GAP_MS and (nxt_start is None or nxt_start - last >= GAP_MS + 4000):
-        prev, cur = cur, MUSIC_NOTE
-    return prev, cur, nxt
+    prev = groups[i - 1][1] if i >= 1 else ""
+    nxt  = groups[i + 1][1] if i + 1 < len(groups) else ""
+    return prev, groups[i][1], nxt
 
 def render(state: tuple[str, str, str], width: int = SEPARATOR_MAX) -> str:
     """Previous, current and next block in a code block, divided by solid lines. A block is one or

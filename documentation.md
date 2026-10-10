@@ -1053,7 +1053,7 @@ For private lyrics the worker also sends:
 | `PROVIDER_TIMEOUT` | lyrics.py | 8 s | Per lyrics provider; one that's slower is skipped. |
 | `MAX_LENGTH_DIFF_MS` | lyrics.py | 3 s | Lyrics whose source duration is further off are another version and aren't used. |
 | `NONE_CACHE_TTL`, `FOUND_CACHE_TTL` | lyrics.py | 3 days, 30 days | How long "no synced lyrics" and found lyrics are cached. |
-| `GAP_MS` | lyrics.py | 8 s | This far into a line, with the next one still well away, the current line shows ♪. |
+| `GAP_MS` | lyrics.py | 8 s | When the next line is 12 s or more away (or after the last line), a ♪ block starts this long after the line. It's shown as next before it starts. |
 | `_GROQ_ARGS` | worker.py | 400 tokens, low reasoning | Settings for every Groq call (the AI pick allows 1200 tokens). |
 
 | File | Created by | Purpose |
@@ -1161,6 +1161,7 @@ Live **synced** lyrics for the song that's playing, turned on per session with *
 - An embed titled **`Lyrics - <song title>`**. Its description is a code block with three blocks, previous, **current** (each row marked `▶`) and next, divided by solid lines (`─`). The divider's length stays the same for the whole song: its longest line, capped at 30 characters so it doesn't wrap on a phone. The layout depends on `lyric_safe` in `server_settings.json`, which is read when each song's lyrics start:
   - **`true` (default): two lyric lines per block**, each on its own row. A message shows 6 lyric lines and changes about half as often (40–49% fewer edits on real songs). The pairs are fixed: lines 1+2, 3+4 and so on. A music break (♪) stays on its own block, and two lines more than 7 s apart aren't paired, so the second never shows long before it's sung.
   - **`false`: one lyric line per block** (more edits).
+- **Music breaks (♪)** are blocks in the timeline: the ones the lyrics mark, and a ♪ added 8 s after a line when the next line is 12 s or more away (and after the last line). So a break always shows up as the *next* block first, then becomes current. It never suddenly replaces the line being shown.
 - **One message per song**, deleted when the song ends (or is skipped or stopped, or lyrics are turned off). The next song gets a new one.
 - **Privacy follows the playback.** If playback was started with a private command, lyrics are an ephemeral message only the person who pressed 🎤 sees. Discord allows that for 15 minutes after the click, so it then says to press 🎤 again. Otherwise it's a normal message in the session's text channel, posted by the worker.
 - **Only synced lyrics.** If no provider has synced lyrics for the song, the message just says "Synced lyrics not available". Plain unsynced text is never shown. If the lookup takes more than a second, the message first says "Looking up synced lyrics…".
@@ -1200,7 +1201,7 @@ LRC to `[(start ms, text)]`. Handles several timestamps on one line, `[offset:]`
 The names lyrics sites use: no "(Official Video)", "feat." or "Artist - " prefix, and only the first artist. Version words like "(Slowed)" are kept.
 
 **`def state_at(lyrics, pos_ms)`** / **`def render(state)`**
-The (previous, current, next) blocks at a position (`merged=True` for `lyric_safe`: up to two lyric lines each, from `Lyrics.layouts`, built by `_group`), and their code-block text with `─` dividers (`Lyrics.width` long).
+The (previous, current, next) blocks at a position, with breaks added by `_with_breaks` (`merged=True` for `lyric_safe`: up to two lyric lines each, from `Lyrics.layouts`, built by `_group`), and their code-block text with `─` dividers (`Lyrics.width` long).
 
 ### worker.py: lyrics
 
