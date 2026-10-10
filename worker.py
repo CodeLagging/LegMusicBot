@@ -74,7 +74,11 @@ AUTOPLAY_BATCH  = 5      # autoplay songs queued per refill
 AUTOPLAY_QUERY  = "~autoplay"   # search-memory key for how the user reacts to autoplay picks
 AUTOPLAY_PER_ARTIST = 2  # variety: at most this many songs by one artist per refill
 AUTOPLAY_LABEL  = "Autoplay (Algo)"   # source shown for autoplay picks; also marks them in the queue
-ALGO_DIRECT_CHANCE = 0.3   # /autoplay: chance to replay a saved song instead of a recommendation
+AUTOPLAY_NEW_SHARE = 0.7   # chance each autoplay pick is a song the user has never played (still from their taste)
+AUTOPLAY_MIX_DEPTH = 30    # songs used from each seed's YouTube Mix (deeper = more new songs to choose from)
+# For new songs the only history signal is the artist. At full weight, new songs by artists the
+# user already plays won every slot; at this weight about half are (the rest are new artists).
+AUTOPLAY_NEW_TASTE_W = 0.15
 
 _groq         = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
 _GROQ_MODEL   = "openai/gpt-oss-20b"
@@ -1214,8 +1218,9 @@ async def _mix_cached(sess: Session, seed: dict) -> list[wavelink.Playable]:
     return sess.mix_cache[yt_id]
 
 def _autoplay_score(t: wavelink.Playable, position: int, seed_weight: float, appearances: int,
-                    taste: dict | None) -> float | None:
-    """How good an autoplay pick is for this user. None = don't play it."""
+                    taste: dict | None, taste_w: float = 0.6) -> float | None:
+    """How good an autoplay pick is for this user. None = don't play it.
+    taste_w: how much their history (artists, known songs) counts next to how related the song is."""
     score = max(0.0, 25 - position) * seed_weight      # earlier in a Mix = more closely related
     score += 12 * (appearances - 1)                     # related to several seeds = strong signal
     if taste:
@@ -1226,14 +1231,32 @@ def _autoplay_score(t: wavelink.Playable, position: int, seed_weight: float, app
                     return None                         # skipped when autoplay played it before
                 score += 15 * min(net, 3)
         bonus, _ = _personal(t, taste, None)            # artist share, known songs, same-title rules
-        score += 0.6 * bonus
+        score += taste_w * bonus
         artist = _artist_key(t.author)
         skips, plays = taste["artist_skips"].get(artist, 0), taste["artists"].get(artist, 0)
         if skips >= 2 and skips > plays:
             score -= 25                                 # an artist this user keeps skipping
     return score + random.uniform(0, 8)                 # a little variety between refills
 
+def _known_song(t: wavelink.Playable, taste: dict | None) -> bool:
+    """The user already has this song in their algo: this upload, or another upload of it."""
+    if not taste:
+        return False
+    sid = _song_id(t.title, t.author)
+    if (t.identifier or "") in taste["ids"] or sid in taste["songs"]:
+        return True
+    # Re-uploads put the artist in the title ("Sxilwix - Bella Noche (Lyrics)" by a lyrics channel).
+    text = f" {sid[0]} "
+    return any(f" {title} " in text and any(a and f" {a} " in text for a in artists)
+               for title, artists in taste["titles"].items() if title)
+
 async def _recommend(sess: Session, count: int) -> list[tuple[wavelink.Playable, str, str]]:
+    """Autoplay picks. Each one has an AUTOPLAY_NEW_SHARE chance to be a song the user has never
+    played, otherwise it's one they already like. Both kinds come from their taste: the Mixes of
+    their songs, ranked by how related a song is, how many of their songs lead to it, the artists
+    they play, and what they skipped before.
+    Before, songs they knew got the full history bonus and won almost every slot, so autoplay
+    mostly replayed what was already in the algo."""
     seeds = await _autoplay_seeds(sess)
     if not seeds:
         return []
@@ -1242,7 +1265,9 @@ async def _recommend(sess: Session, count: int) -> list[tuple[wavelink.Playable,
     out: list[tuple[wavelink.Playable, str, str]] = []
     per_artist: dict[str, int] = {}
 
-    def take(t: wavelink.Playable, path: str) -> bool:
+    def take(t: wavelink.Playable, path: str, check: bool = True) -> bool:
+        if check and not _usable_rec(t, ids, titles):
+            return False
         artist = _artist_key(t.author)
         if per_artist.get(artist, 0) >= AUTOPLAY_PER_ARTIST:
             return False
@@ -1252,50 +1277,73 @@ async def _recommend(sess: Session, count: int) -> list[tuple[wavelink.Playable,
         out.append((t, AUTOPLAY_LABEL, path))
         return True
 
-    if sess.autoplay_source == "algo" and random.random() < ALGO_DIRECT_CHANCE:
-        for seed in seeds:
-            if seed.get("yt_id") and seed["yt_id"] not in ids:
-                try:
-                    res = await wavelink.Pool.fetch_tracks(f"https://www.youtube.com/watch?v={seed['yt_id']}")
-                    tracks = res.tracks if isinstance(res, wavelink.Playlist) else list(res or [])
-                except Exception:
-                    tracks = []
-                if tracks:
-                    take(tracks[0], "Your saved songs")
-                break
-
-    # One pool from every seed's Mix (cached per session), ranked for this user.
+    # One pool from every seed's Mix (cached per session), ranked for this user, then split into
+    # songs they've never played and songs they already know.
     mixes = await asyncio.gather(*[_mix_cached(sess, seed) for seed in seeds])
     pool: dict[str, dict] = {}
     for rank, (seed, mix) in enumerate(zip(seeds, mixes)):
         weight = 1.0 - 0.1 * rank                        # most recent / strongest seed counts most
-        for pos, t in enumerate(mix[:20]):
+        for pos, t in enumerate(mix[:AUTOPLAY_MIX_DEPTH]):
             if not _usable_rec(t, ids, titles):
                 continue
             entry = pool.setdefault(t.identifier or t.uri, {"t": t, "pos": pos, "w": weight, "n": 0,
                                                             "seed": seed.get("title", "")})
             entry["n"] += 1
             entry["pos"], entry["w"] = min(entry["pos"], pos), max(entry["w"], weight)
-    scored = []
+    fresh, known = [], []
     for e in pool.values():
-        sc = _autoplay_score(e["t"], e["pos"], e["w"], e["n"], taste)
+        is_known = _known_song(e["t"], taste)
+        sc = _autoplay_score(e["t"], e["pos"], e["w"], e["n"], taste,
+                             taste_w=0.6 if is_known else AUTOPLAY_NEW_TASTE_W)
         if sc is not None:
-            scored.append((sc, e))
-    for sc, e in sorted(scored, key=lambda x: -x[0]):
-        if len(out) >= count:
+            (known if is_known else fresh).append((sc, e))
+    ranked = {kind: [(e["t"], f"Mix · {e['seed'][:40]}") for _, e in sorted(lst, key=lambda x: -x[0])]
+              for kind, lst in (("new", fresh), ("known", known))}
+    # /autoplay: familiar picks start with the seeds themselves (saved songs drawn at random,
+    # weighted by plays), so the familiar share isn't always the same few top songs.
+    saved = [s for s in seeds if s.get("yt_id")] if sess.autoplay_source == "algo" else []
+
+    async def fill(kind: str) -> bool:
+        if kind == "known":
+            while saved:
+                yt = saved.pop(0)["yt_id"]
+                if yt in ids:
+                    continue
+                try:
+                    res = await wavelink.Pool.fetch_tracks(f"https://www.youtube.com/watch?v={yt}")
+                    tracks = res.tracks if isinstance(res, wavelink.Playlist) else list(res or [])
+                except Exception:
+                    tracks = []
+                # Their own song as saved: altered versions they like are fine here.
+                if tracks and _norm_title(tracks[0].title or "") not in titles \
+                        and take(tracks[0], "Your saved songs", check=False):
+                    return True
+        lst = ranked[kind]
+        while lst:
+            t, path = lst.pop(0)
+            if take(t, path):
+                return True
+        return False
+
+    kinds = ["new" if random.random() < AUTOPLAY_NEW_SHARE else "known" for _ in range(count)]
+    for kind in kinds:
+        # Short on one kind (e.g. a new listener knows nothing yet): the other kind fills the slot.
+        if not (await fill(kind) or await fill("known" if kind == "new" else "new")):
             break
-        take(e["t"], f"Mix · {e['seed'][:40]}")
 
     if len(out) < count:
-        # Fallback: AI suggestions. Ask for a batch once and keep the rest for later refills.
+        # Fallback: AI suggestions (new songs only). Ask for a batch once and keep the rest for later refills.
         if not sess.ai_reserve:
             print(f"[Worker {BOT_INDEX}] Not enough Mix results — asking Groq for a batch of suggestions", flush=True)
             sess.ai_reserve = await _groq_similar(seeds, count=10)
         while sess.ai_reserve and len(out) < count:
             line = sess.ai_reserve.pop(0)
             t, _, _ = await _search(line, "sp", None, use_ai=False)   # no extra Groq call per song
-            if t and _usable_rec(t, ids, titles):
+            if t and not _known_song(t, taste):
                 take(t, "AI pick")
+    new = sum(1 for t, _, _ in out if not _known_song(t, taste))
+    print(f"[Worker {BOT_INDEX}] Autoplay picks: {new} new to the user, {len(out) - new} they know "
+          f"(pool: {len(fresh)} new, {len(known)} known)", flush=True)
     return out
 
 async def _autoplay_refill(sess: Session) -> None:

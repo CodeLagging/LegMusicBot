@@ -217,20 +217,22 @@ When you `/play` something, your history on that server is a real part of the ra
 ### /autoplay
 
 - Seeds from **your saved songs** instead of what was played. Better-scored songs are more likely to be used as seeds.
-- About 30% of the time (`ALGO_DIRECT_CHANCE`) it replays one of your saved songs directly; otherwise it plays something related to them.
+- Its familiar picks (see below) start with your saved songs themselves, drawn at random and weighted by plays.
 - Errors if you have no saved songs yet on this server.
 
 ### How picks are found
 
-1. **YouTube Mix:** for each seed song, the worker loads YouTube's own radio mix (`watch?v=ID&list=RDID`, about 25 related songs). Mixes are cached for the session, so later refills don't reload them.
+1. **YouTube Mix:** for each seed song, the worker loads YouTube's own radio mix (`watch?v=ID&list=RDID`); the first 30 songs are used (`AUTOPLAY_MIX_DEPTH`). Mixes are cached for the session, so later refills don't reload them.
 2. All seeds' Mix songs go into **one pool**, filtered: nothing already played in the session or queued (by video id and cleaned-up title), no altered versions, nothing under 1 minute or over 10 minutes.
 3. Each candidate is scored (`_autoplay_score`):
    - how related it is: earlier in a Mix and from a stronger/more recent seed scores higher; appearing in **several seeds' Mixes** is a strong bonus;
    - **your reaction to autoplay before**: picks you listened to score higher, picks you skipped within 30 s are never played again (stored in search memory under `~autoplay`);
    - your taste (`_personal`): artists you play, songs you know; artists you keep skipping are pushed down;
    - a little randomness for variety.
-4. The best ones are queued, at most **2 per artist** per refill (`AUTOPLAY_PER_ARTIST`).
-5. **AI fallback** (only if the Mixes don't give enough): Groq is asked once for 10 similar songs; unused ones are kept for later refills. They're looked up without another AI call per song.
+4. The pool is split into songs **new to you** (not in your algo — neither that upload nor another upload of the song, including re-uploads like "Artist - Song (Lyrics)") and songs **you know**.
+5. **Each pick has a 70% chance to be a new song** (`AUTOPLAY_NEW_SHARE`), otherwise a song you know. New songs are still chosen from your taste: they come from the Mixes of your songs, songs that several of your songs lead to rank first, artists you keep skipping are pushed down, and artists you play count a little (`AUTOPLAY_NEW_TASTE_W`) — about half of new picks are by artists you already play, the rest are new artists. If one kind runs out, the other fills the slot, so a refill is always full.
+6. Picks are queued, at most **2 per artist** per refill (`AUTOPLAY_PER_ARTIST`).
+7. **AI fallback** (only if the Mixes don't give enough): Groq is asked once for 10 similar songs; unused ones are kept for later refills. They're looked up without another AI call per song, and only songs new to you are used.
 
 For `/autoplay`, seeds are your saved songs, weighted by plays **and** how recently you listened.
 
@@ -703,10 +705,13 @@ Seeds for the next picks: weighted saved songs of `autoplay_user` in `algo` mode
 A seed's Mix, loaded once per session.
 
 **`def _autoplay_score(t, position, seed_weight, appearances, taste)`**
-Score for one autoplay candidate, or None when the user skipped it in autoplay before (see "How picks are found").
+Score for one autoplay candidate, or None when the user skipped it in autoplay before (see "How picks are found"). `taste_w` is how much history counts: 0.6 for songs the user knows, `AUTOPLAY_NEW_TASTE_W` (0.15) for new ones.
 
 **`async def _recommend(sess, count)`**
-Finds up to `count` picks: in algo mode sometimes a saved song directly, then the best-scored songs from the pooled Mixes (max 2 per artist), then AI suggestions (batched, kept in `sess.ai_reserve`) if still short.
+Finds up to `count` picks. The pooled Mix songs are split into new-to-the-user and known (`_known_song`); each pick is new with probability `AUTOPLAY_NEW_SHARE` (0.7), else known (in algo mode a saved seed first, then known Mix songs). A missing kind is filled by the other; AI suggestions (batched, kept in `sess.ai_reserve`, new songs only) cover any remaining shortfall. Logs how many picks were new.
+
+**`def _known_song(t, taste)`**
+True when the song is in the user's algo: the same upload, the same title and artist, or a re-upload whose title contains a saved song's title and artist.
 
 **`async def _autoplay_refill(sess)`**
 Queues the picks (credited to the autoplay user or controller) if the queue is still empty and the session still exists.
@@ -980,7 +985,9 @@ Sent to `.main.sock`, one JSON line per connection, in order:
 | `PLAY_COUNT_MS` | worker.py | 30 s | Listening time for a song to count as a listen. |
 | `HISTORY_LEN` | worker.py | 25 | Played tracks remembered per session. |
 | `AUTOPLAY_BATCH` | worker.py | 5 | Autoplay picks queued per refill. |
-| `ALGO_DIRECT_CHANCE` | worker.py | 0.3 | `/autoplay`: chance of replaying a saved song instead of a related one. |
+| `AUTOPLAY_NEW_SHARE` | worker.py | 0.7 | Chance each autoplay pick is a song new to the user (else one they know). |
+| `AUTOPLAY_NEW_TASTE_W` | worker.py | 0.15 | How much the artists you play count when ranking new songs (about half of new picks end up by them). |
+| `AUTOPLAY_MIX_DEPTH` | worker.py | 30 | Songs used from each seed's YouTube Mix. |
 | `_STATUS_DELETE_DELAY` | worker.py | 10 s | Lifetime of the now-playing messages. |
 | `AI_PICK_CANDIDATES` | worker.py | 6 | Search results shown to the AI when it's needed. |
 | `AI_SKIP_MARGIN` | worker.py | 30 | Lead that makes a result a clear winner (no AI call). |
