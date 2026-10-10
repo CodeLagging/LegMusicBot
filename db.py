@@ -50,33 +50,36 @@ def _server_con() -> sqlite3.Connection:
         vcw        TEXT NOT NULL DEFAULT '{}',
         eph        TEXT NOT NULL DEFAULT '{}',
         src        TEXT,
+        rtc_region TEXT,
         updated_at REAL)""")
     cols = {r[1] for r in con.execute("PRAGMA table_info(guild_settings)")}
     if "src" not in cols:
         con.execute("ALTER TABLE guild_settings ADD COLUMN src TEXT")
+    if "rtc_region" not in cols:
+        con.execute("ALTER TABLE guild_settings ADD COLUMN rtc_region TEXT")
     return con
 
 
 def get_guild(guild_id: int) -> dict:
     with _tx(_server_con()) as con:
-        row = con.execute("SELECT cc_id, vcw, eph, src FROM guild_settings WHERE guild_id = ?",
+        row = con.execute("SELECT cc_id, vcw, eph, src, rtc_region FROM guild_settings WHERE guild_id = ?",
                           (guild_id,)).fetchone()
     if not row:
-        return {"cc_id": None, "vcw": {}, "eph": {}, "src": None}
+        return {"cc_id": None, "vcw": {}, "eph": {}, "src": None, "rtc_region": None}
     return {"cc_id": row["cc_id"], "vcw": json.loads(row["vcw"] or "{}"),
-            "eph": json.loads(row["eph"] or "{}"), "src": row["src"]}
+            "eph": json.loads(row["eph"] or "{}"), "src": row["src"], "rtc_region": row["rtc_region"]}
 
 
 def save_guild(guild_id: int, cfg: dict) -> None:
     with _tx(_server_con()) as con:
         con.execute(
-            """INSERT INTO guild_settings (guild_id, cc_id, vcw, eph, src, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO guild_settings (guild_id, cc_id, vcw, eph, src, rtc_region, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(guild_id) DO UPDATE SET
                  cc_id = excluded.cc_id, vcw = excluded.vcw, eph = excluded.eph,
-                 src = excluded.src, updated_at = excluded.updated_at""",
+                 src = excluded.src, rtc_region = excluded.rtc_region, updated_at = excluded.updated_at""",
             (guild_id, cfg.get("cc_id"), json.dumps(cfg.get("vcw") or {}),
-             json.dumps(cfg.get("eph") or {}), cfg.get("src"), time.time()),
+             json.dumps(cfg.get("eph") or {}), cfg.get("src"), cfg.get("rtc_region"), time.time()),
         )
 
 

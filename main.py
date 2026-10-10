@@ -559,6 +559,7 @@ async def on_ready():
     if main_bot._cmds_synced:
         return   # on_ready also fires after reconnects
     main_bot._cmds_synced = True
+    _spawn(_voice_regions())   # so /settings → Voice region opens without waiting
     await asyncio.gather(*[_sync_guild(g) for g in allowed])
     try:
         # Remove the global copies so commands don't show up twice. Done over HTTP so the tree
@@ -1713,11 +1714,88 @@ def _settings_embed(guild: discord.Guild, worker_idx: int, note: str | None = No
         marker = "▸ " if w.index == worker_idx else ""
         lines.append(f"{marker}Worker {w.index}: " + (f"<#{vc}>" if vc else "joins where the user is") + here)
     lines.append(f"**Default search source:** {SOURCES[_cfg_src(gid)]}")
+    lines.append(f"**Voice region:** {_region_label(_gcfg(gid).get('rtc_region'))}")
     private = [label for k, label in EPH_KEYS.items() if _eph(gid, k)]
     lines.append("**Private replies:** " + (", ".join(private) if private else "none (all public)"))
     embed = discord.Embed(title=f"⚙️  Settings — {guild.name}", description="\n".join(lines), colour=COLOUR)
     embed.set_footer(text="Only you can use this panel. Changes apply immediately.")
     return embed
+
+# Voice region override (/settings): set on a voice channel when a bot joins it.
+_REGION_FALLBACK = [("hongkong", "Hong Kong"), ("singapore", "Singapore"), ("japan", "Japan"),
+                    ("south-korea", "South Korea"), ("india", "India"), ("sydney", "Sydney"),
+                    ("us-west", "US West"), ("us-east", "US East"), ("us-central", "US Central"),
+                    ("us-south", "US South"), ("brazil", "Brazil"), ("rotterdam", "Rotterdam")]
+_regions_cache: tuple[float, list[tuple[str, str]]] | None = None
+
+async def _voice_regions() -> list[tuple[str, str]]:
+    """Discord's voice regions as (id, name), cached for a day; a built-in list if the API fails."""
+    global _regions_cache
+    if _regions_cache and time.monotonic() - _regions_cache[0] < 86400:
+        return _regions_cache[1]
+    try:
+        data = await main_bot.http.request(discord.http.Route("GET", "/voice/regions"))
+        regions = [(r["id"], r["name"]) for r in data if not r.get("deprecated")]
+    except Exception as exc:
+        print(f"[Main] Could not fetch voice regions: {exc}", flush=True)
+        regions = []
+    _regions_cache = (time.monotonic(), regions or list(_REGION_FALLBACK))
+    return _regions_cache[1]
+
+def _region_label(value: str | None) -> str:
+    if not value:
+        return "don't change (each channel keeps its own)"
+    if value == "auto":
+        return "automatic (Discord picks)"
+    return dict(_regions_cache[1] if _regions_cache else _REGION_FALLBACK).get(value, value)
+
+
+class RegionView(discord.ui.View):
+    """/settings → 🌐 Voice region: pick the region set on voice channels the bots join."""
+
+    def __init__(self, invoker_id: int, guild: discord.Guild, worker_idx: int, regions: list[tuple[str, str]]):
+        super().__init__(timeout=600)
+        self.invoker_id, self.guild, self.worker_idx = invoker_id, guild, worker_idx
+        current = _gcfg(guild.id).get("rtc_region")
+        options = [
+            discord.SelectOption(label="Don't change", value="none", default=not current,
+                                 description="Leave each voice channel's region as it is"),
+            discord.SelectOption(label="Automatic", value="auto", default=current == "auto",
+                                 description="Discord picks the voice server"),
+        ] + [discord.SelectOption(label=name[:100], value=rid, default=current == rid) for rid, name in regions[:23]]
+        self.pick = discord.ui.Select(placeholder="Voice region for channels the bots join", options=options, row=0)
+        self.pick.callback = self._on_pick
+        self.add_item(self.pick)
+        back = discord.ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._on_back
+        self.add_item(back)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.invoker_id:
+            return True
+        await interaction.response.send_message(
+            embed=_err_embed("Only the person who ran /settings can use this panel"), ephemeral=True)
+        return False
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        value = self.pick.values[0]
+        _gcfg(self.guild.id)["rtc_region"] = None if value == "none" else value
+        _save_gcfg(self.guild.id)
+        if value == "none":
+            note = ("✅ Voice region: don't change. Channels the bots already changed keep that region "
+                    "(change it back in the channel's settings).")
+        else:
+            note = (f"✅ Voice region: {_region_label(value)}. Set on a voice channel when a bot joins it "
+                    "(the worker bots need Manage Channels; people in that channel reconnect for a moment).")
+        self.stop()
+        await interaction.response.edit_message(embed=_settings_embed(self.guild, self.worker_idx, note),
+                                                view=SettingsView(self.invoker_id, self.guild, self.worker_idx))
+
+    async def _on_back(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(embed=_settings_embed(self.guild, self.worker_idx),
+                                                view=SettingsView(self.invoker_id, self.guild, self.worker_idx))
+
 
 def _channel_default(channel_id: int | None) -> list:
     if not channel_id:
@@ -1847,6 +1925,17 @@ class SettingsView(discord.ui.View):
         _gcfg(self.guild.id)["vcw"].pop(str(self.worker_idx), None)
         _save_gcfg(self.guild.id)
         await self._redraw(interaction, f"✅ Worker {self.worker_idx} now follows the user.")
+
+    @discord.ui.button(label="🌐 Voice region", style=discord.ButtonStyle.secondary, row=4)
+    async def btn_region(self, interaction: discord.Interaction, _):
+        await interaction.response.defer()   # the region list may need a Discord API call first
+        regions = await _voice_regions()
+        self.stop()
+        await interaction.edit_original_response(
+            embed=_settings_embed(self.guild, self.worker_idx,
+                                  "🌐 Pick the voice region for channels the bots join. Hong Kong / Singapore / "
+                                  "Japan are closest to the server; pick the one nearest to most listeners."),
+            view=RegionView(self.invoker_id, self.guild, self.worker_idx, regions))
 
     @discord.ui.button(label="Done", style=discord.ButtonStyle.primary, row=4)
     async def btn_done(self, interaction: discord.Interaction, _):

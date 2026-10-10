@@ -59,6 +59,9 @@ IDLE_TIMEOUT = 180
 
 
 YTDLP_TIMEOUT        = 20
+YTDLP_NICE           = 10      # yt-dlp runs at lower CPU priority so it never starves Lavalink's audio
+PRELOAD_BEFORE_MS    = 30_000  # this long before a song ends, the next song's stream is loaded fresh
+PRELOAD_TTL          = 120     # seconds a preloaded stream is trusted (YouTube stream links go stale)
 URL_CACHE_TTL        = 3600
 MAX_RESOLVE_ATTEMPTS = 2
 MAX_FAIL_STREAK      = 3
@@ -642,6 +645,7 @@ class Session:
         self.lyrics_private = False
         self.lyrics_task: asyncio.Task | None = None
         self.current_length = 0       # length of the upload actually playing (lyrics timing check)
+        self.preload_task: asyncio.Task | None = None   # loads the next song's stream before it's needed
         self.pos_base_ms    = 0       # our own playback clock, see _play_position
         self.pos_mark_ns    = 0
 
@@ -726,6 +730,14 @@ def _bg(fn, *args) -> None:
 _url_cache: dict[str, tuple[float, str]] = {}
 _inflight: dict[str, asyncio.Future] = {}
 
+def _lower_priority() -> None:
+    """Runs in the yt-dlp child before it starts: a search or stream lookup on the same Pi must not
+    take CPU from Lavalink while it's sending audio (that's heard as stutter)."""
+    try:
+        os.nice(YTDLP_NICE)
+    except OSError:
+        pass
+
 async def _kill_proc(proc) -> None:
     """Kill a timed-out subprocess and reap it (a killed but never-awaited process lingers)."""
     try:
@@ -746,6 +758,7 @@ async def _ytdlp_run(video_url: str) -> str | None:
             video_url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            preexec_fn=_lower_priority,
         )
     except Exception as exc:
         print(f"[Worker {BOT_INDEX}] yt-dlp could not start: {exc}", flush=True)
@@ -798,6 +811,7 @@ async def _ytdlp_meta_run(video_url: str) -> dict | None:
             video_url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            preexec_fn=_lower_priority,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=YTDLP_TIMEOUT)
     except asyncio.TimeoutError:
@@ -861,9 +875,17 @@ async def _rank_by_popularity(scored: list[tuple[wavelink.Playable, int]],
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked
 
-async def _resolve(track: wavelink.Playable
+_preloaded: dict[str, tuple[float, tuple]] = {}   # track key -> (when, _resolve result)
+
+async def _resolve(track: wavelink.Playable, fresh: bool = False
                    ) -> tuple[wavelink.Playable, wavelink.Playable, wavelink.Playable | None] | None:
-    """Returns (what Lavalink plays, the track the user asked for, the YouTube track it maps to)."""
+    """Returns (what Lavalink plays, the track the user asked for, the YouTube track it maps to).
+    A stream preloaded shortly before (see _preload_next) is used as is, so the song starts at
+    once. fresh: skip cached stream links (they can be refused after a few minutes)."""
+    if not fresh:
+        hit = _preloaded.pop(_track_key(track), None)
+        if hit and time.monotonic() - hit[0] < PRELOAD_TTL:
+            return hit[1]
     src = track
     uri = track.uri or ""
 
@@ -883,7 +905,7 @@ async def _resolve(track: wavelink.Playable
 
     # 1) cached/fresh yt-dlp stream URL, 2) a forced-fresh URL (cached ones can be refused by
     #    YouTube), 3) Lavalink's own YouTube plugin. Only then give up on this video.
-    for attempt in ("cached", "fresh", "plugin"):
+    for attempt in (("fresh", "plugin") if fresh else ("cached", "fresh", "plugin")):
         if attempt == "fresh":
             _url_cache.pop(uri, None)
             _meta_cache.pop(uri, None)
@@ -956,6 +978,7 @@ async def _set_vc_status(guild_id: int, channel_id: int, title: str | None) -> N
 def _after_start(sess: Session) -> None:
     _mark_position(sess, 0)
     _panel_changed(sess)
+    _schedule_preload(sess)
     if sess.current_info:
         _spawn(_set_vc_status(sess.guild_id, sess.channel_id, sess.current_info["title"]))
     if _humans_in_vc(sess):
@@ -1151,6 +1174,71 @@ async def _set_paused(sess: Session, player: wavelink.Player, paused: bool) -> N
     _mark_position(sess, pos)
 
 
+# ── preloading the next song ─────────────────────────────────────────────────
+
+def _cancel_preload(sess: Session) -> None:
+    if sess.preload_task and not sess.preload_task.done():
+        sess.preload_task.cancel()
+    sess.preload_task = None
+
+def _schedule_preload(sess: Session) -> None:
+    _cancel_preload(sess)
+    player = _get_player(sess.guild_id)
+    if player is not None and player.current is not None:
+        sess.preload_task = asyncio.ensure_future(_preload_next(sess, player, player.current))
+
+async def _preload_next(sess: Session, player: wavelink.Player, track: wavelink.Playable) -> None:
+    """PRELOAD_BEFORE_MS before this song ends, get a fresh stream link for the next song and load
+    it in Lavalink. The switch is then immediate: a link fetched minutes earlier (when the song
+    started) was often refused by then, which cost 2-3 s of silence while a new one was fetched."""
+    def same_song() -> bool:
+        return sessions.get(sess.guild_id) is sess and player.current is track
+    try:
+        while same_song():
+            length = sess.current_length or int(getattr(track, "length", 0) or 0)
+            if not length:
+                return   # a live stream: no "next" moment to prepare for
+            left = length - _play_position(sess, player)
+            if left <= PRELOAD_BEFORE_MS:
+                break
+            await asyncio.sleep(min(5.0, (left - PRELOAD_BEFORE_MS) / 1000))
+        if not same_song() or not sess.queue or sess.loop:
+            return
+        nxt = sess.queue[0][0]
+        resolved = await _resolve(nxt, fresh=True)
+        if resolved and same_song() and sess.queue and sess.queue[0][0] is nxt:
+            _preloaded[_track_key(nxt)] = (time.monotonic(), resolved)
+            if len(_preloaded) > 50:
+                for k, _ in sorted(_preloaded.items(), key=lambda kv: kv[1][0])[:25]:
+                    _preloaded.pop(k, None)
+            print(f"[Worker {BOT_INDEX}] Preloaded next song {nxt.title!r}", flush=True)
+    except Exception as exc:
+        print(f"[Worker {BOT_INDEX}] Preloading the next song failed: {exc}", flush=True)
+
+
+# ── voice region (/settings) ─────────────────────────────────────────────────
+
+async def _apply_region(vc: discord.VoiceChannel) -> None:
+    """The server's voice region from /settings, set on the channel before a bot joins it. Not set =
+    the channel is left as it is; "auto" = Discord picks. Needs Manage Channels."""
+    try:
+        want = (await asyncio.to_thread(db.get_guild, vc.guild.id)).get("rtc_region")
+    except Exception:
+        return
+    if not want:
+        return
+    target = None if want == "auto" else want
+    if vc.rtc_region == target:
+        return
+    try:
+        await vc.edit(rtc_region=target)
+        print(f"[Worker {BOT_INDEX}] Voice region of {vc.name!r} set to {want}", flush=True)
+    except discord.Forbidden:
+        print(f"[Worker {BOT_INDEX}] No Manage Channels permission to set the voice region of {vc.name!r}", flush=True)
+    except Exception as exc:
+        print(f"[Worker {BOT_INDEX}] Could not set the voice region of {vc.name!r}: {exc}", flush=True)
+
+
 # ── lyrics ───────────────────────────────────────────────────────────────────
 
 _lyrics_seq = 0
@@ -1294,6 +1382,7 @@ async def _play_shutdown_message(sess: Session, player: wavelink.Player | None) 
     sess.drain_state = "message"
     sess.lyrics_on = False
     _stop_lyrics(sess)
+    _cancel_preload(sess)
     sess.queue.clear()
     sess.autoplay = sess.loop = False
     _cancel_idle_timer(sess)
@@ -1601,6 +1690,7 @@ async def _end_session(guild_id: int, disconnect: bool = True) -> None:
         return
     sess.closing = True
     _stop_lyrics(sess)
+    _cancel_preload(sess)
     _cancel_idle_timer(sess)
     if sess.autoplay_task and not sess.autoplay_task.done():
         sess.autoplay_task.cancel()
@@ -1965,6 +2055,7 @@ async def _connect_vc(sess: Session) -> wavelink.Player:
     # would otherwise look like a kick and end the session that is connecting.
     sess.connecting = True
     try:
+        await _apply_region(vc)   # before joining, so the bot connects to that region's voice server
         if player and getattr(player, "channel", None) is None:
             await _leave_voice(sess.guild_id)   # half-disconnected leftover: start clean
             player = None

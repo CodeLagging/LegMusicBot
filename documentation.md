@@ -19,6 +19,7 @@ This document explains every function, class and method of the source files, the
 11. [Graceful restart](#11-graceful-restart)
 12. [Deployment and service](#12-deployment-and-service)
 13. [Lyrics](#13-lyrics)
+14. [Playback smoothness](#14-playback-smoothness)
 
 ---
 
@@ -96,7 +97,7 @@ When playback is started with a private command (`P_EPH`, `PL_EPH` or `AP_EPH` o
 
 - **Main bot:** Message Content Intent enabled in the Developer Portal (for the ``prefix`` commands). Send Messages in the server's first channel (for the whitelist notice).
 - **Lavalink:** the **LavaDSPX** plugin for the Normalize button (`com.github.Devoxin:LavaDSPX-Plugin:0.0.5`, repository `https://jitpack.io`, tested with Lavalink 4.2.2). Without it, Normalize replies with an error and everything else works.
-- **Workers:** Connect and Speak in voice channels, Send Messages and Embed Links in the control channel (now-playing and lyrics messages; they also delete their own lyrics messages), and **Set Voice Channel Status** (to show the song title on the channel; without it playback still works and a log line notes the missing permission).
+- **Workers:** Connect and Speak in voice channels, Send Messages and Embed Links in the control channel (now-playing and lyrics messages; they also delete their own lyrics messages), and **Set Voice Channel Status** (to show the song title on the channel; without it playback still works and a log line notes the missing permission). **Manage Channels** only if a voice region is set in `/settings` (without it the region isn't changed and a log line says so).
 - Every server needs the main bot **and** all worker bots invited.
 
 ---
@@ -153,7 +154,7 @@ The panel stops working after 15 minutes; run `/control` again.
 | 1 | Worker picker (choose which worker's fixed channel to edit) |
 | 2 | Fixed voice channel picker for that worker (empty = follow the user) |
 | 3 | Private replies multi-select (P/PL/AP/HC/CC/S) |
-| 4 | 🔎 Source (cycles Spotify → YouTube Music → SoundCloud), Clear control channel, Clear worker channel, Done |
+| 4 | 🔎 Source (cycles Spotify → YouTube Music → SoundCloud), Clear control channel, Clear worker channel, 🌐 Voice region (opens a picker: Don't change / Automatic / a region; see section 14), Done |
 
 Changes save immediately. A voice channel already fixed to another worker is refused.
 
@@ -887,7 +888,7 @@ Opens a SQLite file (creating its folder) with row access by name and WAL mode.
 Opens `database/server/servers.db` and creates or upgrades the `guild_settings` table (`guild_id`, `cc_id`, `vcw` JSON, `eph` JSON, `src`, `updated_at`).
 
 **`def get_guild(guild_id)`**
-A server's settings as `{cc_id, vcw, eph, src}`; defaults when the server has none.
+A server's settings as `{cc_id, vcw, eph, src, rtc_region}`; defaults when the server has none. The `rtc_region` column is added to an existing `servers.db` automatically.
 
 **`def save_guild(guild_id, cfg)`**
 Inserts or updates a server's settings.
@@ -1025,6 +1026,9 @@ For private lyrics the worker also sends:
 | `VC_TIMEOUT`, `VC_RETRIES` | worker.py | 60 s, 3 | Time and attempts for joining or moving to a voice channel. |
 | `IDLE_TIMEOUT` | worker.py | 180 s | Idle time before the worker leaves. |
 | `YTDLP_TIMEOUT` | worker.py | 20 s | Maximum time for one yt-dlp lookup. |
+| `YTDLP_NICE` | worker.py | 10 | yt-dlp runs at this lower CPU priority, so lookups never take CPU from Lavalink's audio. |
+| `PRELOAD_BEFORE_MS` | worker.py | 30 s | This long before a song ends, the next song's stream is fetched fresh and loaded. |
+| `PRELOAD_TTL` | worker.py | 120 s | How long a preloaded stream is trusted (YouTube stream links go stale). |
 | `URL_CACHE_TTL` | worker.py | 3600 s | How long a resolved stream URL is reused. |
 | `MAX_RESOLVE_ATTEMPTS` | worker.py | 2 | Candidates tried per play before handing the original to Lavalink. |
 | `MAX_FAIL_STREAK` | worker.py | 3 | Failed tracks in a row before the worker stops and reports. |
@@ -1220,3 +1224,21 @@ The playback clock described above. Pause, resume, seek and the start of each so
 ### textnorm.py
 
 `fold`, `words`, `artist_key` and `norm_title`: the text normalisation shared by search, autoplay and lyrics (accents removed, "- Topic"/"VEVO" dropped from artist names, bracketed parts and "official video" dropped from titles).
+
+---
+
+## 14. Playback smoothness
+
+Measured on the server (Raspberry Pi 5, 4 cores, wired gigabit, idle around 49 °C, no throttling): the hardware and network aren't the bottleneck, and the bots already connect to Hong Kong voice servers (the closest region) automatically. What reduces stutter and gaps:
+
+- **Next song preloaded:** 30 s before a song ends (`PRELOAD_BEFORE_MS`), the worker fetches a **fresh** stream link for the next song and loads it in Lavalink, so the next song starts at once (`_preload_next`). Before, the link was fetched when the previous song started; YouTube often refused it minutes later (20 times in 3 days), and each refusal cost 2–3 s of silence while a new one was fetched. Not done in loop mode or for live streams. A preload older than `PRELOAD_TTL` (2 min) isn't used.
+- **yt-dlp at lower CPU priority** (`YTDLP_NICE`, nice 10): searches and stream lookups run on the same Pi as Lavalink; they now always yield to the audio.
+- **Bigger Lavalink audio buffer:** `frameBufferDurationMs: 10000` in `~/servers/lavalink/application.yml` (was 5000). Lavalink keeps up to 10 s of decoded audio ready, which rides out short YouTube hiccups. The side effect is that **Normalize** can take up to 10 s to be heard after toggling it. Changing it needs a Lavalink restart. The backup of the previous file is `application.yml.bak-2026-10-10b`.
+- **Voice region per server** (`/settings` → 🌐 Voice region). Options:
+  - **Don't change** (default): channels keep their own region.
+  - **Automatic**: Discord picks.
+  - **A region** (Hong Kong, Singapore, Japan, …).
+
+  The region is set on the voice channel just before a bot joins it (`_apply_region`). The worker bots need **Manage Channels** for this, and people already in the channel reconnect for a moment. Pick the region nearest to most listeners. It's only worth changing if the automatic choice is far from them. Switching back to "Don't change" doesn't revert channels already changed; change those in the channel's settings.
+
+If audio still stutters, Lavalink's own counters show whether frames are being lost on the server side (`GET /v4/stats` → `frameStats`: `sent`, `nulled`, `deficit` per minute while something plays).
