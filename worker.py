@@ -82,7 +82,7 @@ AUTOPLAY_MIX_DEPTH = 30    # songs used from each seed's YouTube Mix (deeper = m
 AUTOPLAY_NEW_TASTE_W = 0.15
 
 LYRICS_TICK    = 0.25    # seconds between position checks while lyrics show
-LYRICS_LEAD_MS = 400     # lines are sent this early, to cover the time a message edit takes
+LYRICS_LEAD_MS = 600     # lines are sent this early, to cover the time a message edit takes (and Discord shows it)
 LYRICS_MIN_GAP = 1.2     # seconds between lyric edits at most (fast lines skip straight to the latest)
 
 _groq         = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])

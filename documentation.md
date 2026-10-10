@@ -1019,7 +1019,7 @@ For private lyrics the worker also sends:
 | `PERSONAL_HALF_LIFE_DAYS` | worker.py | 30 | How fast personal boosts fade without listening. |
 | `NORMALIZE_SETTINGS` | worker.py | maxAmplitude 0.75, adaptive | Normalize filter settings. |
 | `LYRICS_TICK` | worker.py | 0.25 s | How often the lyrics loop checks the playback position. |
-| `LYRICS_LEAD_MS` | worker.py | 400 ms | Lines are sent this early, to cover the time a message edit takes. |
+| `LYRICS_LEAD_MS` | worker.py | 600 ms | Lines are sent this early, to cover the time a message edit takes and Discord shows it. |
 | `LYRICS_MIN_GAP` | worker.py | 1.2 s | At most one lyrics edit this often; faster lines skip to the latest. |
 | `PROVIDER_TIMEOUT` | lyrics.py | 8 s | Per lyrics provider; one that's slower is skipped. |
 | `MAX_LENGTH_DIFF_MS` | lyrics.py | 3 s | Lyrics whose source duration is further off are another version and aren't used. |
@@ -1153,7 +1153,7 @@ Musixmatch isn't used: its synced lyrics are only available through its desktop 
 
 **Cache:** results are kept in `database/lyrics.db`. Found lyrics last 30 days, and "no synced lyrics" lasts 3 days (only when every provider answered). When lyrics are on, the next song in the queue is looked up while the current one plays, so its lyrics usually appear at once.
 
-**Timing:** wavelink only learns the playback position from Lavalink's updates (every 5 s), so right after a song starts, a seek, or a resume, its position is stale. The worker keeps its own clock (`_mark_position` / `_play_position`), restarted when Lavalink reports that the track really started, and uses Lavalink's position again once a newer update arrives. Lines are sent 0.4 s early (`LYRICS_LEAD_MS`) to cover the edit delay.
+**Timing:** wavelink only learns the playback position from Lavalink's updates (every 5 s), so right after a song starts, a seek, or a resume, its position is stale. The worker keeps its own clock (`_mark_position` / `_play_position`), restarted when Lavalink reports that the track really started, and uses Lavalink's position again once a newer update arrives. Lines are sent 0.6 s early (`LYRICS_LEAD_MS`) to cover the edit delay.
 
 Coverage at launch, checked against the saved songs on the main server: 51 of 69 had synced lyrics (48 from YouTube Music, 3 from LRCLib). Most of the rest are instrumental.
 
