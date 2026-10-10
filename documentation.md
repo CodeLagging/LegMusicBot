@@ -71,6 +71,7 @@ Copy `server_settings.json.example` and fill it in. Behaviour keys are re-read a
 | `leave_message` | "This server is not currently whitelisted, bot will not function" | Posted (with the server owner pinged) before the bot leaves a non-whitelisted server. |
 | `algo_max_kb` | `1024` | Storage cap for one user's saved songs on one server, in KB. There is no song-count limit; a saved song takes about 100 bytes, so 1 MB is roughly 10,000 songs. |
 | `autoplay_seed_count` | `5` | How many songs autoplay looks at when choosing what to play next. |
+| `lyrics_delay` | `-0.2` | Lyrics timing in seconds (decimals allowed). Negative shows lines earlier, positive later. It's added to the built-in 0.4 s head start (`LYRICS_EDIT_LEAD`) that covers the time an edit takes to show in Discord. Takes effect within a second, no restart. |
 
 ### Per-server settings (/settings)
 
@@ -1019,7 +1020,8 @@ For private lyrics the worker also sends:
 | `PERSONAL_HALF_LIFE_DAYS` | worker.py | 30 | How fast personal boosts fade without listening. |
 | `NORMALIZE_SETTINGS` | worker.py | maxAmplitude 0.75, adaptive | Normalize filter settings. |
 | `LYRICS_TICK` | worker.py | 0.25 s | How often the lyrics loop checks the playback position. |
-| `LYRICS_LEAD_MS` | worker.py | 600 ms | Lines are sent this early, to cover the time a message edit takes and Discord shows it. |
+| `LYRICS_EDIT_LEAD` | worker.py | 0.4 s | Lines are sent this early, the time an edit takes to show in Discord. `lyrics_delay` in `server_settings.json` adjusts on top (-0.2 = 0.2 s earlier). |
+| `PAIR_MAX_GAP_MS` | lyrics.py | 7 s | Two lyric lines share a display line only if the second starts within this. |
 | `LYRICS_MIN_GAP` | worker.py | 1.2 s | At most one lyrics edit this often; faster lines skip to the latest. |
 | `PROVIDER_TIMEOUT` | lyrics.py | 8 s | Per lyrics provider; one that's slower is skipped. |
 | `MAX_LENGTH_DIFF_MS` | lyrics.py | 3 s | Lyrics whose source duration is further off are another version and aren't used. |
@@ -1129,7 +1131,7 @@ Notes:
 
 Live **synced** lyrics for the song that's playing, turned on per session with **🎤 Lyrics** in `/control` (there's no server default). Bots can't stream video, so lyrics are a message that's edited as the song plays:
 
-- An embed titled **`Lyrics - <song title>`**. Its description is a code block with three lines: previous, **current** (marked `▶`) and next. Instrumental breaks show ♪.
+- An embed titled **`Lyrics - <song title>`**. Its description is a code block with three display lines: previous, **current** (marked `▶`) and next. **Each display line holds two lyric lines** ("line 1 / line 2"), so a message shows 6 lyric lines and changes half as often (40–49% fewer edits on real songs). The pairs are fixed: lines 1+2, 3+4 and so on. A music break (♪) stays on its own line, and two lines more than 7 s apart aren't joined, so the second never shows long before it's sung.
 - **One message per song**, deleted when the song ends (or is skipped or stopped, or lyrics are turned off). The next song gets a new one.
 - **Privacy follows the playback.** If playback was started with a private command, lyrics are an ephemeral message only the person who pressed 🎤 sees. Discord allows that for 15 minutes after the click, so it then says to press 🎤 again. Otherwise it's a normal message in the session's text channel, posted by the worker.
 - **Only synced lyrics.** If no provider has synced lyrics for the song, the message just says "Synced lyrics not available". Plain unsynced text is never shown. If the lookup takes more than a second, the message first says "Looking up synced lyrics…".
@@ -1153,7 +1155,7 @@ Musixmatch isn't used: its synced lyrics are only available through its desktop 
 
 **Cache:** results are kept in `database/lyrics.db`. Found lyrics last 30 days, and "no synced lyrics" lasts 3 days (only when every provider answered). When lyrics are on, the next song in the queue is looked up while the current one plays, so its lyrics usually appear at once.
 
-**Timing:** wavelink only learns the playback position from Lavalink's updates (every 5 s), so right after a song starts, a seek, or a resume, its position is stale. The worker keeps its own clock (`_mark_position` / `_play_position`), restarted when Lavalink reports that the track really started, and uses Lavalink's position again once a newer update arrives. Lines are sent 0.6 s early (`LYRICS_LEAD_MS`) to cover the edit delay.
+**Timing:** wavelink only learns the playback position from Lavalink's updates (every 5 s), so right after a song starts, a seek, or a resume, its position is stale. The worker keeps its own clock (`_mark_position` / `_play_position`), restarted when Lavalink reports that the track really started, and uses Lavalink's position again once a newer update arrives. Lines are sent early to cover the edit delay: 0.4 s (`LYRICS_EDIT_LEAD`) minus `lyrics_delay` from `server_settings.json` (default -0.2, so 0.6 s in total). Change `lyrics_delay` if lines feel late (more negative) or early (towards positive).
 
 Coverage at launch, checked against the saved songs on the main server: 51 of 69 had synced lyrics (48 from YouTube Music, 3 from LRCLib). Most of the rest are instrumental.
 
@@ -1169,12 +1171,12 @@ LRC to `[(start ms, text)]`. Handles several timestamps on one line, `[offset:]`
 The names lyrics sites use: no "(Official Video)", "feat." or "Artist - " prefix, and only the first artist. Version words like "(Slowed)" are kept.
 
 **`def state_at(lyrics, pos_ms)`** / **`def render(state)`**
-The (previous, current, next) lines at a position, and their code-block text.
+The (previous, current, next) display lines at a position, each up to two lyric lines (`Lyrics.groups`, built by `_pairs`), and their code-block text.
 
 ### worker.py: lyrics
 
 **`async def _lyrics_song(sess, player, track)`**
-One song's lyrics. It looks them up, then every `LYRICS_TICK` finds the line at `_play_position + LYRICS_LEAD_MS`, and edits only when the line changed. It ends when the song ends, the session ends or lyrics are turned off, and its `finally` deletes the message.
+One song's lyrics. It looks them up, then every `LYRICS_TICK` finds the display line at `_play_position` plus the lead (`LYRICS_EDIT_LEAD - lyrics_delay`), and edits only when it changed. It ends when the song ends, the session ends or lyrics are turned off, and its `finally` deletes the message.
 
 **`class _LyricsOut`**
 Where one song's lyrics go: a message in the session's text channel (public playback), or `lyrics` events to the controller (private playback).

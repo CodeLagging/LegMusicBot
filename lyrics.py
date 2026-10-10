@@ -23,6 +23,7 @@ MAX_LENGTH_DIFF_MS = 3000       # a source further off is another version (slowe
 NONE_CACHE_TTL     = 3 * 86400  # "no synced lyrics anywhere" is checked again after this
 FOUND_CACHE_TTL    = 30 * 86400
 GAP_MS             = 8000       # this far into a line, with the next one still a while away -> ♪
+PAIR_MAX_GAP_MS    = 7000       # two lyric lines share a display line only if the second starts this soon
 SOURCE_BONUS       = {"YouTube Music": 30, "LRCLib": 15, "NetEase": 0}
 MUSIC_NOTE         = "♪"
 USER_AGENT = "LegMusicBot (https://github.com/CodeLagging/LegMusicBot)"
@@ -30,13 +31,32 @@ BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Ge
 
 
 class Lyrics:
-    __slots__ = ("lines", "starts", "provider", "duration_ms")
+    __slots__ = ("lines", "starts", "provider", "duration_ms", "groups", "group_starts")
 
     def __init__(self, lines: list[tuple[int, str]], provider: str, duration_ms: int = 0):
-        self.lines       = sorted((int(t), s) for t, s in lines)
-        self.starts      = [t for t, _ in self.lines]
-        self.provider    = provider
-        self.duration_ms = int(duration_ms or 0)
+        self.lines        = sorted((int(t), s) for t, s in lines)
+        self.starts       = [t for t, _ in self.lines]
+        self.provider     = provider
+        self.duration_ms  = int(duration_ms or 0)
+        self.groups       = _pairs(self.lines)          # what's displayed: (start, text, last line start)
+        self.group_starts = [g[0] for g in self.groups]
+
+
+def _pairs(lines: list[tuple[int, str]]) -> list[tuple[int, str, int]]:
+    """Two lyric lines per display line, so the message changes half as often (fewer edits, less
+    rate limiting). Pairs are fixed (1+2, 3+4, ...). A music break (♪) stays on its own line, and
+    lines far apart aren't joined (the second one would show long before it's sung)."""
+    groups: list[list] = []   # [start, [texts], start of its last line]
+    for t, text in lines:
+        g = groups[-1] if groups else None
+        if g and text == MUSIC_NOTE and g[1] == [MUSIC_NOTE]:
+            continue   # one ♪ for consecutive breaks
+        if g and text != MUSIC_NOTE and g[1][0] != MUSIC_NOTE and len(g[1]) < 2 and t - g[0] <= PAIR_MAX_GAP_MS:
+            g[1].append(text)
+            g[2] = t
+        else:
+            groups.append([t, [text], t])
+    return [(start, " / ".join(texts), last) for start, texts, last in groups]
 
 
 # ── parsing ──────────────────────────────────────────────────────────────────
@@ -331,23 +351,23 @@ async def find(title: str, artist: str, length_ms: int, yt_id: str | None = None
 # ── display ──────────────────────────────────────────────────────────────────
 
 def state_at(lyr: Lyrics, pos_ms: int) -> tuple[str, str, str]:
-    """(previous, current, next) line at this position. Before the first line, during long breaks
-    and after the last line the current line is ♪."""
-    i = bisect.bisect_right(lyr.starts, pos_ms) - 1
-    lines = lyr.lines
+    """(previous, current, next) display line at this position; each is up to two lyric lines.
+    Before the first line, during long breaks and after the last line the current line is ♪."""
+    groups = lyr.groups
+    i = bisect.bisect_right(lyr.group_starts, pos_ms) - 1
     if i < 0:
-        return "", MUSIC_NOTE, lines[0][1] if lines else ""
-    nxt_start = lines[i + 1][0] if i + 1 < len(lines) else None
-    prev, cur = (lines[i - 1][1] if i >= 1 else ""), lines[i][1]
-    nxt = lines[i + 1][1] if nxt_start is not None else ""
+        return "", MUSIC_NOTE, groups[0][1] if groups else ""
+    nxt_start = groups[i + 1][0] if i + 1 < len(groups) else None
+    prev, cur, last = (groups[i - 1][1] if i >= 1 else ""), groups[i][1], groups[i][2]
+    nxt = groups[i + 1][1] if nxt_start is not None else ""
     # Nothing sung for a while (an instrumental break the file doesn't mark, or the outro).
-    if cur != MUSIC_NOTE and pos_ms - lines[i][0] >= GAP_MS and (nxt_start is None or nxt_start - lines[i][0] >= GAP_MS + 4000):
+    if cur != MUSIC_NOTE and pos_ms - last >= GAP_MS and (nxt_start is None or nxt_start - last >= GAP_MS + 4000):
         prev, cur = cur, MUSIC_NOTE
     return prev, cur, nxt
 
 def render(state: tuple[str, str, str]) -> str:
     """Three lines in a code block; the current one is marked (bold doesn't work in code blocks)."""
     def clean(s: str) -> str:
-        return (s or "").replace("```", "'''")[:90]
+        return (s or "").replace("```", "'''")[:180]
     prev, cur, nxt = state
     return f"```\n  {clean(prev)}\n▶ {clean(cur)}\n  {clean(nxt)}\n```"

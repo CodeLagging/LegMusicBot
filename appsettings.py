@@ -19,6 +19,9 @@ DEFAULTS: dict = {
     "leave_message": "This server is not currently whitelisted, bot will not function",
     "algo_max_kb": 1024,       # per user per server; about 100 bytes per saved song
     "autoplay_seed_count": 5,
+    # Lyrics timing in seconds: negative shows lines earlier, positive later. Added to the built-in
+    # 0.4 s head start that covers the time an edit takes to show in Discord. Re-read on change.
+    "lyrics_delay": -0.2,
 }
 
 _cache: dict = dict(DEFAULTS)
@@ -69,6 +72,18 @@ def _id_set(values) -> set[int]:
     return out
 
 _warned: set[str] = set()
+
+
+def get_float(name: str) -> float:
+    """A numeric setting that may have decimals (e.g. -0.2); a typo falls back to the default."""
+    value = get().get(name)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        if f"{name}={value!r}" not in _warned:
+            _warned.add(f"{name}={value!r}")
+            print(f"[Settings] Invalid {name} {value!r} in {PATH.name} — using {DEFAULTS[name]}", flush=True)
+        return float(DEFAULTS[name])
 
 
 def get_int(name: str) -> int:

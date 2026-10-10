@@ -18,5 +18,6 @@
   ],
   "leave_message": "This server is not currently whitelisted, bot will not function",
   "algo_max_kb": 1024,
-  "autoplay_seed_count": 5
+  "autoplay_seed_count": 5,
+  "lyrics_delay": -0.2
 }

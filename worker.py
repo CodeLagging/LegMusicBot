@@ -82,8 +82,9 @@ AUTOPLAY_MIX_DEPTH = 30    # songs used from each seed's YouTube Mix (deeper = m
 AUTOPLAY_NEW_TASTE_W = 0.15
 
 LYRICS_TICK    = 0.25    # seconds between position checks while lyrics show
-LYRICS_LEAD_MS = 600     # lines are sent this early, to cover the time a message edit takes (and Discord shows it)
 LYRICS_MIN_GAP = 1.2     # seconds between lyric edits at most (fast lines skip straight to the latest)
+LYRICS_EDIT_LEAD = 0.4   # seconds: lines go out this early, the time an edit takes to show in Discord
+                         # (lyrics_delay in server_settings.json adjusts on top: -0.2 = 0.2 s earlier)
 
 _groq         = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
 _GROQ_MODEL   = "openai/gpt-oss-20b"
@@ -1214,7 +1215,8 @@ async def _lyrics_song(sess: Session, player: wavelink.Player, track: wavelink.P
         shown, last = None, 0.0
         while playing():
             if not player.paused:
-                state = lyrics.state_at(found, _play_position(sess, player) + LYRICS_LEAD_MS)
+                lead_ms = int((LYRICS_EDIT_LEAD - appsettings.get_float("lyrics_delay")) * 1000)
+                state = lyrics.state_at(found, _play_position(sess, player) + lead_ms)
                 if state != shown and time.monotonic() - last >= LYRICS_MIN_GAP:
                     await out.show(_lyrics_embed(title, lyrics.render(state)))
                     shown, last = state, time.monotonic()
