@@ -1935,9 +1935,15 @@ async def _search(query: str, source: str, sess: Session | None,
         candidates += await _remembered_candidates(taste, qnorm, candidates)
 
     # If the search names an artist, personal history must not pull results by other artists.
+    # A query word names an artist only when more results have it in the artist than in the title:
+    # "m22" in "noite quente m22" is an artist, but "morena" is a song title even though one
+    # result's artist is "Illest Morena" (treating it as a name switched off the user's history).
     q_words = [w for w in _words(query) if len(w) >= 3]
-    named = {_artist_key(t.author) for t in candidates
-             if any(w in _fold(t.author or "") and w not in _fold(t.title or "") for w in q_words)}
+    def _in_artist_only(w, t): return w in _fold(t.author or "") and w not in _fold(t.title or "")
+    def _in_title_only(w, t):  return w in _fold(t.title or "") and w not in _fold(t.author or "")
+    artist_words = [w for w in q_words
+                    if sum(_in_artist_only(w, t) for t in candidates) > sum(_in_title_only(w, t) for t in candidates)]
+    named = {_artist_key(t.author) for t in candidates if any(_in_artist_only(w, t) for w in artist_words)}
     personal: dict[str, tuple[float, str]] = {}
     for t in candidates:
         bonus, note = _personal(t, taste, qnorm)
@@ -2227,6 +2233,7 @@ async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.Strea
                         muted=sess.muted if sess else False, loop=sess.loop if sess else False,
                         autoplay=sess.autoplay if sess else False,
                         normalize=sess.normalize if sess else False,
+                        paused=bool(sess and player and player.paused),
                         session=sess.snapshot() if sess else None)
             return
 

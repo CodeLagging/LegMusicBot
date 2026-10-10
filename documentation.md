@@ -121,9 +121,9 @@ The `worker` option forces a specific worker (0 = automatic). It is needed to us
 | Row | Contents |
 |---|---|
 | 0 | ⏪ 10s, ⏪ 5s, ⏩ 5s, ⏩ 10s, 🔁 Loop |
-| 1 | ⏮ Backward (restart track), ⏸/▶ Pause/Play, ⏹ Stop, ⏭ Skip, 🔇 Mute (hides now-playing messages) |
+| 1 | ⏮ Backward (restart track), ⏸ Pause / ▶ Resume (shows which one applies), ⏹ Stop, ⏭ Skip, 🔇 Mute (hides now-playing messages) |
 
-The panel **updates itself** every 8 s when the song, queue or a setting changes (keeping your page and selection), and shows "Playback ended" when the session stops. Discord only allows editing it for 15 minutes, so at 14 minutes it turns into "Panel expired — run /control again".
+The panel **updates itself** every 8 s when the song, queue or a setting changes (keeping your page and selection), and shows "Playback ended" when the session stops. The header shows ⏸️ paused, 🔇 muted, 🔁 loop, 🎲 autoplay and 🎚️ normalized when they're on. After ⏹ Stop the panel says "Stopped" and its buttons are disabled. Discord only allows editing it for 15 minutes, so at 14 minutes it turns into "Panel expired — run /control again".
 | 2 | Queue dropdown (25 per page; 🎲 marks autoplay picks) |
 | 3 | ⏭ Jump To, 🗑 Remove, ✖ Clear selection, 🎲 Autoplay, 🔒 Control: Me / 🔓 Control: All |
 | 4 | 🎚️ Normalize (evens out loud and quiet songs; default off; also applies to the shutdown message), then page buttons for queues longer than one page |
@@ -201,7 +201,7 @@ When you `/play` something, your history on that server is a real part of the ra
 - Song boosts fade with time since you last listened (half strength after about a month without listening).
 - Uploads you listened to that **aren't in the search results** (e.g. found earlier via Spotify) are fetched and added as candidates, so "noite quente" can find the Flame Runner upload you played without typing the artist.
 - Artist names are matched without YouTube channel suffixes ("Sxilwix - Topic" = "Sxilwix").
-- **Your words still win:** if the search names an artist ("noite quente m22"), history can't pull results by other artists. Altered versions still need to be asked for.
+- **Your words still win:** if the search names an artist ("noite quente m22"), history can't pull results by other artists. A word counts as an artist name only when more results have it in the artist than in the title, so "morena" (a song title, even though one artist is called Illest Morena) still uses your history. Altered versions still need to be asked for.
 - With strong personal evidence (+40 or more) for a result that matches the search, it beats the AI's generic "most popular official upload" pick.
 - When Spotify is used, its match also prefers a song or artist you know (many songs share a title).
 - `/reset-algo` deletes your saved songs and search memory on that server (with a confirm button; only ever your own).
@@ -452,9 +452,9 @@ The queue dropdown, one page of up to 25 tracks. Choosing a track only selects i
 
 **`class ControlView(discord.ui.View)`**
 The panel (15 minute timeout). Rows as in section 3.
-- **`__init__(self, worker, guild_id, queue, current_title, page=0, muted=False, loop=False, autoplay=False, mode="me", selected_idx=None)`** — Stores the state and adds the dropdown and dynamic buttons.
+- **`__init__(self, worker, guild_id, queue, current_title, page=0, muted=False, loop=False, autoplay=False, mode="me", selected_qid=None, normalize=False)`** — Stores the state and adds the dropdown and dynamic buttons. Every version of the panel gets its own button ids (`tag`): each refresh puts a new view on the same message and retires the old one, and discord.py forgets a retired view's buttons by id for that message — with ids shared between versions (Stop, Autoplay, Control used to have fixed ones) that also unhooked the new view's buttons, so they did nothing after the first refresh.
 - **`interaction_check(self, interaction)`** — Runs before every button/dropdown. Refuses (privately) when the session has ended or the user isn't allowed (section 4). The mode button is controller/dev only; the Stop button is also allowed for Manage Server.
-- **`_dispatch(self, interaction, op, timeout=15.0, **extra)`** — Shared handler: sends the operation, stores any session snapshot, shows feedback, and refreshes the panel after skip, restart, mute, loop, autoplay and mode changes. Returns the reply.
+- **`_dispatch(self, interaction, op, timeout=15.0, **extra)`** — Shared handler: sends the operation, stores any session snapshot, shows feedback, and refreshes the panel after skip, restart, pause/resume, mute, loop, autoplay, normalize and mode changes. Returns the reply.
 - **`rw10`, `rw5`, `ff5`, `ff10`** — Seek −10/−5/+5/+10 s.
 - **`btn_loop`** — `toggle_loop`.
 - **`btn_backward`** — `backward` (restart the track).
@@ -931,7 +931,7 @@ The controller sends one JSON object per connection to `.worker<N>.sock`, with `
 | `backward` | Seeks to the start. | `restarted` |
 | `seek` | Moves by `delta_ms`, clamped to the track. | `seeked` with `delta_ms` |
 | `remove_from_queue` | Deletes the song with `qid`. Error if it already played or was removed. | `removed` with `title`, `queue_remaining` |
-| `get_queue` | Returns the current track and the queue: each entry has `title`, `author`, `index` (position), `qid` and an `autoplay` flag. | `queue` with `current`, `queue`, `muted`, `loop`, `autoplay`, `session` |
+| `get_queue` | Returns the current track and the queue: each entry has `title`, `author`, `index` (position), `qid` and an `autoplay` flag. | `queue` with `current`, `queue`, `muted`, `loop`, `autoplay`, `normalize`, `paused`, `session` |
 | `toggle_mute` | Hides or shows now-playing messages. | `muted` or `unmuted` |
 | `toggle_loop` | Repeats the current track or not. | `loop_on` or `loop_off` |
 | `toggle_autoplay` | Turns autoplay on (needs played history unless in algo mode; starts playing if idle) or off (drops queued picks). | `autoplay_on` or `autoplay_off`, `session` |

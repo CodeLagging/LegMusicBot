@@ -1093,7 +1093,7 @@ class AutoplayButton(discord.ui.Button):
         on = view._autoplay
         super().__init__(label="🎲 Autoplay ON" if on else "🎲 Autoplay",
                          style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
-                         row=3, custom_id=f"ctl_autoplay:{view.worker.index}:{view.guild_id}")
+                         row=3, custom_id=f"ctl_autoplay:{view.tag}")
 
     async def callback(self, interaction: discord.Interaction):
         await self._ctrl._dispatch(interaction, "toggle_autoplay", timeout=45.0)
@@ -1105,7 +1105,7 @@ class ModeButton(discord.ui.Button):
         everyone = view._mode == "all"
         super().__init__(label="🔓 Control: All" if everyone else "🔒 Control: Me",
                          style=discord.ButtonStyle.success if everyone else discord.ButtonStyle.secondary,
-                         row=3, custom_id=f"ctl_mode:{view.worker.index}:{view.guild_id}")
+                         row=3, custom_id=f"ctl_mode:{view.tag}")
 
     async def callback(self, interaction: discord.Interaction):
         new_mode = "me" if self._ctrl._mode == "all" else "all"
@@ -1163,6 +1163,12 @@ class ControlView(discord.ui.View):
                  muted: bool = False, loop: bool = False, autoplay: bool = False,
                  mode: str = "me", selected_qid: int | None = None, normalize: bool = False):
         super().__init__(timeout=900)
+        # Every refresh puts a new view on the same message and retires the old one. discord.py
+        # forgets the old view's buttons by custom_id for that message, so buttons with the same
+        # id in every version (Stop, Autoplay, Control) were unhooked from the new view too and
+        # stopped working after the first refresh. Ids are unique per version instead.
+        self.tag             = os.urandom(6).hex()
+        self.btn_stop.custom_id = f"ctl_stop:{self.tag}"
         self.worker          = worker
         self.guild_id        = guild_id
         self.eph             = _eph(guild_id, "CC_EPH")
@@ -1235,7 +1241,7 @@ class ControlView(discord.ui.View):
             await interaction.followup.send(embed=embed, ephemeral=self.eph)
         if resp.get("message") in ("skipped", "restarted", "muted", "unmuted", "loop_on", "loop_off",
                                    "autoplay_on", "autoplay_off", "mode_all", "mode_me",
-                                   "normalize_on", "normalize_off"):
+                                   "normalize_on", "normalize_off", "paused", "resumed"):
             await _refresh_control_panel(interaction, self, page=self._queue_page, selected_qid=None)
         return resp
 
@@ -1257,7 +1263,7 @@ class ControlView(discord.ui.View):
     @discord.ui.button(label="⏮ Backward", style=discord.ButtonStyle.primary, row=1)
     async def btn_backward(self, i, _): await self._dispatch(i, "backward")
 
-    @discord.ui.button(label="⏸ Pause / ▶ Play", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="⏸ Pause", style=discord.ButtonStyle.primary, row=1)
     async def btn_pause(self, i, _): await self._dispatch(i, "pause_resume")
 
     @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger, row=1, custom_id="ctl_stop:")
@@ -1267,8 +1273,13 @@ class ControlView(discord.ui.View):
             self._stopped = True
             self.worker.apply(self.guild_id, None)
             for child in self.children: child.disabled = True
-            try: await i.edit_original_response(view=self)
-            except Exception: pass
+            try:
+                await i.edit_original_response(
+                    embed=_simple_embed("⏹️  Stopped — use /play or /control again", discord.Colour.dark_grey()),
+                    view=self)
+            except Exception:
+                pass
+            self.stop()
 
     @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.primary, row=1)
     async def btn_skip(self, i, _): await self._dispatch(i, "skip", timeout=45.0)
@@ -1307,6 +1318,7 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
     loop:  bool    = resp.get("loop",  False) if ok else False
     autoplay: bool = resp.get("autoplay", False) if ok else False
     normalize: bool = resp.get("normalize", False) if ok else False
+    paused: bool   = resp.get("paused", False) if ok else False
     session        = (resp.get("session") if ok else None) or worker.session(guild_id) or {}
     if ok:
         worker.apply(guild_id, resp.get("session"))
@@ -1326,7 +1338,7 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
                         page, muted, loop, autoplay, mode, selected_qid, normalize)
     view.state = state
     view.sig   = (current_title, tuple(q["qid"] for q in queue), muted, loop, autoplay, normalize,
-                  mode, controller)
+                  mode, controller, paused)
 
 
     for child in view.children:
@@ -1338,11 +1350,14 @@ async def _build_control_view(worker: WorkerProcess, guild_id: int,
         elif child.label in ("🔁 Loop", "🔁 Loop ON"):
             child.style = discord.ButtonStyle.success if loop else discord.ButtonStyle.secondary
             child.label = "🔁 Loop ON" if loop else "🔁 Loop"
+        elif child.label in ("⏸ Pause", "▶ Resume"):
+            child.style = discord.ButtonStyle.success if paused else discord.ButtonStyle.primary
+            child.label = "▶ Resume" if paused else "⏸ Pause"
 
     start     = page * PAGE_SIZE
     end       = min(start + PAGE_SIZE, len(queue))
     page_info = f"  (page {page + 1}/{total_pages})" if total_pages > 1 else ""
-    flags     = (("  🔇 muted" if muted else "") + ("  🔁 loop" if loop else "") + ("  🎲 autoplay" if autoplay else "")
+    flags     = (("  ⏸️ paused" if paused else "") + ("  🔇 muted" if muted else "") + ("  🔁 loop" if loop else "") + ("  🎲 autoplay" if autoplay else "")
                  + ("  🎚️ normalized" if normalize else ""))
     sel_info  = (f"\n✅ **Selected:** #{sel_item['index'] + 1} {_truncate(sel_item['title'], 50)}"
                  if sel_item else "")

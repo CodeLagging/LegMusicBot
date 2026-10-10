@@ -1,6 +1,6 @@
 # Bug scan — summary of fixes
 
-Eight passes over `main.py`, `worker.py`, `db.py`, `appsettings.py` and `launcher.py`: full read-throughs, scenario checks (races, restarts, Discord limits, Lavalink failures), a `ruff` bug-rule scan, and a final regression run of search and autoplay against the real Lavalink / YouTube / Groq. Every fix below was tested (fake players/workers for the failure cases, real services for search). **40 fixes**, plus two small cleanups.
+Eight passes (plus two later fixes) over `main.py`, `worker.py`, `db.py`, `appsettings.py` and `launcher.py`: full read-throughs, scenario checks (races, restarts, Discord limits, Lavalink failures), a `ruff` bug-rule scan, and a final regression run of search and autoplay against the real Lavalink / YouTube / Groq. Every fix below was tested (fake players/workers for the failure cases, real services for search). **42 fixes**, plus two small cleanups.
 
 Status: pushed to GitHub and deployed (passes 1–8).
 
@@ -70,6 +70,13 @@ Status: pushed to GitHub and deployed (passes 1–8).
 | 38 | During a restart's "finish the song" wait, `/stop` and `/control` were refused like `/play`. | Couldn't stop or skip the last song for up to 5 minutes. | Only commands that start playback are blocked. |
 | 39 | Dragging the bot to another channel left "🎵Playing - title" on the old one. | Stale status on an empty channel. | Status moves with the bot. |
 | 40 | A typo in `algo_max_kb` / `autoplay_seed_count` (e.g. `null`) raised during song changes and while a session ended. | Songs not advancing; the bot not leaving voice. | Invalid values are logged once and the default is used. |
+
+## Found later
+
+| # | Problem | What you'd have seen | Fix |
+|---|---|---|---|
+| 41 | `/control`'s Stop, Autoplay and Control buttons had the same id in every version of the panel. Each refresh (song change, most button presses) retires the old version, and discord.py then forgot those ids for the message — including the new version's buttons. | **Stop, Autoplay and Control did nothing** after the panel had refreshed once ("This interaction failed"), with nothing in the logs. | Ids are unique per panel version. Every control was tested through discord.py's real dispatch with refreshes in between. Pause now shows ⏸/▶ and the panel shows "paused"; after Stop it says "Stopped". |
+| 42 | A search word that's part of one result's artist name ("morena" vs the artist "Illest Morena") was treated as naming the artist, which switched off the user's history. | "morena" played "Thobela Morena" instead of LeoTHM's "MORENA" that you played 3 times. | A word is an artist name only when more results have it in the artist than in the title. "noite quente m22" still picks M22. |
 
 Also two cleanups with no behaviour change: the watchdog's leftover indentation, and skipping status/idle calls for a session that already ended.
 
