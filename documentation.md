@@ -370,8 +370,8 @@ Body of ``restart`` / ``shutdown``. `full` runs systemctl. No argument (or `all`
 
 ### Slash command helpers
 
-**`async def _guard(interaction)`**
-First step of the slash commands, before deferring so refusals are always private. Refuses commands outside a server, in a non-whitelisted server, or outside the control channel.
+**`async def _guard(interaction, during_restart=False)`**
+First step of the slash commands, before deferring so refusals are always private. Refuses commands outside a server, in a non-whitelisted server, or outside the control channel. While a restart lets songs finish, commands that start playback are refused; `/stop` and `/control` pass `during_restart=True` and keep working, so people can still stop or skip.
 
 **`def _text_channel_id(interaction)`**
 Where the worker posts now-playing messages: the control channel when set, else the channel the command was used in.
@@ -465,7 +465,7 @@ The panel (15 minute timeout). Rows as in section 3.
 Fetches `get_queue`, stores the session snapshot, clamps the page, drops a selection that no longer exists, builds the view, colours the Mute/Loop buttons and builds the "Playback Controls — Worker N" embed (current track, flags, queue range, and who controls it).
 
 **`class AlgoMenuView`**, **`class AlgoConfirmView`**, **`async def slash_reset_algo(interaction)`**
-`/reset-algo`: the algo menu (dropdown of saved songs by `track_key`, page buttons, 🗑️ Reset all, 🟠 Remove selected, Cancel) and its confirm step (Yes / Back). Only the person who opened it can use it. After removing, the menu reopens with the updated list; workers drop their cached copy of the user's history (`forget_user`).
+`/reset-algo`: the algo menu (dropdown of saved songs by `track_key`, page buttons, 🗑️ Reset all, 🟠 Remove selected, Cancel) and its confirm step (Yes / Back). Only the person who opened it can use it. The Yes click is acknowledged right away (telling the workers to forget can take longer than Discord's 3-second limit), then the message is edited. After removing, the menu reopens with the updated list; workers drop their cached copy of the user's history (`forget_user`).
 
 **`class PanelState`**, **`async def _panel_autorefresh(state)`**
 An open panel's message and newest view; every `PANEL_REFRESH` (8 s) the panel is rebuilt and edited only if what it shows changed (`view.sig`). At 14 minutes (just before Discord's 15-minute edit limit) it replaces itself with "Panel expired — run /control again" and removes the buttons; it also stops when the session ends.
@@ -530,6 +530,7 @@ One server's playback on this worker.
 | `idle_task`, `auto_paused` | Idle countdown; paused because the channel emptied. |
 | `connecting`, `closing` | Guards so our own connect/disconnect isn't mistaken for being kicked. |
 | `history` | The last 25 played tracks (autoplay seeds and duplicate filter). |
+| `play_lock` | One song change at a time. wavelink only reports "playing" once a song is sent to Lavalink, so without it a `/play` landing while another song was still resolving or connecting started as well, and one song replaced the other. Taken by `_advance` and by the play commands from connecting until the song plays or is queued. |
 
 - **`snapshot(self)`** — The small dict sent to the controller: `channel_id`, `controller_id`, `mode`, `autoplay`, `text_channel_id`.
 
@@ -658,7 +659,7 @@ Resolves the next queued YouTube track in the background.
 Records the playing track's real title, its algo record and requester, and adds it to the history.
 
 **`def _after_start(sess)`**
-After a track starts: sets the voice channel status, cancels the idle timer, prefetches the next track, and starts an autoplay refill when autoplay is on and the queue is empty.
+After a track starts: sets the voice channel status, cancels the idle timer (or starts it when nobody is in the channel, so the bot never plays to an empty channel forever), prefetches the next track, and starts an autoplay refill when autoplay is on and the queue is empty.
 
 **`async def _play(sess, player, track, requester)`**
 Plays a track, trying it and then its alternates (at most `MAX_RESOLVE_ATTEMPTS`, 2). Alternates are only other uploads of the same song (`_same_song`). When nothing resolves it hands the original to Lavalink anyway. Returns the track actually playing, which is what the reply, the Now Playing message and the channel status show.
@@ -670,7 +671,7 @@ Feeds the outgoing track into its requester's saved songs: a listen when finishe
 Adds a user's track ahead of any autoplay picks and returns its 1-based position.
 
 **`async def _advance(sess, player, announce=True)`**
-Plays the next queued track, refilling from autoplay first when the queue is empty and autoplay is on. With nothing left it clears the voice channel status and starts the idle timer.
+Plays the next queued track, refilling from autoplay first when the queue is empty and autoplay is on. With nothing left it clears the voice channel status and starts the idle timer. Holds the session's `play_lock`, like the play commands, so only one song change runs at a time.
 
 ### Autoplay
 
@@ -749,7 +750,7 @@ After searching/connecting: if the session was stopped meanwhile (`/stop`, or a 
 Spotify links that fail get an explanation (Spotify refusing lookups) instead of "Nothing found".
 
 **`async def _session_watchdog()`** / **`async def _watchdog_pass()`**
-Every 30 s (and 10 s after start): resumes a **stalled queue** (songs waiting but nothing playing for two checks in a row, e.g. after a Lavalink restart), leaves any voice channel the worker is in without a session (a "ghost" connection Discord kept after a restart), ends sessions whose voice connection is gone, and starts the idle timer for sessions with nothing to play, so a worker can't stay "busy" or sit in a channel forever.
+Every 30 s (and 10 s after start): resumes a **stalled queue** (songs waiting but nothing playing for two checks in a row, e.g. after a Lavalink restart; never while a song change holds `play_lock`, e.g. a slow YouTube lookup), leaves any voice channel the worker is in without a session (a "ghost" connection Discord kept after a restart), ends sessions whose voice connection is gone, and starts the idle timer for sessions with nothing to play, so a worker can't stay "busy" or sit in a channel forever.
 
 **`def _claim(guild_id, channel_id, user_id)`**
 Returns the server's session (creating it with `user_id` as controller when there is none). Raises when the worker already plays in a different channel of that server.
@@ -785,7 +786,7 @@ Logs the error and counts the failure. After `MAX_FAIL_STREAK` (3) in a row it p
 
 **`async def on_voice_state_update(member, before, after)`**
 - The worker itself left voice (kicked or disconnected by someone) → the session ends, so the worker is free again.
-- The worker was dragged to another channel → the session follows it.
+- The worker was dragged to another channel → the session follows it, and the "🎵Playing - title" status moves to the new channel.
 - The last person left the session's channel → playback pauses and the idle timer starts.
 - Someone came back → playback resumes and the idle timer stops.
 
@@ -901,6 +902,9 @@ True when the user id is in `dev_ids`.
 **`def is_whitelisted(guild_id)`**
 True when the whitelist is off or the server is listed.
 
+**`def get_int(name)`**
+A numeric setting (`algo_max_kb`, `autoplay_seed_count`). An invalid value (null, text) is logged once and the default is used, instead of raising during a song change.
+
 ---
 
 ## 9. IPC operations and state events
@@ -1011,7 +1015,7 @@ To reset a server's settings, delete its row from `servers.db` (or the whole fil
 
 1. systemd runs **`launcher.py`**, which starts `main.py --server` as its child. On restart/stop systemd signals **only the launcher** (`KillMode=process`).
 2. The launcher sends `{"op": "shutdown"}` to the bot over `.main.sock`, waits for its **ACK**, and exits. systemd sees the stop as done, so `systemctl` returns. (No ACK within 10 s → the launcher sends the bot SIGTERM, which it handles the same way.)
-3. The bot blocks new commands ("restarting — try again in a few minutes") and sends `drain` to every worker. A draining worker refuses new playback ("hard block"), even after its own song finished.
+3. The bot blocks commands that start playback ("restarting — try again in a few minutes"; `/stop` and `/control` still work) and sends `drain` to every worker. A draining worker refuses new playback ("hard block"), even after its own song finished.
 4. Each worker, per server:
    - a song is playing → it finishes **that song**; the rest of the queue/playlist and autoplay are dropped;
    - paused or between songs → the message plays right away;

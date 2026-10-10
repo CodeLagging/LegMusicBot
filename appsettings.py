@@ -71,6 +71,19 @@ def _id_set(values) -> set[int]:
 _warned: set[str] = set()
 
 
+def get_int(name: str) -> int:
+    """A numeric setting. A typo (null, "1mb", ...) falls back to the default instead of raising
+    in the middle of a song change or while a session is ending."""
+    value = get().get(name)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        if f"{name}={value!r}" not in _warned:
+            _warned.add(f"{name}={value!r}")
+            print(f"[Settings] Invalid {name} {value!r} in {PATH.name} — using {DEFAULTS[name]}", flush=True)
+        return int(DEFAULTS[name])
+
+
 def is_dev(user_id: int) -> bool:
     return int(user_id) in _id_set(get()["dev_ids"])
 

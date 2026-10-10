@@ -696,11 +696,13 @@ async def _dev_power(message: discord.Message, cmd: str, arg: str) -> None:
 
 # ── shared slash-command helpers ─────────────────────────────────────────────
 
-async def _guard(interaction: discord.Interaction) -> bool:
+async def _guard(interaction: discord.Interaction, during_restart: bool = False) -> bool:
+    """during_restart: the command still works while a restart lets songs finish (/stop,
+    /control). Only commands that start playback are blocked then."""
     if not interaction.guild_id:
         await interaction.response.send_message(embed=_err_embed("Server only"), ephemeral=True)
         return False
-    if _draining:
+    if _draining and not during_restart:
         await interaction.response.send_message(
             embed=_err_embed("The music bots are restarting — try again in a few minutes"), ephemeral=True)
         return False
@@ -940,7 +942,7 @@ async def slash_autoplay(interaction: discord.Interaction, worker: int = 0):
 @main_bot.tree.command(name="stop", description="Stop music and disconnect")
 @app_commands.describe(worker="Which worker to stop (0 = the one in your channel)")
 async def slash_stop(interaction: discord.Interaction, worker: int = 0):
-    if not await _guard(interaction): return
+    if not await _guard(interaction, during_restart=True): return
     eph = _eph(interaction.guild_id, "S_EPH")
     await interaction.response.defer(thinking=True, ephemeral=eph)
     pick = await _pick_for_control(interaction, worker, for_stop=True)
@@ -1413,7 +1415,7 @@ async def _panel_autorefresh(state: PanelState) -> None:
 @main_bot.tree.command(name="control", description="Open playback control panel")
 @app_commands.describe(worker="Which worker to control (0 = the one in your channel)")
 async def slash_control(interaction: discord.Interaction, worker: int = 0):
-    if not await _guard(interaction): return
+    if not await _guard(interaction, during_restart=True): return
     eph = _eph(interaction.guild_id, "CC_EPH")
     await interaction.response.defer(thinking=True, ephemeral=eph)
     pick = await _pick_for_control(interaction, worker)
@@ -1811,10 +1813,13 @@ class AlgoConfirmView(discord.ui.View):
     async def _on_yes(self, interaction: discord.Interaction):
         m = self.menu
         self.stop()
+        # Acknowledge first: Discord fails the click after 3 s, and telling every worker to forget
+        # can take longer than that (up to 5 s per unresponsive worker).
+        await interaction.response.defer()
         if self.action == "all":
             songs, queries = await asyncio.to_thread(db.reset_user, m.guild_id, m.user_id)
             await _forget_on_workers(m.guild_id, m.user_id)
-            await interaction.response.edit_message(embed=discord.Embed(
+            await interaction.edit_original_response(embed=discord.Embed(
                 title="🗑️  Your algo was reset",
                 description=f"Deleted {songs} saved song(s) and {queries} search memor{'y' if queries == 1 else 'ies'} "
                             "on this server. Searches and autoplay start fresh from your next listens.",
@@ -1825,8 +1830,8 @@ class AlgoConfirmView(discord.ui.View):
         rows    = await asyncio.to_thread(db.user_tracks, m.guild_id, m.user_id)
         queries = await asyncio.to_thread(db.user_query_count, m.guild_id, m.user_id)
         view = AlgoMenuView(m.user_id, m.guild_id, rows, queries, m.page)
-        await interaction.response.edit_message(embed=view.embed(f"🟠 Removed {removed} song(s) from your algo."),
-                                                view=view)
+        await interaction.edit_original_response(embed=view.embed(f"🟠 Removed {removed} song(s) from your algo."),
+                                                 view=view)
 
 
 @main_bot.tree.command(name="reset-algo", description="See your saved songs (algo) and remove some or all of them")

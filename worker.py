@@ -632,6 +632,10 @@ class Session:
         self.mix_cache: dict[str, list] = {}   # seed YouTube id -> its Mix, reused across refills
         self.ai_reserve: list[str] = []        # unused AI suggestions, used before asking Groq again
         self.history: deque[dict] = deque(maxlen=HISTORY_LEN)
+        # One song change at a time. wavelink only reports "playing" once a song is sent to
+        # Lavalink, so a /play landing while another song was still resolving or connecting
+        # started too, and one replaced the other (that song was lost).
+        self.play_lock = asyncio.Lock()
 
     def snapshot(self) -> dict:
         return {
@@ -941,7 +945,12 @@ async def _set_vc_status(guild_id: int, channel_id: int, title: str | None) -> N
 def _after_start(sess: Session) -> None:
     if sess.current_info:
         _spawn(_set_vc_status(sess.guild_id, sess.channel_id, sess.current_info["title"]))
-    _cancel_idle_timer(sess)
+    if _humans_in_vc(sess):
+        _cancel_idle_timer(sess)
+    else:
+        # Nobody is listening (everyone left while the song was changing, or a fixed channel
+        # nobody is in): keep the idle timer, or the bot plays to an empty channel forever.
+        _start_idle_timer(sess)
     _prefetch_next(sess)
     if sess.autoplay and not sess.queue:
         _kick_autoplay(sess)
@@ -992,7 +1001,7 @@ def _account(sess: Session, played_ms: int | None = None,
     sess.current_meta = sess.current_query = None
     if not meta or not uid:
         return
-    max_kb = int(appsettings.get()["algo_max_kb"])
+    max_kb = appsettings.get_int("algo_max_kb")
     if finished or (played_ms or 0) >= PLAY_COUNT_MS:
         _bg(db.record_play, sess.guild_id, uid, meta, max_kb)
         if query:
@@ -1017,6 +1026,10 @@ def _enqueue(sess: Session, item: QueueItem) -> int:
 
 async def _advance(sess: Session, player: wavelink.Player, announce: bool = True) -> None:
     """Play the next queued track (refilling from autoplay if needed), or go idle."""
+    async with sess.play_lock:   # see Session.play_lock
+        await _next_song(sess, player, announce)
+
+async def _next_song(sess: Session, player: wavelink.Player, announce: bool) -> None:
     if sess.drain_state == "finishing":
         await _play_shutdown_message(sess, player)   # the last song is done; nothing else plays
         return
@@ -1183,7 +1196,7 @@ def _weighted_pick(rows: list[dict], k: int) -> list[dict]:
     return out
 
 async def _autoplay_seeds(sess: Session) -> list[dict]:
-    n = max(1, int(appsettings.get()["autoplay_seed_count"]))
+    n = max(1, appsettings.get_int("autoplay_seed_count"))
     if sess.autoplay_source == "algo" and sess.autoplay_user:
         rows = await asyncio.to_thread(db.user_tracks, sess.guild_id, sess.autoplay_user, 200)
         return _weighted_pick(rows, n)
@@ -1458,6 +1471,11 @@ async def _watchdog_pass() -> None:
             print(f"[Worker {BOT_INDEX}] Watchdog: session in guild {gid} has no voice connection — ending", flush=True)
             await _end_session(gid, disconnect=False)
             continue
+        if sess.play_lock.locked():
+            # A song change is in progress (e.g. a slow YouTube lookup): nothing playing for a
+            # moment is expected, and resuming now would start a second song next to it.
+            sess.stalled = 0
+            continue
         refilling = sess.autoplay_task is not None and not sess.autoplay_task.done()
         if player.current is None and sess.queue and not sess.skipping and not refilling:
             # Songs are waiting but nothing plays (e.g. Lavalink restarted mid-song and dropped
@@ -1615,7 +1633,8 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
             sess.fallbacks[_track_key(nxt)] = alternatives
         print(f"[Worker {BOT_INDEX}] Trying alternate track: {nxt.title!r}", flush=True)
         try:
-            await _play(sess, player, nxt, sess.current_requester, sess.current_query)
+            async with sess.play_lock:
+                await _play(sess, player, nxt, sess.current_requester, sess.current_query)
             return
         except Exception as exc:
             print(f"[Worker {BOT_INDEX}] Alternate failed too: {exc}", flush=True)
@@ -1633,8 +1652,13 @@ async def on_voice_state_update(member: discord.Member, before, after):
             print(f"[Worker {BOT_INDEX}] Disconnected from voice in guild {sess.guild_id} — freeing", flush=True)
             await _end_session(sess.guild_id, disconnect=False)
         elif after.channel is not None and after.channel.id != sess.channel_id:
+            old = sess.channel_id
             sess.channel_id = after.channel.id   # dragged to another channel
             _notify(sess.guild_id)
+            # The "🎵Playing - title" status moves with the bot instead of staying on the old channel.
+            _spawn(_set_vc_status(sess.guild_id, old, None))
+            if sess.current_info and not sess.drain_state:
+                _spawn(_set_vc_status(sess.guild_id, sess.channel_id, sess.current_info["title"]))
         return
 
     if member.bot:
@@ -2364,18 +2388,19 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
         if not track:
             await reply(False, _not_found_msg(cmd["query"], "Nothing found."))
             return
-        player = await _fresh_vc(sess, new)
-        if await _abandoned(sess, reply):
-            return
-        if player.playing:
-            pos = _enqueue(sess, QueueItem(track, lbl, path, uid, cmd["query"]))
-            await reply(True, "queued", session=sess.snapshot(),
-                        **_track_reply(track, "queued", lbl, path, queue_pos=pos))
-        else:
-            sess.fail_streak = 0
-            played = await _play(sess, player, track, uid, cmd["query"])
-            await reply(True, "playing", session=sess.snapshot(),
-                        **_track_reply(played, "playing", lbl, path))
+        async with sess.play_lock:   # play-or-queue is decided once the previous change is done
+            player = await _fresh_vc(sess, new)
+            if await _abandoned(sess, reply):
+                return
+            if player.playing:
+                pos = _enqueue(sess, QueueItem(track, lbl, path, uid, cmd["query"]))
+                await reply(True, "queued", session=sess.snapshot(),
+                            **_track_reply(track, "queued", lbl, path, queue_pos=pos))
+            else:
+                sess.fail_streak = 0
+                played = await _play(sess, player, track, uid, cmd["query"])
+                await reply(True, "playing", session=sess.snapshot(),
+                            **_track_reply(played, "playing", lbl, path))
         return
 
     if op == "search_and_playlist":
@@ -2384,26 +2409,27 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
             await reply(False, _not_found_msg(
                 cmd["query"], f"No playable tracks found.{' (' + str(skipped) + ' local skipped)' if skipped else ''}"))
             return
-        player = await _fresh_vc(sess, new)
-        if await _abandoned(sess, reply):
-            return
-        first = tracks[0]
-        if player.playing:
-            for t in tracks: _enqueue(sess, QueueItem(t, lbl, "Playlist", uid))
-            await reply(True, "queued_playlist", session=sess.snapshot(),
-                        embed_type="queued_playlist",
-                        pl_name=pl_name, count=len(tracks),
-                        title=first.title, artwork=first.artwork or "",
-                        source_label=lbl, skipped=skipped)
-        else:
-            sess.fail_streak = 0
-            for t in tracks[1:]: _enqueue(sess, QueueItem(t, lbl, "Playlist", uid))
-            await _play(sess, player, first, uid)
-            await reply(True, "playing_playlist", session=sess.snapshot(),
-                        embed_type="playing_playlist",
-                        pl_name=pl_name, count=len(tracks),
-                        title=first.title, artwork=first.artwork or "",
-                        source_label=lbl, skipped=skipped)
+        async with sess.play_lock:
+            player = await _fresh_vc(sess, new)
+            if await _abandoned(sess, reply):
+                return
+            first = tracks[0]
+            if player.playing:
+                for t in tracks: _enqueue(sess, QueueItem(t, lbl, "Playlist", uid))
+                await reply(True, "queued_playlist", session=sess.snapshot(),
+                            embed_type="queued_playlist",
+                            pl_name=pl_name, count=len(tracks),
+                            title=first.title, artwork=first.artwork or "",
+                            source_label=lbl, skipped=skipped)
+            else:
+                sess.fail_streak = 0
+                for t in tracks[1:]: _enqueue(sess, QueueItem(t, lbl, "Playlist", uid))
+                await _play(sess, player, first, uid)
+                await reply(True, "playing_playlist", session=sess.snapshot(),
+                            embed_type="playing_playlist",
+                            pl_name=pl_name, count=len(tracks),
+                            title=first.title, artwork=first.artwork or "",
+                            source_label=lbl, skipped=skipped)
         return
 
     if op == "autoplay_start":
@@ -2416,27 +2442,28 @@ async def _start_op(sess: Session, op: str, cmd: dict, uid: int | None, reply, n
         sess.autoplay_source = "algo"
         sess.autoplay_user   = uid
         _notify(gid)
-        player = await _fresh_vc(sess, new)
-        if await _abandoned(sess, reply):
-            return
-        if player.playing:
-            sess.queue = [q for q in sess.queue if q[1] != AUTOPLAY_LABEL]
+        async with sess.play_lock:
+            player = await _fresh_vc(sess, new)
+            if await _abandoned(sess, reply):
+                return
+            if player.playing:
+                sess.queue = [q for q in sess.queue if q[1] != AUTOPLAY_LABEL]
+                if not sess.queue:
+                    _kick_autoplay(sess)
+                await reply(True, "autoplay_on", autoplay=True, session=sess.snapshot())
+                return
+            await _autoplay_fill(sess)
+            if await _abandoned(sess, reply):
+                return
             if not sess.queue:
-                _kick_autoplay(sess)
-            await reply(True, "autoplay_on", autoplay=True, session=sess.snapshot())
-            return
-        await _autoplay_fill(sess)
-        if await _abandoned(sess, reply):
-            return
-        if not sess.queue:
-            await reply(False, "Couldn't find anything to autoplay right now — try again in a bit.")
-            return
-        item = sess.queue.pop(0)
-        nxt, lbl, path, req = item
-        sess.fail_streak = 0
-        played = await _play(sess, player, nxt, req, item.query)
-        await reply(True, "playing", session=sess.snapshot(),
-                    **_track_reply(played, "playing", AUTOPLAY_LABEL, path or "Your saved songs"))
+                await reply(False, "Couldn't find anything to autoplay right now — try again in a bit.")
+                return
+            item = sess.queue.pop(0)
+            nxt, lbl, path, req = item
+            sess.fail_streak = 0
+            played = await _play(sess, player, nxt, req, item.query)
+            await reply(True, "playing", session=sess.snapshot(),
+                        **_track_reply(played, "playing", AUTOPLAY_LABEL, path or "Your saved songs"))
         return
 
 

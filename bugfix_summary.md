@@ -1,8 +1,8 @@
 # Bug scan — summary of fixes
 
-Seven passes over `main.py`, `worker.py`, `db.py`, `appsettings.py` and `launcher.py`: full read-throughs, scenario checks (races, restarts, Discord limits, Lavalink failures), a `ruff` bug-rule scan, and a final regression run of search and autoplay against the real Lavalink / YouTube / Groq. Every fix below was tested (fake players/workers for the failure cases, real services for search). **33 fixes**, plus two small cleanups.
+Eight passes over `main.py`, `worker.py`, `db.py`, `appsettings.py` and `launcher.py`: full read-throughs, scenario checks (races, restarts, Discord limits, Lavalink failures), a `ruff` bug-rule scan, and a final regression run of search and autoplay against the real Lavalink / YouTube / Groq. Every fix below was tested (fake players/workers for the failure cases, real services for search). **40 fixes**, plus two small cleanups.
 
-Status: committed locally (`3b46e36` … pass 7), **not pushed or deployed yet**.
+Status: pushed to GitHub and deployed (passes 1–8).
 
 ---
 
@@ -58,6 +58,18 @@ Status: committed locally (`3b46e36` … pass 7), **not pushed or deployed yet**
 | 31 | `/settings` right after a restart built a worker dropdown with zero options. | `/settings` failing for a few seconds after restart. | Worker options hidden until workers exist. |
 | 32 | Song titles containing `[` `]` ("[Official Video]") ended the Markdown link early. | Broken clickable titles in Now Playing / queued embeds. | Brackets escaped (worker and main embeds). |
 | 33 | One invalid entry in `dev_ids` / `whitelist` raised on every message. | Bot erroring on all messages after a settings typo. | Invalid entries are skipped and logged once. |
+
+## Final pass (8)
+
+| # | Problem | What you'd have seen | Fix |
+|---|---|---|---|
+| 34 | wavelink only says "playing" once a song reaches Lavalink. Two quick `/play`s, or a `/play` during a song change, could both start a song. | **A song lost**: the second replaced the first (two "Now Playing" messages, one song gone). Reproduced in a test. | One song change at a time per session: the later `/play` waits a moment and is queued. |
+| 35 | The watchdog treated a slow song change (slow YouTube lookup, ~1 min) as a stalled queue. | Same as above: a second song started next to the one loading. | Watchdog leaves sessions alone while a song change is running. |
+| 36 | A song starting while nobody was in the channel cancelled the idle timer (everyone left mid song change, or a fixed channel nobody is in). | Bot playing to an empty channel forever, especially with autoplay on. | The idle timer keeps running when nobody is listening. |
+| 37 | `/reset-algo` → Yes answered only after telling every worker to forget (up to 5 s); Discord gives 3 s. | "This interaction failed" although the reset worked. | The click is acknowledged first, then the message updates. |
+| 38 | During a restart's "finish the song" wait, `/stop` and `/control` were refused like `/play`. | Couldn't stop or skip the last song for up to 5 minutes. | Only commands that start playback are blocked. |
+| 39 | Dragging the bot to another channel left "🎵Playing - title" on the old one. | Stale status on an empty channel. | Status moves with the bot. |
+| 40 | A typo in `algo_max_kb` / `autoplay_seed_count` (e.g. `null`) raised during song changes and while a session ended. | Songs not advancing; the bot not leaving voice. | Invalid values are logged once and the default is used. |
 
 Also two cleanups with no behaviour change: the watchdog's leftover indentation, and skipping status/idle calls for a session that already ended.
 
